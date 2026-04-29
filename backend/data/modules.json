@@ -2,6 +2,7 @@
   {
     "id": "cloud_type",
     "name": "云类型反演",
+    "category": "cloud",
     "description": "基于葵花8的云类型反演模块（CM_CTH.exe）",
     "executable": "backend/installed_modules/cth/CM_CTH.exe",
     "working_dir": "backend/installed_modules/cth",
@@ -24,12 +25,6 @@
         "required": true
       },
       {
-        "key": "outpath1",
-        "label": "输出目录",
-        "type": "dir_path",
-        "required": true
-      },
-      {
         "key": "outpath",
         "label": "输出目录",
         "type": "dir_path",
@@ -48,6 +43,7 @@
   {
     "id": "h8aod",
     "name": "H8 AOD 反演",
+    "category": "aerosol",
     "description": "H8 AOD 本地原生模块，按 JSON 配置文件模式运行",
     "executable": "backend/installed_modules/h8aod/AOD_AHI.exe",
     "working_dir": "backend/installed_modules/h8aod",
