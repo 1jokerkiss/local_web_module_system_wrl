@@ -13,11 +13,16 @@ import {
   updateUserEnabled,
   adminResetPassword,
   getModules,
+  getAdminModules,
+  getToolbars,
+  addToolbar,
   getTasks,
   runModule,
   saveModule,
   deleteModule as deleteModuleApi,
   uploadModuleZip,
+  listDropZips,
+  installLocalDropModules,
   getTask,
   cancelTask,
   deleteTask,
@@ -70,6 +75,7 @@ const emptyModuleForm = {
   command_template_text: '["{executable}"]',
   inputs_text: '[]',
   tags_text: '',
+  tool_type: 'cloud',
   enabled: true,
 };
 
@@ -164,6 +170,56 @@ const styles = {
 
 function normalize(v) {
   return String(v || '').toLowerCase();
+}
+
+const DEFAULT_TOOLBARS = [
+  { key: 'cloud', label: '云反演', system: true },
+  { key: 'aerosol', label: '气溶胶反演', system: true },
+];
+
+function normalizeToolKey(v) {
+  return String(v || '')
+    .trim()
+    .replace(/\.\./g, '_')
+    .replace(/[\\/\s]+/g, '_');
+}
+
+function guessToolType(module) {
+  const explicit = normalizeToolKey(module?.tool_type || module?.category || '');
+  if (explicit) return explicit;
+
+  const text = `${normalize(module?.id)} ${normalize(module?.name)} ${normalize(module?.description)} ${normalize((module?.tags || []).join(' '))}`;
+
+  if (['aod', 'aerosol', '气溶胶', 'h8', 'polar', '偏振'].some((x) => text.includes(x))) {
+    return 'aerosol';
+  }
+  if (['cloud', '云', 'cloud_type', 'cth'].some((x) => text.includes(x))) {
+    return 'cloud';
+  }
+  return 'cloud';
+}
+
+function getModuleToolType(module) {
+  return guessToolType(module);
+}
+
+function uniqToolbars(toolbars, modules) {
+  const map = new Map();
+  DEFAULT_TOOLBARS.forEach((t) => map.set(t.key, t));
+  (toolbars || []).forEach((t) => {
+    const key = normalizeToolKey(t.key || t.label);
+    if (key) map.set(key, { key, label: t.label || key, system: !!t.system });
+  });
+  (modules || []).forEach((m) => {
+    const key = getModuleToolType(m);
+    if (key && !map.has(key)) map.set(key, { key, label: key, system: false });
+  });
+  return Array.from(map.values()).sort((a, b) => {
+    const aw = a.key === 'cloud' ? 0 : a.key === 'aerosol' ? 1 : 2;
+    const bw = b.key === 'cloud' ? 0 : b.key === 'aerosol' ? 1 : 2;
+    if (aw !== bw) return aw - bw;
+    return String(a.label).localeCompare(String(b.label), 'zh-CN');
+  });
 }
 
 function guessModuleByKeywords(modules, keywords) {
@@ -969,21 +1025,21 @@ export default function App() {
   const [modules, setModules] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [users, setUsers] = useState([]);
+  const [toolbars, setToolbars] = useState(DEFAULT_TOOLBARS);
 
-  const [activeTab, setActiveTab] = useState('cloud');
-  const [activeCloudKey, setActiveCloudKey] = useState('cloud_type');
-  const [activeAerosolKey, setActiveAerosolKey] = useState('h8_aod');
-
-  const [cloudForms, setCloudForms] = useState({
-    cloud_top_height: { task_name: '云顶高度反演', input_path: '', output_dir: '' },
-    cloud_type: { task_name: '云类型反演', input_path: '', output_dir: '' },
-  });
+  const [activeTab, setActiveTab] = useState('tool:cloud');
+  const [activeModuleByTool, setActiveModuleByTool] = useState({});
+  const [expandedToolTypes, setExpandedToolTypes] = useState({ cloud: true, aerosol: true });
+  const [cloudForms, setCloudForms] = useState({});
 
   const [runtimeForms, setRuntimeForms] = useState({});
   const [moduleForm, setModuleForm] = useState(emptyModuleForm);
   const [editingModuleId, setEditingModuleId] = useState('');
   const [zipFile, setZipFile] = useState(null);
+  const [uploadToolType, setUploadToolType] = useState('cloud');
+  const [dropInfo, setDropInfo] = useState({ drop_dir: '', items: [] });
   const [uploadMsg, setUploadMsg] = useState('');
+  const [newToolbarForm, setNewToolbarForm] = useState({ key: '', label: '' });
   const [newUserForm, setNewUserForm] = useState({
     username: '',
     password: '',
@@ -999,30 +1055,23 @@ export default function App() {
 
   const isAdmin = currentUser?.role === 'admin';
 
-  const cloudModules = useMemo(
-    () => CLOUD_ITEMS.map((it) => ({ ...it, module: guessModuleByKeywords(modules, it.keywords) })),
-    [modules]
-  );
+  const visibleToolbars = useMemo(() => uniqToolbars(toolbars, modules), [toolbars, modules]);
 
-  const aerosolModules = useMemo(
-    () => AEROSOL_ITEMS.map((it) => ({ ...it, module: guessModuleByKeywords(modules, it.keywords) })),
-    [modules]
-  );
-
-  const dynamicModules = useMemo(() => {
-  const used = new Set([
-    ...cloudModules.map((x) => x.module?.id).filter(Boolean),
-    ...aerosolModules.map((x) => x.module?.id).filter(Boolean),
-  ]);
-
-  const blacklist = ['echo', '演示模块', 'aod_ahi 模块示例'];
-
-  return modules.filter((m) => {
-    if (used.has(m.id)) return false;
-    const text = `${normalize(m.id)} ${normalize(m.name)} ${normalize(m.description)}`;
-    return !blacklist.some((x) => text.includes(x));
-  });
-}, [modules, cloudModules, aerosolModules]);
+  const modulesByTool = useMemo(() => {
+    const grouped = {};
+    visibleToolbars.forEach((t) => {
+      grouped[t.key] = [];
+    });
+    modules.forEach((m) => {
+      const key = getModuleToolType(m);
+      if (!grouped[key]) grouped[key] = [];
+      grouped[key].push(m);
+    });
+    Object.keys(grouped).forEach((key) => {
+      grouped[key].sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id), 'zh-CN'));
+    });
+    return grouped;
+  }, [modules, visibleToolbars]);
 
   const navItems = useMemo(() => {
     const arr = [];
@@ -1030,12 +1079,10 @@ export default function App() {
       arr.push({ key: 'module_mgmt', label: '模块管理' });
       arr.push({ key: 'user_mgmt', label: '用户管理' });
     }
-    arr.push({ key: 'cloud', label: '云反演' });
-    arr.push({ key: 'aerosol', label: '气溶胶反演' });
-    dynamicModules.forEach((m) => arr.push({ key: `dynamic:${m.id}`, label: m.name }));
+    visibleToolbars.forEach((t) => arr.push({ key: `tool:${t.key}`, label: t.label }));
     arr.push({ key: 'tasks', label: '任务列表' });
     return arr;
-  }, [isAdmin, dynamicModules]);
+  }, [isAdmin, visibleToolbars]);
 
   useEffect(() => {
     if (currentUser) {
@@ -1051,15 +1098,21 @@ export default function App() {
       try {
         const me = await getMe();
         setCurrentUser(me);
-        setActiveTab(me.role === 'admin' ? 'module_mgmt' : 'cloud');
+        setActiveTab(me.role === 'admin' ? 'module_mgmt' : 'tool:cloud');
 
-        const [mods, taskList] = await Promise.all([getModules(), getTasks()]);
+        const [toolbarList, mods, taskList] = await Promise.all([
+          getToolbars(),
+          me.role === 'admin' ? getAdminModules() : getModules(),
+          getTasks(),
+        ]);
+        setToolbars(Array.isArray(toolbarList) ? toolbarList : DEFAULT_TOOLBARS);
         setModules(Array.isArray(mods) ? mods : []);
         setTasks(Array.isArray(taskList) ? taskList : []);
 
         if (me.role === 'admin') {
-          const userList = await getUsers();
+          const [userList, drop] = await Promise.all([getUsers(), listDropZips().catch(() => null)]);
           setUsers(Array.isArray(userList) ? userList : []);
+          if (drop) setDropInfo(drop);
         }
       } catch (e) {
         clearAuthToken();
@@ -1069,14 +1122,7 @@ export default function App() {
     init();
   }, []);
 useEffect(() => {
-  const modulesToInitialize = [
-    // 只有这里正确过滤并包含了 cloudModules，runtimeForms 才会生成对应的 3 个输入框字段
-    ...cloudModules.map((x) => x.module).filter(Boolean),
-    ...aerosolModules.map((x) => x.module).filter(Boolean),
-    ...dynamicModules
-  ];
-
-  modulesToInitialize.forEach((m) => {
+  modules.forEach((m) => {
     setRuntimeForms((prev) => {
       if (prev[m.id]) return prev;
       const init = { task_name: m.name };
@@ -1086,8 +1132,21 @@ useEffect(() => {
       return { ...prev, [m.id]: init };
     });
   });
-  // 必须监听 cloudModules 的变化
-}, [cloudModules, aerosolModules, dynamicModules]);
+}, [modules]);
+
+useEffect(() => {
+  setActiveModuleByTool((prev) => {
+    const next = { ...prev };
+    visibleToolbars.forEach((tb) => {
+      const list = modulesByTool[tb.key] || [];
+      if (!list.length) return;
+      if (!next[tb.key] || !list.some((m) => m.id === next[tb.key])) {
+        next[tb.key] = list[0].id;
+      }
+    });
+    return next;
+  });
+}, [visibleToolbars, modulesByTool]);
   useEffect(() => {
     if (!currentUser) {
       if (pollTimerRef.current) {
@@ -1148,15 +1207,21 @@ useEffect(() => {
       const data = await login(loginForm.username, loginForm.password, loginType);
       setAuthToken(data.token);
       setCurrentUser(data.user);
-      setActiveTab(data.user.role === 'admin' ? 'module_mgmt' : 'cloud');
+      setActiveTab(data.user.role === 'admin' ? 'module_mgmt' : 'tool:cloud');
 
-      const [mods, taskList] = await Promise.all([getModules(), getTasks()]);
+      const [toolbarList, mods, taskList] = await Promise.all([
+        getToolbars(),
+        data.user.role === 'admin' ? getAdminModules() : getModules(),
+        getTasks(),
+      ]);
+      setToolbars(Array.isArray(toolbarList) ? toolbarList : DEFAULT_TOOLBARS);
       setModules(Array.isArray(mods) ? mods : []);
       setTasks(Array.isArray(taskList) ? taskList : []);
 
       if (data.user.role === 'admin') {
-        const userList = await getUsers();
+        const [userList, drop] = await Promise.all([getUsers(), listDropZips().catch(() => null)]);
         setUsers(Array.isArray(userList) ? userList : []);
+        if (drop) setDropInfo(drop);
       }
     } catch (e) {
       setLoginError(e?.message || '登录失败，请检查账号、密码或登录身份是否匹配');
@@ -1245,8 +1310,21 @@ async function handleRegister() {
   }
 
   async function refreshModules() {
-    const list = await getModules();
+    const list = isAdmin ? await getAdminModules() : await getModules();
     setModules(Array.isArray(list) ? list : []);
+  }
+
+  async function refreshToolbars() {
+    const list = await getToolbars();
+    setToolbars(Array.isArray(list) ? list : DEFAULT_TOOLBARS);
+  }
+
+  async function refreshDropZipList() {
+    if (!isAdmin) return;
+    try {
+      const data = await listDropZips();
+      setDropInfo(data || { drop_dir: '', items: [] });
+    } catch {}
   }
 
   async function refreshUsers() {
@@ -1418,6 +1496,7 @@ async function handleRegister() {
       command_template_text: JSON.stringify(module.command_template || ['{executable}'], null, 2),
       inputs_text: JSON.stringify(module.inputs || [], null, 2),
       tags_text: (module.tags || []).join(','),
+      tool_type: getModuleToolType(module),
       enabled: module.enabled !== false,
     });
   }
@@ -1437,11 +1516,12 @@ async function handleRegister() {
           .split(',')
           .map((x) => x.trim())
           .filter(Boolean),
+        tool_type: moduleForm.tool_type || 'cloud',
         enabled: moduleForm.enabled,
       });
       setModuleForm(emptyModuleForm);
       setEditingModuleId('');
-      await refreshModules();
+      await Promise.all([refreshModules(), refreshToolbars()]);
       alert('模块已保存');
     } catch (e) {
       alert(e?.message || '保存模块失败');
@@ -1449,14 +1529,53 @@ async function handleRegister() {
   }
 
   async function uploadZip() {
-    if (!zipFile) return;
+    if (!zipFile) {
+      setUploadMsg('未选择 zip 文件；如果已放入本地投放目录，请点“扫描本地目录安装”。');
+      return;
+    }
     setUploadMsg('上传中...');
     try {
-      await uploadModuleZip(zipFile);
+      await uploadModuleZip(zipFile, uploadToolType);
+      setZipFile(null);
       setUploadMsg('上传并安装成功');
-      await refreshModules();
+      await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
     } catch (e) {
       setUploadMsg(e?.message || '上传失败');
+    }
+  }
+
+  async function installFromDrop(filename = '') {
+    setUploadMsg('正在扫描本地投放目录...');
+    try {
+      const data = await installLocalDropModules(uploadToolType, filename);
+      const okCount = data?.installed?.length || 0;
+      const failCount = data?.failed?.length || 0;
+      setUploadMsg('本地目录安装完成：成功 ' + okCount + ' 个，失败 ' + failCount + ' 个');
+      await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
+      if (failCount) {
+        alert((data.failed || []).map((x) => `${x.name}: ${x.error}`).join('\n'));
+      }
+    } catch (e) {
+      setUploadMsg(e?.message || '本地目录安装失败');
+    }
+  }
+
+  async function handleAddToolbar() {
+    try {
+      const label = newToolbarForm.label.trim();
+      if (!label) {
+        alert('请输入工具类型名称');
+        return;
+      }
+      await addToolbar({
+        key: normalizeToolKey(newToolbarForm.key || label),
+        label,
+      });
+      setNewToolbarForm({ key: '', label: '' });
+      await refreshToolbars();
+      alert('工具栏已添加');
+    } catch (e) {
+      alert(e?.message || '添加工具栏失败');
     }
   }
 
@@ -1730,6 +1849,111 @@ async function handleRegister() {
     );
   }
 
+  function renderToolbarOptions() {
+    return visibleToolbars.map((tb) => (
+      <option key={tb.key} value={tb.key}>
+        {tb.label}
+      </option>
+    ));
+  }
+
+  function renderInstalledModulesTree() {
+    return (
+      <div style={{ display: 'grid', gap: 10, marginTop: 12, maxHeight: 'calc(100vh - 520px)', overflow: 'auto' }}>
+        {visibleToolbars.map((tb) => {
+          const list = modulesByTool[tb.key] || [];
+          const expanded = expandedToolTypes[tb.key] !== false;
+          return (
+            <div key={tb.key} style={{ border: '1px solid #d6e2ef', background: '#fff', borderRadius: 12, overflow: 'hidden' }}>
+              <button
+                style={{ ...styles.whiteBtn, width: '100%', border: 'none', borderRadius: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                onClick={() => setExpandedToolTypes((prev) => ({ ...prev, [tb.key]: !expanded }))}
+              >
+                <span>{expanded ? '▼' : '▶'} {tb.label}</span>
+                <span style={{ color: '#6a7f96' }}>{list.length} 个模块</span>
+              </button>
+
+              {expanded && (
+                <div style={{ padding: 10, display: 'grid', gap: 10 }}>
+                  {list.length === 0 && <div style={{ color: '#9aa8b8', fontSize: 13 }}>暂无模块</div>}
+                  {list.map((m) => (
+                    <div key={m.id} style={{ border: '1px solid #e2ebf5', background: '#fbfdff', borderRadius: 10, padding: 10 }}>
+                      <div style={{ fontWeight: 800, color: '#12385f' }}>{m.name}</div>
+                      <div style={{ color: '#6a7f96', marginTop: 4, wordBreak: 'break-all' }}>{m.id}</div>
+                      {m.enabled === false && <div style={{ color: '#b45309', marginTop: 4 }}>已禁用</div>}
+                      <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                        <button style={styles.whiteBtn} onClick={() => fillModuleForm(m)}>编辑</button>
+                        <button style={styles.redBtn} onClick={() => handleDeleteModule(m.id)}>删除</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  function renderToolPage(toolKey) {
+    const toolbar = visibleToolbars.find((t) => t.key === toolKey) || { key: toolKey, label: toolKey };
+    const list = modulesByTool[toolKey] || [];
+    const selectedId = activeModuleByTool[toolKey] || list[0]?.id || '';
+    const selectedModule = list.find((m) => m.id === selectedId) || list[0] || null;
+
+    return (
+      <section
+        style={{
+          display: 'grid',
+          gridTemplateColumns: '300px minmax(0, 1fr) 280px',
+          gap: 12,
+          minHeight: 'calc(100vh - 98px)',
+        }}
+      >
+        <div style={{ ...styles.card, padding: 18 }}>
+          <div style={{ fontSize: 22, fontWeight: 900, color: '#0b2d51', marginBottom: 16 }}>
+            {toolbar.label}模块
+          </div>
+
+          <div style={{ display: 'grid', gap: 12 }}>
+            {list.length === 0 && (
+              <div style={{ color: '#8998a8', lineHeight: 1.8 }}>
+                这个工具栏下还没有模块。管理员可以在“模块管理”中选择该工具类型后安装或手工添加模块。
+              </div>
+            )}
+            {list.map((m) => (
+              <button
+                key={m.id}
+                onClick={() => setActiveModuleByTool((prev) => ({ ...prev, [toolKey]: m.id }))}
+                style={{
+                  textAlign: 'left',
+                  padding: '18px 16px',
+                  borderRadius: 14,
+                  border: selectedModule?.id === m.id ? '2px solid #2b73db' : '1px solid #d7e3f0',
+                  background:
+                    selectedModule?.id === m.id
+                      ? 'linear-gradient(135deg, rgba(41,118,210,0.13), rgba(89,176,255,0.08))'
+                      : '#fff',
+                  cursor: 'pointer',
+                }}
+              >
+                <div style={{ fontWeight: 800, fontSize: 20, color: '#13385f' }}>{m.name}</div>
+                <div style={{ marginTop: 8, color: '#60748b', lineHeight: 1.7 }}>{m.description || m.id}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ ...styles.card, padding: 22 }}>
+          {selectedModule ? renderModuleRuntime(selectedModule) : <div style={{ padding: 20, color: '#999' }}>当前工具栏暂无可运行模块</div>}
+        </div>
+
+        {renderFileManagerPanel()}
+      </section>
+    );
+  }
+
   if (!currentUser) {
     return (
       <>
@@ -1801,55 +2025,77 @@ async function handleRegister() {
       <div style={{ padding: 12 }}>
         {activeTab === 'module_mgmt' && isAdmin && (
           <section style={{ ...styles.card, padding: 16, minHeight: 'calc(100vh - 98px)' }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '360px 1fr', gap: 16 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '380px 1fr', gap: 16 }}>
               <div style={{ ...styles.card, padding: 16 }}>
+                <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
+                  添加工具栏
+                </div>
+                <div style={{ display: 'grid', gap: 10, marginBottom: 18 }}>
+                  <input
+                    placeholder="工具类型名称，例如：地表温度反演"
+                    value={newToolbarForm.label}
+                    onChange={(e) => setNewToolbarForm({ ...newToolbarForm, label: e.target.value })}
+                    style={styles.input}
+                  />
+                  <input
+                    placeholder="工具类型标识，可选，例如：lst"
+                    value={newToolbarForm.key}
+                    onChange={(e) => setNewToolbarForm({ ...newToolbarForm, key: e.target.value })}
+                    style={styles.input}
+                  />
+                  <button style={styles.blueBtn} onClick={handleAddToolbar}>添加工具栏</button>
+                </div>
+
                 <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
                   模块上传 / 本地投放
                 </div>
 
-                <div style={{ marginBottom: 14 }}>
-                  <input type="file" accept=".zip" onChange={(e) => setZipFile(e.target.files?.[0] || null)} />
+                <div style={{ display: 'grid', gap: 10, marginBottom: 14 }}>
+                  <label>
+                    <div style={labelStyle}>模块所属工具栏</div>
+                    <select value={uploadToolType} onChange={(e) => setUploadToolType(e.target.value)} style={styles.input}>
+                      {renderToolbarOptions()}
+                    </select>
+                  </label>
+
+                  <label>
+                    <div style={labelStyle}>可选：上传模块 zip</div>
+                    <input type="file" accept=".zip" onChange={(e) => setZipFile(e.target.files?.[0] || null)} />
+                  </label>
                 </div>
 
                 <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                   <button style={styles.blueBtn} onClick={uploadZip}>上传并安装</button>
+                  <button style={styles.blueBtn} onClick={() => installFromDrop()}>扫描本地目录安装</button>
+                  <button style={styles.whiteBtn} onClick={refreshDropZipList}>刷新目录</button>
                   <button style={styles.whiteBtn} onClick={() => setShowDropHint(true)}>本地模块目录说明</button>
                 </div>
 
                 {uploadMsg && <div style={{ marginTop: 12, color: '#4f6682' }}>{uploadMsg}</div>}
+                {dropInfo.drop_dir && (
+                  <div style={{ marginTop: 12, color: '#6a7f96', fontSize: 13, wordBreak: 'break-all' }}>
+                    本地投放目录：{dropInfo.drop_dir}
+                  </div>
+                )}
+
+                {dropInfo.items?.length > 0 && (
+                  <div style={{ marginTop: 12, display: 'grid', gap: 8 }}>
+                    <div style={{ fontWeight: 800, color: '#12385f' }}>目录中待安装 zip</div>
+                    {dropInfo.items.map((item) => (
+                      <div key={item.path} style={{ border: '1px solid #e1eaf3', background: '#fff', borderRadius: 10, padding: 10 }}>
+                        <div style={{ fontWeight: 700, wordBreak: 'break-all' }}>{item.name}</div>
+                        <button style={{ ...styles.whiteBtn, marginTop: 8 }} onClick={() => installFromDrop(item.name)}>
+                          安装这个 zip
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
 
                 <div style={{ marginTop: 20, fontSize: 20, fontWeight: 900, color: '#12385f' }}>
                   已安装模块
                 </div>
-
-                <div
-                  style={{
-                    display: 'grid',
-                    gap: 10,
-                    marginTop: 12,
-                    maxHeight: 'calc(100vh - 290px)',
-                    overflow: 'auto',
-                  }}
-                >
-                  {modules.map((m) => (
-                    <div
-                      key={m.id}
-                      style={{
-                        border: '1px solid #d6e2ef',
-                        background: '#fff',
-                        borderRadius: 12,
-                        padding: 12,
-                      }}
-                    >
-                      <div style={{ fontWeight: 800, color: '#12385f' }}>{m.name}</div>
-                      <div style={{ color: '#6a7f96', marginTop: 4 }}>{m.id}</div>
-                      <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-                        <button style={styles.whiteBtn} onClick={() => fillModuleForm(m)}>编辑</button>
-                        <button style={styles.redBtn} onClick={() => handleDeleteModule(m.id)}>删除</button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
+                {renderInstalledModulesTree()}
               </div>
 
               <div style={{ ...styles.card, padding: 16 }}>
@@ -1858,10 +2104,14 @@ async function handleRegister() {
                 </div>
 
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                  <select value={moduleForm.tool_type} onChange={(e) => setModuleForm({ ...moduleForm, tool_type: e.target.value })} style={styles.input}>
+                    {renderToolbarOptions()}
+                  </select>
                   <input placeholder="ID" value={moduleForm.id} onChange={(e) => setModuleForm({ ...moduleForm, id: e.target.value })} style={styles.input} />
                   <input placeholder="名称" value={moduleForm.name} onChange={(e) => setModuleForm({ ...moduleForm, name: e.target.value })} style={styles.input} />
                   <input placeholder="可执行文件" value={moduleForm.executable} onChange={(e) => setModuleForm({ ...moduleForm, executable: e.target.value })} style={styles.input} />
                   <input placeholder="工作目录" value={moduleForm.working_dir} onChange={(e) => setModuleForm({ ...moduleForm, working_dir: e.target.value })} style={styles.input} />
+                  <input placeholder="标签，英文逗号分隔" value={moduleForm.tags_text} onChange={(e) => setModuleForm({ ...moduleForm, tags_text: e.target.value })} style={styles.input} />
                   <textarea placeholder="描述" value={moduleForm.description} onChange={(e) => setModuleForm({ ...moduleForm, description: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 80 }} />
                   <textarea placeholder="命令模板(JSON数组)" value={moduleForm.command_template_text} onChange={(e) => setModuleForm({ ...moduleForm, command_template_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2' }} />
                   <textarea placeholder="输入字段(JSON数组)" value={moduleForm.inputs_text} onChange={(e) => setModuleForm({ ...moduleForm, inputs_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 180 }} />
@@ -1883,7 +2133,6 @@ async function handleRegister() {
             </div>
           </section>
         )}
-
         {activeTab === 'user_mgmt' && isAdmin && (
           <section style={{ ...styles.card, padding: 16, minHeight: 'calc(100vh - 98px)' }}>
             <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
@@ -1946,106 +2195,7 @@ async function handleRegister() {
             </div>
           </section>
         )}
-        {activeTab === 'cloud' && (
-          <section
-            style={{
-              display: 'grid',
-              gridTemplateColumns: '300px minmax(0, 1fr) 280px',
-              gap: 12,
-              minHeight: 'calc(100vh - 98px)',
-            }}
-          >
-            {/* 左侧模块列表 */}
-            <div style={{ ...styles.card, padding: 18 }}>
-              <div style={{ fontSize: 22, fontWeight: 900, color: '#0b2d51', marginBottom: 16 }}>
-                云反演模块
-              </div>
-
-              <div style={{ display: 'grid', gap: 12 }}>
-                {cloudModules.map((item) => (
-                  <button
-                    key={item.key}
-                    onClick={() => setActiveCloudKey(item.key)}
-                    style={{
-                      textAlign: 'left',
-                      padding: '18px 16px',
-                      borderRadius: 14,
-                      border: activeCloudKey === item.key ? '2px solid #2b73db' : '1px solid #d7e3f0',
-                      background:
-                        activeCloudKey === item.key
-                          ? 'linear-gradient(135deg, rgba(41,118,210,0.13), rgba(89,176,255,0.08))'
-                          : '#fff',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    <div style={{ fontWeight: 800, fontSize: 20, color: '#13385f' }}>
-                      {item.title}
-                    </div>
-                    <div style={{ marginTop: 8, color: '#60748b', lineHeight: 1.7 }}>
-                      {item.description}
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* 中间模块参数区 */}
-            <div style={{ ...styles.card, padding: 22 }}>
-              {(() => {
-                const item = cloudModules.find((x) => x.key === activeCloudKey);
-
-                if (!item?.module) {
-                  return <div style={{ padding: 20, color: '#999' }}>正在加载模块配置...</div>;
-                }
-
-                return renderModuleRuntime(item.module);
-              })()}
-            </div>
-
-            {/* 右侧文件管理区 */}
-            {renderFileManagerPanel()}
-          </section>
-        )}
-
-        {activeTab === 'aerosol' && (
-          <section style={{ display: 'grid', gridTemplateColumns: '300px 1fr', gap: 12, minHeight: 'calc(100vh - 98px)' }}>
-            <div style={{ ...styles.card, padding: 18 }}>
-              <div style={{ fontSize: 22, fontWeight: 900, color: '#0b2d51', marginBottom: 16 }}>气溶胶反演模块</div>
-              <div style={{ display: 'grid', gap: 12 }}>
-                {aerosolModules.map((item) => (
-                  <button
-                    key={item.key}
-                    onClick={() => setActiveAerosolKey(item.key)}
-                    style={{
-                      textAlign: 'left',
-                      padding: '18px 16px',
-                      borderRadius: 14,
-                      border: activeAerosolKey === item.key ? '2px solid #2b73db' : '1px solid #d7e3f0',
-                      background: activeAerosolKey === item.key ? 'linear-gradient(135deg, rgba(41,118,210,0.13), rgba(89,176,255,0.08))' : '#fff',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    <div style={{ fontWeight: 800, fontSize: 20, color: '#13385f' }}>{item.title}</div>
-                    <div style={{ marginTop: 8, color: '#60748b', lineHeight: 1.7 }}>
-                      {item.module ? '已接入模块，可直接配置输入参数并运行。' : '当前尚未匹配到后端模块。'}
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div style={{ ...styles.card, padding: 22 }}>
-              {renderModuleRuntime(aerosolModules.find((x) => x.key === activeAerosolKey)?.module)}
-            </div>
-          </section>
-        )}
-
-        {activeTab.startsWith('dynamic:') && (
-          <section style={{ ...styles.card, padding: 22, minHeight: 'calc(100vh - 98px)' }}>
-            {renderModuleRuntime(dynamicModules.find((m) => `dynamic:${m.id}` === activeTab))}
-          </section>
-        )}
-
+        {activeTab.startsWith('tool:') && renderToolPage(activeTab.slice('tool:'.length))}
         {activeTab === 'tasks' && (
           <section style={{ ...styles.card, padding: 18, minHeight: 'calc(100vh - 98px)' }}>
             <div style={{ fontSize: 28, fontWeight: 900, color: '#0b2d51', marginBottom: 16 }}>任务列表</div>
@@ -2189,13 +2339,13 @@ async function handleRegister() {
           <div style={{ lineHeight: 1.9, color: '#173353' }}>
             <p>你这个系统是本地服务器 + 本地浏览器模式，可以支持“把压缩包放到指定目录就相当于添加模块”的方式。</p>
             <p>
-              建议后端加一个模块投放目录，例如：
-              <code>D:/local_module_web_system/module_drop</code>
+              当前后端会自动创建并扫描本地投放目录：
+              <code>{dropInfo.drop_dir || '项目根目录/module_drop'}</code>
             </p>
             <ol>
-              <li>管理员把模块 zip 放进去</li>
-              <li>后端扫描该目录</li>
-              <li>自动调用现有安装逻辑完成安装</li>
+              <li>管理员先在“模块所属工具栏”里选择云反演、气溶胶反演或自定义工具类型</li>
+              <li>把模块 zip 直接放进这个目录，不需要在网页里选择文件</li>
+              <li>点击“扫描本地目录安装”，后端会安装 zip，并把安装成功的 zip 移到 module_drop/installed</li>
             </ol>
           </div>
         </SimpleOverlay>

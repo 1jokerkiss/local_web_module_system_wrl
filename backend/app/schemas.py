@@ -23,6 +23,7 @@ class ModuleDefinition(BaseModel):
     command_template: list[str] = Field(default_factory=list)
     inputs: list[ModuleInputField] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    tool_type: str = "cloud"
     enabled: bool = True
 
 

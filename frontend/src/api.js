@@ -126,6 +126,21 @@ export async function getModules() {
   return request('/api/modules');
 }
 
+export async function getAdminModules() {
+  return request('/api/admin/modules');
+}
+
+export async function getToolbars() {
+  return request('/api/toolbars');
+}
+
+export async function addToolbar(payload) {
+  return request('/api/admin/toolbars', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function saveModule(payload) {
   return request('/api/admin/modules', {
     method: 'POST',
@@ -139,12 +154,24 @@ export async function deleteModule(moduleId) {
   });
 }
 
-export async function uploadModuleZip(file) {
+export async function uploadModuleZip(file, toolType = 'cloud') {
   const fd = new FormData();
   fd.append('file', file);
+  fd.append('tool_type', toolType);
   return request('/api/admin/modules/upload', {
     method: 'POST',
     body: fd,
+  });
+}
+
+export async function listDropZips() {
+  return request('/api/admin/modules/drop-zips');
+}
+
+export async function installLocalDropModules(toolType = 'cloud', filename = '') {
+  return request('/api/admin/modules/install-local-drop', {
+    method: 'POST',
+    body: JSON.stringify({ tool_type: toolType, filename }),
   });
 }
 

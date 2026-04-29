@@ -8,7 +8,7 @@ from pathlib import Path
 from string import Formatter
 from typing import Any, Dict, List, Optional
 from datetime import datetime
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,9 +42,14 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 MODULES_FILE = DATA_DIR / "modules.json"
 TASKS_FILE = DATA_DIR / "tasks.json"
+TOOLBARS_FILE = DATA_DIR / "toolbars.json"
 
 INSTALLED_MODULES_DIR = BASE_DIR / "installed_modules"
 INSTALLED_MODULES_DIR.mkdir(parents=True, exist_ok=True)
+
+# 单机本地投放目录：管理员可以把模块 zip 直接放到这里，前端点“扫描本地目录安装”即可。
+MODULE_DROP_DIR = BASE_DIR.parent / "module_drop"
+MODULE_DROP_DIR.mkdir(parents=True, exist_ok=True)
 
 RUNTIME_DIR = BASE_DIR / "runtime"
 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
@@ -102,6 +107,11 @@ class UpdateUserEnabledRequest(BaseModel):
     enabled: bool
 class ResetUserPasswordRequest(BaseModel):
     new_password: str
+
+
+class ToolBarSaveRequest(BaseModel):
+    key: str = ""
+    label: str
 class ModuleRunRequest(BaseModel):
     module_id: str
     inputs: Dict[str, Any] = {}
@@ -115,8 +125,133 @@ class ModuleSaveRequest(BaseModel):
     command_template: List[str] = []
     inputs: List[Dict[str, Any]] = []
     tags: List[str] = []
+    tool_type: str = "cloud"
     enabled: bool = True
+
+
+class InstallLocalDropRequest(BaseModel):
+    tool_type: str = "cloud"
+    filename: str = ""
 # 通用辅助函数
+DEFAULT_TOOLBARS = [
+    {"key": "cloud", "label": "云反演", "system": True},
+    {"key": "aerosol", "label": "气溶胶反演", "system": True},
+]
+
+
+def normalize_tool_key(value: str) -> str:
+    """把工具栏 key 规范化，允许中文名称，但过滤路径和分隔符。"""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    value = value.replace("..", "_").replace("/", "_").replace("\\", "_")
+    value = "_".join(value.split())
+    return value
+
+
+def make_toolbar_key(label: str) -> str:
+    raw = normalize_tool_key(label)
+    if raw:
+        return raw
+    return f"tool_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+
+def ensure_toolbars_file():
+    if not TOOLBARS_FILE.exists():
+        TOOLBARS_FILE.write_text(
+            json.dumps(DEFAULT_TOOLBARS, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
+def load_toolbars() -> List[dict]:
+    ensure_toolbars_file()
+    try:
+        raw = json.loads(TOOLBARS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            raw = []
+    except Exception:
+        raw = []
+
+    merged: Dict[str, dict] = {}
+    for item in DEFAULT_TOOLBARS + raw:
+        key = normalize_tool_key(str(item.get("key", "")))
+        label = str(item.get("label") or key).strip()
+        if not key or not label:
+            continue
+        merged[key] = {
+            "key": key,
+            "label": label,
+            "system": bool(item.get("system", key in {"cloud", "aerosol"})),
+        }
+
+    result = list(merged.values())
+    result.sort(key=lambda x: (0 if x.get("key") in {"cloud", "aerosol"} else 1, x.get("label", "")))
+    return result
+
+
+def save_toolbars(toolbars: List[dict]):
+    TOOLBARS_FILE.write_text(
+        json.dumps(toolbars, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def add_toolbar(key: str, label: str) -> dict:
+    label = (label or "").strip()
+    if not label:
+        raise ValueError("工具类型名称不能为空")
+
+    key = normalize_tool_key(key) or make_toolbar_key(label)
+    toolbars = load_toolbars()
+    if any(t.get("key") == key for t in toolbars):
+        raise ValueError("工具类型已存在")
+
+    item = {"key": key, "label": label, "system": False}
+    toolbars.append(item)
+    save_toolbars(toolbars)
+    return item
+
+
+def ensure_toolbar_exists(key: str, label: str | None = None):
+    key = normalize_tool_key(key) or "cloud"
+    toolbars = load_toolbars()
+    if any(t.get("key") == key for t in toolbars):
+        return
+    toolbars.append({"key": key, "label": label or key, "system": False})
+    save_toolbars(toolbars)
+
+
+def guess_module_tool_type(module: dict) -> str:
+    explicit = normalize_tool_key(str(module.get("tool_type") or module.get("category") or ""))
+    if explicit:
+        return explicit
+
+    text = " ".join(
+        str(x or "")
+        for x in [
+            module.get("id"),
+            module.get("name"),
+            module.get("description"),
+            " ".join(module.get("tags") or []),
+        ]
+    ).lower()
+
+    if any(k in text for k in ["aod", "aerosol", "气溶胶", "h8", "polar", "偏振"]):
+        return "aerosol"
+    if any(k in text for k in ["cloud", "云", "cloud_type", "cth"]):
+        return "cloud"
+    return "cloud"
+
+
+def normalize_module_record(module: dict) -> dict:
+    if not isinstance(module, dict):
+        return {}
+    copied = dict(module)
+    copied["tool_type"] = guess_module_tool_type(copied)
+    return copied
+
+
 def ensure_modules_file():
     if not MODULES_FILE.exists():
         MODULES_FILE.write_text("[]", encoding="utf-8")
@@ -125,7 +260,7 @@ def load_modules() -> List[dict]:
     try:
         data = json.loads(MODULES_FILE.read_text(encoding="utf-8"))
         if isinstance(data, list):
-            return data
+            return [normalize_module_record(item) for item in data if isinstance(item, dict)]
         return []
     except Exception:
         return []
@@ -150,7 +285,7 @@ def get_module(module_id: str) -> Optional[dict]:
 @app.get("/api/files")
 def api_list_user_files(authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
-    user_dir = UPLOADS_DIR / user["username"]
+    user_dir = UPLOADS_DIR / user.username
     user_dir.mkdir(parents=True, exist_ok=True)
 
     items = []
@@ -172,7 +307,7 @@ def api_upload_user_file(
     authorization: str | None = Header(default=None),
 ):
     user = get_current_user(authorization)
-    user_dir = UPLOADS_DIR / user["username"]
+    user_dir = UPLOADS_DIR / user.username
     user_dir.mkdir(parents=True, exist_ok=True)
 
     original_name = sanitize_filename(file.filename or "uploaded_file")
@@ -204,7 +339,7 @@ def api_upload_user_file(
 @app.delete("/api/files/{filename}")
 def api_delete_user_file(filename: str, authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
-    user_dir = UPLOADS_DIR / user["username"]
+    user_dir = UPLOADS_DIR / user.username
     user_dir.mkdir(parents=True, exist_ok=True)
 
     safe_name = sanitize_filename(filename)
@@ -219,7 +354,7 @@ def api_delete_user_file(filename: str, authorization: str | None = Header(defau
 @app.get("/api/files/{filename}/download")
 def api_download_user_file(filename: str, authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
-    user_dir = UPLOADS_DIR / user["username"]
+    user_dir = UPLOADS_DIR / user.username
     user_dir.mkdir(parents=True, exist_ok=True)
 
     safe_name = sanitize_filename(filename)
@@ -230,6 +365,8 @@ def api_download_user_file(filename: str, authorization: str | None = Header(def
     return FileResponse(str(target), filename=target.name)
 
 def upsert_module(module_data: dict):
+    module_data = normalize_module_record(module_data)
+    ensure_toolbar_exists(module_data.get("tool_type") or "cloud")
     modules = load_modules()
     found = False
     for i, module in enumerate(modules):
@@ -370,7 +507,7 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
     # 强制 cwd 为模块目录
     return command, str(module_dir), runtime_env
 
-def install_uploaded_zip(zip_path: Path) -> dict:
+def install_uploaded_zip(zip_path: Path, tool_type: str | None = None) -> dict:
     temp_dir = Path(tempfile.mkdtemp(prefix="module_zip_"))
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
@@ -384,6 +521,10 @@ def install_uploaded_zip(zip_path: Path) -> dict:
         module_root = module_json_path.parent
 
         module_data = json.loads(module_json_path.read_text(encoding="utf-8"))
+        selected_tool_type = normalize_tool_key(tool_type or module_data.get("tool_type") or "") or guess_module_tool_type(module_data)
+        module_data["tool_type"] = selected_tool_type
+        ensure_toolbar_exists(selected_tool_type)
+
         module_id = module_data.get("id")
         if not module_id:
             raise HTTPException(status_code=400, detail="module.json 缺少 id")
@@ -555,6 +696,31 @@ def api_reset_user_password(
 
 
 # =========================
+# 工具栏 / 工具类型接口
+# =========================
+@app.get("/api/toolbars")
+def api_list_toolbars(authorization: str | None = Header(default=None)):
+    get_current_user(authorization)
+    return load_toolbars()
+
+
+@app.get("/api/admin/toolbars")
+def api_admin_list_toolbars(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    return load_toolbars()
+
+
+@app.post("/api/admin/toolbars")
+def api_add_toolbar(payload: ToolBarSaveRequest, authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    try:
+        item = add_toolbar(payload.key, payload.label)
+        return {"ok": True, "toolbar": item}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# =========================
 # 模块接口
 # =========================
 @app.get("/api/modules")
@@ -590,9 +756,13 @@ def api_delete_module(module_id: str, authorization: str | None = Header(default
 @app.post("/api/admin/modules/upload")
 def api_upload_module_zip(
     file: UploadFile = File(...),
+    tool_type: str = Form("cloud"),
     authorization: str | None = Header(default=None),
 ):
     require_admin(authorization)
+
+    selected_tool_type = normalize_tool_key(tool_type) or "cloud"
+    ensure_toolbar_exists(selected_tool_type)
 
     suffix = Path(file.filename or "module.zip").suffix or ".zip"
     temp_zip = Path(tempfile.mktemp(suffix=suffix))
@@ -600,11 +770,74 @@ def api_upload_module_zip(
         with temp_zip.open("wb") as f:
             f.write(file.file.read())
 
-        module_data = install_uploaded_zip(temp_zip)
+        module_data = install_uploaded_zip(temp_zip, selected_tool_type)
         return {"ok": True, "module": module_data}
     finally:
         if temp_zip.exists():
             temp_zip.unlink(missing_ok=True)
+
+
+@app.get("/api/admin/modules/drop-zips")
+def api_list_module_drop_zips(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    MODULE_DROP_DIR.mkdir(parents=True, exist_ok=True)
+    zips = []
+    for p in sorted(MODULE_DROP_DIR.glob("*.zip"), key=lambda x: x.stat().st_mtime, reverse=True):
+        stat = p.stat()
+        zips.append({
+            "name": p.name,
+            "path": str(p.resolve()),
+            "size": stat.st_size,
+            "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+        })
+    return {"drop_dir": str(MODULE_DROP_DIR.resolve()), "items": zips}
+
+
+def archive_installed_zip(zip_path: Path):
+    archive_dir = MODULE_DROP_DIR / "installed"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    target = archive_dir / zip_path.name
+    if target.exists():
+        target = archive_dir / f"{zip_path.stem}_{datetime.now().strftime('%Y%m%d%H%M%S')}{zip_path.suffix}"
+    shutil.move(str(zip_path), str(target))
+
+
+@app.post("/api/admin/modules/install-local-drop")
+def api_install_modules_from_local_drop(
+    payload: InstallLocalDropRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    MODULE_DROP_DIR.mkdir(parents=True, exist_ok=True)
+
+    selected_tool_type = normalize_tool_key(payload.tool_type) or "cloud"
+    ensure_toolbar_exists(selected_tool_type)
+
+    if payload.filename:
+        safe_name = sanitize_filename(payload.filename)
+        candidates = [MODULE_DROP_DIR / safe_name]
+    else:
+        candidates = sorted(MODULE_DROP_DIR.glob("*.zip"), key=lambda x: x.stat().st_mtime)
+
+    installed = []
+    failed = []
+    for zip_path in candidates:
+        if not zip_path.exists() or not zip_path.is_file() or zip_path.suffix.lower() != ".zip":
+            failed.append({"name": zip_path.name, "error": "zip 文件不存在"})
+            continue
+        try:
+            module_data = install_uploaded_zip(zip_path, selected_tool_type)
+            installed.append(module_data)
+            archive_installed_zip(zip_path)
+        except Exception as e:
+            failed.append({"name": zip_path.name, "error": str(e)})
+
+    return {
+        "ok": len(failed) == 0,
+        "drop_dir": str(MODULE_DROP_DIR.resolve()),
+        "installed": installed,
+        "failed": failed,
+    }
 
 
 # =========================

@@ -241,6 +241,7 @@ def install_module_zip(zip_path: Path) -> ModuleDefinition:
         command_template=command_template,
         inputs=inputs,
         tags=manifest.get("tags", []),
+        tool_type=manifest.get("tool_type", manifest.get("category", "cloud")),
         enabled=True,
     )
 
