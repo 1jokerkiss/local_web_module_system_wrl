@@ -1,0 +1,34 @@
+[
+  {
+    "username": "admin",
+    "password_hash": "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9",
+    "role": "admin",
+    "enabled": true,
+    "security_question": "管理员默认账号",
+    "security_answer_hash": "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
+  },
+  {
+    "username": "user",
+    "password_hash": "e606e38b0d8c19b24cf0ee3808183162ea7cd63ff7912dbb22b5e803286b4446",
+    "role": "user",
+    "enabled": true,
+    "security_question": "默认用户账号",
+    "security_answer_hash": "e606e38b0d8c19b24cf0ee3808183162ea7cd63ff7912dbb22b5e803286b4446"
+  },
+  {
+    "username": "11",
+    "password_hash": "4fc82b26aecb47d2868c4efbe3581732a3e7cbcc6c2efb32062c08170a05eeb8",
+    "role": "user",
+    "enabled": true,
+    "security_question": "你的学校名",
+    "security_answer_hash": "ff9ca42d9e8ee3a528584035e33c6973ed925d114957b662221cf7ea69a6ce1f"
+  },
+  {
+    "username": "111",
+    "password_hash": "f6e0a1e2ac41945a9aa7ff8a8aaa0cebc12a3bcc981a929ad5cf810a090e11ae",
+    "role": "user",
+    "enabled": true,
+    "security_question": "111",
+    "security_answer_hash": "f6e0a1e2ac41945a9aa7ff8a8aaa0cebc12a3bcc981a929ad5cf810a090e11ae"
+  }
+]
