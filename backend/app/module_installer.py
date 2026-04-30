@@ -206,17 +206,8 @@ def install_module_zip(zip_path: Path) -> ModuleDefinition:
 
     inputs: list[ModuleInputField] = []
     for item in manifest.get("inputs", []):
-        inputs.append(
-            ModuleInputField(
-                key=item["key"],
-                label=item.get("label", item["key"]),
-                type=item.get("type", "text"),
-                required=item.get("required", True),
-                placeholder=item.get("placeholder", ""),
-                default=item.get("default"),
-                help_text=item.get("help_text", ""),
-            )
-        )
+        # 保留 visible_to_user/admin_fixed/path_mode 等管理员输入控制字段。
+        inputs.append(ModuleInputField.model_validate(item))
 
     command_template = manifest.get("command_template")
     if not command_template:
@@ -242,11 +233,13 @@ def install_module_zip(zip_path: Path) -> ModuleDefinition:
         inputs=inputs,
         tags=manifest.get("tags", []),
         tool_type=manifest.get("tool_type", manifest.get("category", "cloud")),
-        parallel_mode=manifest.get("parallel_mode", "auto"),
-        parallel_input_key=manifest.get("parallel_input_key", ""),
-        parallel_output_key=manifest.get("parallel_output_key", ""),
-        parallel_file_patterns=manifest.get("parallel_file_patterns", "*.tif;*.tiff;*.nc;*.hdf;*.h5"),
-        parallel_output_suffix=manifest.get("parallel_output_suffix", ".tif"),
+        parallel=manifest.get("parallel") or {
+            "mode": manifest.get("parallel_mode", "auto"),
+            "input_key": manifest.get("parallel_input_key", ""),
+            "output_key": manifest.get("parallel_output_key", ""),
+            "file_patterns": manifest.get("parallel_file_patterns", "*.tif;*.tiff;*.nc;*.hdf;*.h5"),
+            "output_suffix": manifest.get("parallel_output_suffix", ".tif"),
+        },
         enabled=True,
     )
 

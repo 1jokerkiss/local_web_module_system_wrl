@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 ParallelMode = Literal["none", "auto", "single_file", "folder_chunks", "module_internal"]
@@ -14,6 +14,13 @@ class ModuleInputField(BaseModel):
     placeholder: str = ""
     default: str | int | float | None = None
     help_text: str = ""
+    visible_to_user: bool = True
+    admin_fixed: bool = False
+    path_mode: Literal["absolute", "relative_to_module"] = "absolute"
+    batch_role: str = ""
+    match_mode: str = "none"
+
+    model_config = ConfigDict(extra="allow")
 
 
 class ModuleDefinition(BaseModel):
@@ -28,17 +35,18 @@ class ModuleDefinition(BaseModel):
     tags: list[str] = Field(default_factory=list)
     tool_type: str = "cloud"
 
-    # 并行执行配置：
-    # auto：自动判断输入是文件还是文件夹；single_file：每个文件一个进程；
-    # folder_chunks：把输入文件夹拆成多个临时子目录，每个子目录启动一个进程；
-    # module_internal：模块源码自己处理并行，平台只把 parallel_workers 传进去；none：禁用并行拆分。
-    parallel_mode: ParallelMode = "auto"
-    parallel_input_key: str = ""
-    parallel_output_key: str = ""
-    parallel_file_patterns: str = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
-    parallel_output_suffix: str = ".tif"
+    # 并行执行配置放进 module.json 的 parallel 字段。
+    parallel: dict[str, Any] = Field(default_factory=lambda: {
+        "mode": "auto",
+        "input_key": "",
+        "output_key": "",
+        "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
+        "output_suffix": ".tif",
+    })
 
     enabled: bool = True
+
+    model_config = ConfigDict(extra="allow")
 
 
 class ModuleRunRequest(BaseModel):

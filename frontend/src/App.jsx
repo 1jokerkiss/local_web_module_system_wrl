@@ -40,6 +40,14 @@ import {
 } from './api';
 
 
+const defaultParallelConfig = {
+  mode: 'auto',
+  input_key: '',
+  output_key: '',
+  file_patterns: '*.tif;*.tiff;*.nc;*.hdf;*.h5',
+  output_suffix: '.tif',
+};
+
 const emptyModuleForm = {
   id: '',
   name: '',
@@ -51,11 +59,8 @@ const emptyModuleForm = {
   inputs_text: '[]',
   tags_text: '',
   tool_type: '',
-  parallel_mode: 'auto',
-  parallel_input_key: '',
-  parallel_output_key: '',
-  parallel_file_patterns: '*.tif;*.tiff;*.nc;*.hdf;*.h5',
-  parallel_output_suffix: '.tif',
+  parallel_json_text: JSON.stringify(defaultParallelConfig, null, 2),
+  extra_json_text: '{}',
   enabled: true,
 };
 
@@ -202,6 +207,52 @@ function guessToolType(module) {
 
 function getModuleToolType(module) {
   return guessToolType(module);
+}
+
+function getModuleParallelConfig(module) {
+  const raw = module?.parallel && typeof module.parallel === 'object' ? module.parallel : {};
+  return {
+    mode: raw.mode || module?.parallel_mode || 'auto',
+    input_key: raw.input_key || module?.parallel_input_key || '',
+    output_key: raw.output_key || module?.parallel_output_key || '',
+    file_patterns: raw.file_patterns || module?.parallel_file_patterns || '*.tif;*.tiff;*.nc;*.hdf;*.h5',
+    output_suffix: raw.output_suffix || module?.parallel_output_suffix || '.tif',
+  };
+}
+
+function isFieldVisibleToUser(field) {
+  return field?.visible_to_user !== false && field?.admin_fixed !== true;
+}
+
+function makeEmptyInputField() {
+  return {
+    key: '',
+    label: '',
+    type: 'file_path',
+    required: true,
+    placeholder: '',
+    default: '',
+    help_text: '',
+    visible_to_user: true,
+    admin_fixed: false,
+    path_mode: 'absolute',
+    batch_role: '',
+    match_mode: 'none',
+  };
+}
+
+function pickModuleExtraFields(module) {
+  const managed = new Set([
+    'id', 'name', 'description', 'executable', 'working_dir', 'config_mode',
+    'command_template', 'inputs', 'tags', 'tool_type', 'category', 'parallel',
+    'parallel_mode', 'parallel_input_key', 'parallel_output_key', 'parallel_file_patterns',
+    'parallel_output_suffix', 'enabled',
+  ]);
+  const extra = {};
+  Object.entries(module || {}).forEach(([key, value]) => {
+    if (!managed.has(key)) extra[key] = value;
+  });
+  return extra;
 }
 
 function uniqToolbars(toolbars, modules) {
@@ -1037,6 +1088,8 @@ export default function App() {
   const [runtimeForms, setRuntimeForms] = useState({});
   const [moduleForm, setModuleForm] = useState(emptyModuleForm);
   const [editingModuleId, setEditingModuleId] = useState('');
+  const [inputEditorOpen, setInputEditorOpen] = useState(false);
+  const [inputEditorFields, setInputEditorFields] = useState([]);
   const [zipFile, setZipFile] = useState(null);
   const [uploadToolType, setUploadToolType] = useState('');
   const [dropInfo, setDropInfo] = useState({ drop_dir: '', items: [] });
@@ -1130,7 +1183,7 @@ useEffect(() => {
     setRuntimeForms((prev) => {
       if (prev[m.id]) return prev;
       const init = { task_name: m.name, _parallel_workers: 1 };
-      (m.inputs || []).forEach((f) => {
+      (m.inputs || []).filter(isFieldVisibleToUser).forEach((f) => {
         init[f.key] = f.default ?? '';
       });
       return { ...prev, [m.id]: init };
@@ -1545,18 +1598,17 @@ async function handleRegister() {
       inputs_text: JSON.stringify(module.inputs || [], null, 2),
       tags_text: (module.tags || []).join(','),
       tool_type: getModuleToolType(module),
-      parallel_mode: module.parallel_mode || 'auto',
-      parallel_input_key: module.parallel_input_key || '',
-      parallel_output_key: module.parallel_output_key || '',
-      parallel_file_patterns: module.parallel_file_patterns || '*.tif;*.tiff;*.nc;*.hdf;*.h5',
-      parallel_output_suffix: module.parallel_output_suffix || '.tif',
+      parallel_json_text: JSON.stringify(getModuleParallelConfig(module), null, 2),
+      extra_json_text: JSON.stringify(pickModuleExtraFields(module), null, 2),
       enabled: module.enabled !== false,
     });
   }
 
   async function saveCurrentModule() {
     try {
+      const extraModuleFields = JSON.parse(moduleForm.extra_json_text || '{}');
       await saveModule({
+        ...extraModuleFields,
         id: moduleForm.id.trim(),
         name: moduleForm.name.trim(),
         description: moduleForm.description,
@@ -1570,11 +1622,7 @@ async function handleRegister() {
           .map((x) => x.trim())
           .filter(Boolean),
         tool_type: moduleForm.tool_type || visibleToolbars[0]?.key || 'uncategorized',
-        parallel_mode: moduleForm.parallel_mode || 'auto',
-        parallel_input_key: moduleForm.parallel_input_key || '',
-        parallel_output_key: moduleForm.parallel_output_key || '',
-        parallel_file_patterns: moduleForm.parallel_file_patterns || '*.tif;*.tiff;*.nc;*.hdf;*.h5',
-        parallel_output_suffix: moduleForm.parallel_output_suffix || '.tif',
+        parallel: JSON.parse(moduleForm.parallel_json_text || '{}'),
         enabled: moduleForm.enabled,
       });
       setModuleForm(emptyModuleForm);
@@ -1726,6 +1774,41 @@ async function handleRegister() {
     } catch (e) {
       alert(e?.message || '删除工具栏失败');
     }
+  }
+
+  function openInputEditor() {
+    try {
+      const fields = JSON.parse(moduleForm.inputs_text || '[]');
+      if (!Array.isArray(fields)) {
+        alert('输入字段必须是 JSON 数组');
+        return;
+      }
+      setInputEditorFields(fields.map((f) => ({ ...makeEmptyInputField(), ...f })));
+      setInputEditorOpen(true);
+    } catch (e) {
+      alert('输入字段 JSON 格式错误：' + (e?.message || e));
+    }
+  }
+
+  function updateInputEditorField(index, patch) {
+    setInputEditorFields((prev) => prev.map((item, i) => (i === index ? { ...item, ...patch } : item)));
+  }
+
+  function saveInputEditor() {
+    const cleaned = inputEditorFields.map((item) => {
+      const next = { ...item };
+      next.key = String(next.key || '').trim();
+      next.label = String(next.label || '').trim() || next.key;
+      next.type = next.type || 'text';
+      next.required = !!next.required;
+      next.visible_to_user = next.visible_to_user !== false;
+      next.admin_fixed = !!next.admin_fixed;
+      next.path_mode = next.path_mode === 'relative_to_module' ? 'relative_to_module' : 'absolute';
+      return next;
+    }).filter((item) => item.key);
+
+    setModuleForm((prev) => ({ ...prev, inputs_text: JSON.stringify(cleaned, null, 2) }));
+    setInputEditorOpen(false);
   }
 
   async function handleDeleteModule(moduleId) {
@@ -1972,7 +2055,7 @@ async function handleRegister() {
             </div>
           </label>
 
-          {(module.inputs || []).map((field) => (
+          {(module.inputs || []).filter(isFieldVisibleToUser).map((field) => (
             <label key={field.key}>
               <div style={{ fontWeight: 800, color: '#173353', marginBottom: 8 }}>
                 {field.label || field.key}
@@ -2383,43 +2466,15 @@ async function handleRegister() {
                   <input placeholder="工作目录" value={moduleForm.working_dir} onChange={(e) => setModuleForm({ ...moduleForm, working_dir: e.target.value })} style={styles.input} />
                   <input placeholder="标签，英文逗号分隔" value={moduleForm.tags_text} onChange={(e) => setModuleForm({ ...moduleForm, tags_text: e.target.value })} style={styles.input} />
 
-                  <label>
-                    <div style={labelStyle}>并行模式</div>
-                    <select value={moduleForm.parallel_mode} onChange={(e) => setModuleForm({ ...moduleForm, parallel_mode: e.target.value })} style={styles.input}>
-                      <option value="auto">auto：自动判断</option>
-                      <option value="single_file">single_file：单文件源码，多文件多进程</option>
-                      <option value="folder_chunks">folder_chunks：文件夹源码，拆分子目录并行</option>
-                      <option value="module_internal">module_internal：源码内部自己并行</option>
-                      <option value="none">none：不启用并行拆分</option>
-                    </select>
-                  </label>
-                  <label>
-                    <div style={labelStyle}>并行输入字段 key</div>
-                    <input placeholder="例如 file、input_path、infile；留空则自动识别" value={moduleForm.parallel_input_key} onChange={(e) => setModuleForm({ ...moduleForm, parallel_input_key: e.target.value })} style={styles.input} />
-                  </label>
-                  <label>
-                    <div style={labelStyle}>并行输出字段 key</div>
-                    <input placeholder="可选，例如 output_path；输出目录字段可留空" value={moduleForm.parallel_output_key} onChange={(e) => setModuleForm({ ...moduleForm, parallel_output_key: e.target.value })} style={styles.input} />
-                  </label>
-                  <label>
-                    <div style={labelStyle}>输出文件后缀</div>
-                    <input placeholder="例如 .tif" value={moduleForm.parallel_output_suffix} onChange={(e) => setModuleForm({ ...moduleForm, parallel_output_suffix: e.target.value })} style={styles.input} />
-                  </label>
-                  <label style={{ gridColumn: '1 / span 2' }}>
-                    <div style={labelStyle}>批量文件通配符</div>
-                    <input placeholder="例如 *.tif;*.tiff 或 *R21*.nc" value={moduleForm.parallel_file_patterns} onChange={(e) => setModuleForm({ ...moduleForm, parallel_file_patterns: e.target.value })} style={styles.input} />
-                  </label>
-                  <div style={{ gridColumn: '1 / span 2', color: '#6a7f96', fontSize: 13, lineHeight: 1.7 }}>
-                    single_file 适合源码一次接收一个 tif/nc；folder_chunks 适合像 CM_CTH.py 一样接收文件夹并在源码内部遍历文件夹的模块。
-                  </div>
-
                   <textarea placeholder="描述" value={moduleForm.description} onChange={(e) => setModuleForm({ ...moduleForm, description: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 80 }} />
                   <textarea placeholder="命令模板(JSON数组)" value={moduleForm.command_template_text} onChange={(e) => setModuleForm({ ...moduleForm, command_template_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2' }} />
-                  <textarea placeholder="输入字段(JSON数组)" value={moduleForm.inputs_text} onChange={(e) => setModuleForm({ ...moduleForm, inputs_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 180 }} />
+                  <textarea placeholder="输入字段(JSON数组)：包含输入/输出路径、是否用户可见、管理员预填 resources 等" value={moduleForm.inputs_text} onChange={(e) => setModuleForm({ ...moduleForm, inputs_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 180 }} />
+                  <textarea placeholder="并行配置(JSON对象)，保存在 module.json 的 parallel 字段" value={moduleForm.parallel_json_text} onChange={(e) => setModuleForm({ ...moduleForm, parallel_json_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 110 }} />
                 </div>
 
-                <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
+                <div style={{ display: 'flex', gap: 10, marginTop: 14, flexWrap: 'wrap' }}>
                   <button style={styles.blueBtn} onClick={saveCurrentModule}>保存模块</button>
+                  <button style={styles.whiteBtn} onClick={openInputEditor}>编辑输入文件</button>
                   <button
                     style={styles.whiteBtn}
                     onClick={() => {
@@ -2629,6 +2684,129 @@ async function handleRegister() {
             ))}
           </div>
         </div>
+      )}
+
+
+      {inputEditorOpen && (
+        <SimpleOverlay
+          title="编辑输入文件"
+          onClose={() => setInputEditorOpen(false)}
+          width="min(1180px, 96vw)"
+        >
+          <div style={{ color: '#173353', lineHeight: 1.7 }}>
+            <div style={{ marginBottom: 12, color: '#5f7088' }}>
+              这里设置每个输入字段是否需要用户填写。选择“管理员预填/隐藏”后，用户运行界面不会显示该字段；默认值可以写 resources 里的相对路径，例如 resources/ConfigXMLFile.xml。
+            </div>
+
+            <div style={{ display: 'grid', gap: 12 }}>
+              {inputEditorFields.map((field, index) => (
+                <div
+                  key={index}
+                  style={{
+                    border: '1px solid #d7e3f0',
+                    background: '#fff',
+                    borderRadius: 12,
+                    padding: 12,
+                  }}
+                >
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 130px 110px', gap: 10 }}>
+                    <input
+                      placeholder="key，例如 input_file"
+                      value={field.key || ''}
+                      onChange={(e) => updateInputEditorField(index, { key: e.target.value })}
+                      style={styles.input}
+                    />
+                    <input
+                      placeholder="显示名称"
+                      value={field.label || ''}
+                      onChange={(e) => updateInputEditorField(index, { label: e.target.value })}
+                      style={styles.input}
+                    />
+                    <select
+                      value={field.type || 'text'}
+                      onChange={(e) => updateInputEditorField(index, { type: e.target.value })}
+                      style={styles.input}
+                    >
+                      <option value="text">text</option>
+                      <option value="textarea">textarea</option>
+                      <option value="number">number</option>
+                      <option value="file_path">file_path</option>
+                      <option value="dir_path">dir_path</option>
+                      <option value="password">password</option>
+                    </select>
+                    <select
+                      value={field.required ? 'true' : 'false'}
+                      onChange={(e) => updateInputEditorField(index, { required: e.target.value === 'true' })}
+                      style={styles.input}
+                    >
+                      <option value="true">必填</option>
+                      <option value="false">非必填</option>
+                    </select>
+                  </div>
+
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 180px 170px', gap: 10, marginTop: 10 }}>
+                    <input
+                      placeholder="默认值 / 管理员预填路径，例如 resources/ConfigXMLFile.xml"
+                      value={field.default ?? ''}
+                      onChange={(e) => updateInputEditorField(index, { default: e.target.value })}
+                      style={styles.input}
+                    />
+                    <select
+                      value={field.visible_to_user === false ? 'hidden' : 'visible'}
+                      onChange={(e) => {
+                        const visible = e.target.value === 'visible';
+                        updateInputEditorField(index, { visible_to_user: visible, admin_fixed: !visible });
+                      }}
+                      style={styles.input}
+                    >
+                      <option value="visible">用户输入</option>
+                      <option value="hidden">用户隐藏</option>
+                    </select>
+                    <select
+                      value={field.path_mode || 'absolute'}
+                      onChange={(e) => updateInputEditorField(index, { path_mode: e.target.value })}
+                      style={styles.input}
+                    >
+                      <option value="absolute">绝对路径/原样</option>
+                      <option value="relative_to_module">相对模块目录</option>
+                    </select>
+                  </div>
+
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 10, marginTop: 10 }}>
+                    <input
+                      placeholder="说明 help_text"
+                      value={field.help_text || ''}
+                      onChange={(e) => updateInputEditorField(index, { help_text: e.target.value })}
+                      style={styles.input}
+                    />
+                    <button
+                      style={styles.redBtn}
+                      onClick={() => setInputEditorFields((prev) => prev.filter((_, i) => i !== index))}
+                    >
+                      删除
+                    </button>
+                  </div>
+
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, flexDirection: 'row' }}>
+                    <input
+                      type="checkbox"
+                      checked={!!field.admin_fixed}
+                      onChange={(e) => updateInputEditorField(index, { admin_fixed: e.target.checked, visible_to_user: e.target.checked ? false : field.visible_to_user !== false })}
+                      style={{ width: 'auto' }}
+                    />
+                    <span>管理员预填/隐藏：适合 resources 文件夹里的固定 XML、LUT、模型、掩膜等资源</span>
+                  </label>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ display: 'flex', gap: 10, marginTop: 14, flexWrap: 'wrap' }}>
+              <button style={styles.whiteBtn} onClick={() => setInputEditorFields((prev) => [...prev, makeEmptyInputField()])}>新增输入字段</button>
+              <button style={styles.blueBtn} onClick={saveInputEditor}>保存输入配置</button>
+              <button style={styles.whiteBtn} onClick={() => setInputEditorOpen(false)}>取消</button>
+            </div>
+          </div>
+        </SimpleOverlay>
       )}
 
       {showDropHint && (

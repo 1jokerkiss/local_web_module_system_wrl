@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .auth import (
     admin_reset_password,
@@ -126,6 +126,8 @@ class ModuleRunRequest(BaseModel):
     inputs: Dict[str, Any] = {}
     parallel_workers: int = 1
 class ModuleSaveRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     id: str
     name: str
     description: str = ""
@@ -136,11 +138,7 @@ class ModuleSaveRequest(BaseModel):
     inputs: List[Dict[str, Any]] = []
     tags: List[str] = []
     tool_type: str = "cloud"
-    parallel_mode: str = "auto"
-    parallel_input_key: str = ""
-    parallel_output_key: str = ""
-    parallel_file_patterns: str = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
-    parallel_output_suffix: str = ".tif"
+    parallel: Dict[str, Any] = {}
     enabled: bool = True
 
 
@@ -148,6 +146,9 @@ class InstallLocalDropRequest(BaseModel):
     tool_type: str = "cloud"
     filename: str = ""
 # 通用辅助函数
+VALID_PARALLEL_MODES = {"none", "auto", "single_file", "folder_chunks", "module_internal"}
+DEFAULT_PARALLEL_PATTERNS = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
+
 # 初始默认工具栏。现在云反演 / 气溶胶反演也按普通动态工具栏处理，
 # 只在第一次创建 toolbars.json 时写入；之后不会强制重新合并回来。
 DEFAULT_TOOLBARS = [
@@ -381,18 +382,41 @@ def guess_module_tool_type(module: dict) -> str:
     return "cloud"
 
 
+def normalize_parallel_config(module: dict) -> dict:
+    raw = module.get("parallel")
+    if not isinstance(raw, dict):
+        raw = {}
+    cfg = {
+        "mode": raw.get("mode") or module.get("parallel_mode") or "auto",
+        "input_key": raw.get("input_key") or module.get("parallel_input_key") or "",
+        "output_key": raw.get("output_key") or module.get("parallel_output_key") or "",
+        "file_patterns": raw.get("file_patterns") or module.get("parallel_file_patterns") or "*.tif;*.tiff;*.nc;*.hdf;*.h5",
+        "output_suffix": raw.get("output_suffix") or module.get("parallel_output_suffix") or ".tif",
+    }
+    mode = str(cfg.get("mode") or "auto").strip() or "auto"
+    cfg["mode"] = mode if mode in VALID_PARALLEL_MODES else "auto"
+    cfg["input_key"] = str(cfg.get("input_key") or "")
+    cfg["output_key"] = str(cfg.get("output_key") or "")
+    cfg["file_patterns"] = str(cfg.get("file_patterns") or "*.tif;*.tiff;*.nc;*.hdf;*.h5")
+    cfg["output_suffix"] = str(cfg.get("output_suffix") or ".tif")
+    return cfg
+
+
 def normalize_module_record(module: dict) -> dict:
     if not isinstance(module, dict):
         return {}
     copied = dict(module)
     copied["tool_type"] = guess_module_tool_type(copied)
-    copied["parallel_mode"] = str(copied.get("parallel_mode") or "auto")
-    copied["parallel_input_key"] = str(copied.get("parallel_input_key") or "")
-    copied["parallel_output_key"] = str(copied.get("parallel_output_key") or "")
-    copied["parallel_file_patterns"] = str(
-        copied.get("parallel_file_patterns") or "*.tif;*.tiff;*.nc;*.hdf;*.h5"
-    )
-    copied["parallel_output_suffix"] = str(copied.get("parallel_output_suffix") or ".tif")
+    copied["parallel"] = normalize_parallel_config(copied)
+    # 旧版本的并行平铺字段不再写回，避免管理页面变乱。
+    for key in [
+        "parallel_mode",
+        "parallel_input_key",
+        "parallel_output_key",
+        "parallel_file_patterns",
+        "parallel_output_suffix",
+    ]:
+        copied.pop(key, None)
     return copied
 
 
@@ -549,6 +573,46 @@ def extract_template_fields(command_template: List[str]) -> List[str]:
             if field_name:
                 fields.add(field_name)
     return list(fields)
+
+
+def resolve_module_dir(module: dict) -> Path:
+    working_dir = module.get("working_dir", ".")
+    project_root = BASE_DIR.parent
+    module_dir = Path(working_dir)
+    if not module_dir.is_absolute():
+        module_dir = (project_root / module_dir).resolve()
+    else:
+        module_dir = module_dir.resolve()
+    return module_dir
+
+
+def resolve_input_value_for_module(module: dict, field: dict, value: Any) -> Any:
+    if value in (None, ""):
+        return value
+    if field.get("path_mode") == "relative_to_module" and field.get("type") in {"file_path", "dir_path"}:
+        p = Path(str(value))
+        if not p.is_absolute():
+            return str((resolve_module_dir(module) / p).resolve())
+    return value
+
+
+def merge_admin_fixed_inputs(module: dict, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(inputs or {})
+    for field in module.get("inputs", []) or []:
+        key = field.get("key")
+        if not key:
+            continue
+        visible = field.get("visible_to_user", True) is not False
+        admin_fixed = bool(field.get("admin_fixed", False)) or not visible
+        has_user_value = key in merged and merged.get(key) not in ("", None)
+        default_value = field.get("default")
+
+        if admin_fixed or not has_user_value:
+            if default_value not in ("", None):
+                merged[key] = resolve_input_value_for_module(module, field, default_value)
+        else:
+            merged[key] = resolve_input_value_for_module(module, field, merged.get(key))
+    return merged
 
 
 def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list[str], str, dict]:
@@ -1053,7 +1117,7 @@ def field_meta(module: dict, key: str) -> dict:
 
 
 def choose_parallel_input_key(module: dict, inputs: dict) -> str:
-    explicit = str(module.get("parallel_input_key") or "").strip()
+    explicit = str(normalize_parallel_config(module).get("input_key") or "").strip()
     if explicit:
         return explicit
 
@@ -1149,7 +1213,7 @@ def is_probably_dir_output(module: dict, output_key: str, output_value: str) -> 
 
 def apply_single_file_output_mapping(module: dict, base_inputs: dict, input_file: Path) -> dict:
     new_inputs = dict(base_inputs)
-    output_key = str(module.get("parallel_output_key") or "").strip()
+    output_key = str(normalize_parallel_config(module).get("output_key") or "").strip()
     if not output_key or output_key not in new_inputs:
         return new_inputs
 
@@ -1163,7 +1227,7 @@ def apply_single_file_output_mapping(module: dict, base_inputs: dict, input_file
         return new_inputs
 
     out_path = Path(output_value)
-    suffix = str(module.get("parallel_output_suffix") or ".tif")
+    suffix = str(normalize_parallel_config(module).get("output_suffix") or ".tif")
     if not suffix.startswith("."):
         suffix = "." + suffix
 
@@ -1179,7 +1243,7 @@ def apply_single_file_output_mapping(module: dict, base_inputs: dict, input_file
 
 
 def infer_parallel_mode(module: dict, inputs: dict, input_key: str) -> str:
-    mode = str(module.get("parallel_mode") or "auto").strip() or "auto"
+    mode = str(normalize_parallel_config(module).get("mode") or "auto").strip() or "auto"
     if mode not in VALID_PARALLEL_MODES:
         mode = "auto"
     if mode != "auto":
@@ -1219,7 +1283,7 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
     if input_value in ("", None):
         raise HTTPException(status_code=400, detail=f"并行输入字段为空: {input_key}")
 
-    patterns = parse_parallel_patterns(module.get("parallel_file_patterns"))
+    patterns = parse_parallel_patterns(normalize_parallel_config(module).get("file_patterns"))
     files = discover_batch_files(str(input_value), patterns)
     if not files:
         raise HTTPException(status_code=400, detail=f"未匹配到可并行处理的文件，匹配规则: {';'.join(patterns)}")
@@ -1247,7 +1311,7 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
     if mode == "folder_chunks":
         if Path(str(input_value)).is_file():
             # 传入单个文件时退化为 single_file。
-            return prepare_parallel_jobs({**module, "parallel_mode": "single_file"}, inputs, workers)
+            return prepare_parallel_jobs({**module, "parallel": {**normalize_parallel_config(module), "mode": "single_file"}}, inputs, workers)
 
         chunks = split_evenly(files, workers)
         chunk_root = RUNTIME_DIR / "parallel_chunks" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1327,7 +1391,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
     if not module.get("enabled", True):
         raise HTTPException(status_code=400, detail="模块已禁用")
 
-    inputs = payload.inputs or {}
+    inputs = merge_admin_fixed_inputs(module, payload.inputs or {})
     parallel_workers = clamp_parallel_workers(payload.parallel_workers)
 
     for field in module.get("inputs", []):
@@ -1336,7 +1400,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
         if required and (key not in inputs or inputs.get(key) in ("", None)):
             raise HTTPException(status_code=400, detail=f"缺少必填参数: {key}")
 
-    mode = str(module.get("parallel_mode") or "auto").strip() or "auto"
+    mode = str(normalize_parallel_config(module).get("mode") or "auto").strip() or "auto"
     if parallel_workers > 1 and mode == "module_internal":
         # 模块源码自己处理并行，平台只负责传参，不拆成多个进程。
         inputs = dict(inputs)
