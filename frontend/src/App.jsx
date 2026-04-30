@@ -37,33 +37,6 @@ import {
     listUserFiles,
 } from './api';
 
-const CLOUD_ITEMS = [
-    {
-    key: 'cloud_type',
-    title: '云类型反演',
-    description: '选择输入路径和输出文件夹，运行云类型识别任务。',
-    keywords: ['云类型反演', 'cloud_type','cloud type','云类型'],
-      },
-    // {
-    //     key: 'cloud_top_height',
-    //     title: '云顶高度反演',
-    //     description: '选择输入路径和输出文件夹，运行云顶高度反演任务。',
-    //     keywords: ['云顶高度', 'cloud top', 'cth'],
-    // },
-];
-
-const AEROSOL_ITEMS = [
-  {
-    key: 'h8_aod',
-    title: 'H8多光谱影像 AOD 反演',
-    keywords: ['h8', 'aod'],
-  },
-  {
-    key: 'polar_aod',
-    title: '偏振观测数据 AOD 反演',
-    keywords: ['偏振', 'polar', 'aod'],
-  },
-];
 
 const emptyModuleForm = {
   id: '',
@@ -1005,6 +978,8 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [authMode, setAuthMode] = useState('login');
   const [loginType, setLoginType] = useState('user');
+  const [activeCloudId, setActiveCloudId] = useState('');
+  const [activeAerosolId, setActiveAerosolId] = useState('');
   const [loginForm, setLoginForm] = useState({ username: '', password: '' });
   const [registerForm, setRegisterForm] = useState({
     username: '',
