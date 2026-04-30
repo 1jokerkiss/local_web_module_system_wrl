@@ -16,6 +16,38 @@ export function getAuthToken() {
   return getToken();
 }
 
+
+async function requestBlob(url, options = {}) {
+  const headers = {
+    ...(options.headers || {}),
+  };
+
+  const token = getToken();
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  if (options.body && !(options.body instanceof FormData) && !(options.body instanceof Blob)) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  const resp = await fetch(`${API_BASE}${url}`, {
+    ...options,
+    headers,
+  });
+
+  if (!resp.ok) {
+    let msg = `请求失败: ${resp.status}`;
+    try {
+      const data = await resp.json();
+      msg = data.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+
+  return resp.blob();
+}
+
 async function request(url, options = {}) {
   const headers = {
     ...(options.headers || {}),
@@ -250,4 +282,13 @@ export async function deleteUserFile(filename) {
   return request(`/api/files/${encodeURIComponent(filename)}`, {
     method: 'DELETE',
   });
+}
+
+export async function getUserFilePreviewData(filename) {
+  return request(`/api/files/${encodeURIComponent(filename)}/preview`);
+}
+
+// 兼容旧调用名：现在返回预览 JSON，不再返回本地路径 blob URL。
+export async function getUserFilePreviewUrl(filename) {
+  return getUserFilePreviewData(filename);
 }

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
 import math
 import os
@@ -12,7 +14,7 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 
@@ -145,6 +147,10 @@ class ModuleSaveRequest(BaseModel):
 class InstallLocalDropRequest(BaseModel):
     tool_type: str = "cloud"
     filename: str = ""
+
+
+class FilePreviewRequest(BaseModel):
+    path: str
 # 通用辅助函数
 VALID_PARALLEL_MODES = {"none", "auto", "single_file", "folder_chunks", "module_internal"}
 DEFAULT_PARALLEL_PATTERNS = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
@@ -450,6 +456,219 @@ def get_module(module_id: str) -> Optional[dict]:
             return module
     return None
 
+
+def is_tif_path(path: Path) -> bool:
+    return path.suffix.lower() in {".tif", ".tiff"}
+
+
+def _normalize_to_uint8(array):
+    import numpy as np
+
+    arr = array.astype("float32", copy=False)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return np.zeros(arr.shape, dtype="uint8")
+
+    valid = arr[finite]
+    lo, hi = np.nanpercentile(valid, [2, 98])
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo = float(np.nanmin(valid))
+        hi = float(np.nanmax(valid))
+    if hi <= lo:
+        return np.zeros(arr.shape, dtype="uint8")
+
+    arr = (arr - lo) / (hi - lo) * 255.0
+    arr = np.clip(arr, 0, 255)
+    arr[~finite] = 0
+    return arr.astype("uint8")
+
+
+def render_tif_to_png_bytes(tif_path: Path) -> bytes:
+    """把 tif/tiff 渲染成浏览器可显示的 PNG。优先使用 GDAL 读取 GeoTIFF。"""
+    if not tif_path.exists() or not tif_path.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    if not is_tif_path(tif_path):
+        raise HTTPException(status_code=400, detail="只支持预览 tif/tiff 文件")
+
+    try:
+        import numpy as np
+        from PIL import Image
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"缺少图片预览依赖 Pillow/numpy: {exc}")
+
+    max_size = 1600
+
+    try:
+        from osgeo import gdal
+
+        ds = gdal.Open(str(tif_path))
+        if ds is None:
+            raise RuntimeError("GDAL 无法打开该 tif")
+
+        width = int(ds.RasterXSize)
+        height = int(ds.RasterYSize)
+        scale = min(1.0, max_size / max(width, height)) if max(width, height) else 1.0
+        out_w = max(1, int(width * scale))
+        out_h = max(1, int(height * scale))
+
+        band_count = int(ds.RasterCount or 1)
+        if band_count >= 3:
+            bands = []
+            for band_index in (1, 2, 3):
+                band = ds.GetRasterBand(band_index)
+                arr = band.ReadAsArray(buf_xsize=out_w, buf_ysize=out_h)
+                bands.append(_normalize_to_uint8(arr))
+            rgb = np.dstack(bands)
+            image = Image.fromarray(rgb, mode="RGB")
+        else:
+            band = ds.GetRasterBand(1)
+            arr = band.ReadAsArray(buf_xsize=out_w, buf_ysize=out_h)
+            gray = _normalize_to_uint8(arr)
+            image = Image.fromarray(gray, mode="L")
+    except HTTPException:
+        raise
+    except Exception:
+        # 兜底：普通 TIFF 用 Pillow 直接打开。
+        try:
+            image = Image.open(tif_path)
+            image.thumbnail((max_size, max_size))
+            if image.mode not in {"L", "RGB", "RGBA"}:
+                image = image.convert("RGB")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"tif 预览失败: {exc}")
+
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def is_previewable_path(path: Path) -> bool:
+    return path.suffix.lower() in {".tif", ".tiff", ".nc", ".nc4", ".cdf", ".hdf", ".h5"}
+
+
+def _png_data_url(png_bytes: bytes) -> str:
+    encoded = base64.b64encode(png_bytes).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def render_nc_to_preview(nc_path: Path) -> dict:
+    """把上传的 nc/hdf/h5 文件预览为图片；如果没有可绘制变量，就返回元数据。"""
+    if not nc_path.exists() or not nc_path.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    try:
+        import numpy as np
+        from PIL import Image
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"缺少预览依赖 Pillow/numpy: {exc}")
+
+    meta: dict[str, Any] = {
+        "name": nc_path.name,
+        "size": nc_path.stat().st_size,
+        "suffix": nc_path.suffix.lower(),
+    }
+
+    try:
+        import xarray as xr
+
+        ds = xr.open_dataset(nc_path, mask_and_scale=True)
+        meta["dimensions"] = {str(k): int(v) for k, v in ds.sizes.items()}
+        meta["variables"] = [str(k) for k in ds.data_vars.keys()]
+        meta["coords"] = [str(k) for k in ds.coords.keys()]
+
+        selected_name = ""
+        selected = None
+        for name, da in ds.data_vars.items():
+            try:
+                if da.ndim >= 2 and np.issubdtype(da.dtype, np.number):
+                    selected_name = str(name)
+                    selected = da
+                    break
+            except Exception:
+                continue
+
+        if selected is None:
+            try:
+                ds.close()
+            except Exception:
+                pass
+            return {
+                "kind": "metadata",
+                "title": nc_path.name,
+                "message": "该文件没有找到可直接绘图的二维数值变量，下面显示文件结构。",
+                "meta": meta,
+            }
+
+        while selected.ndim > 2:
+            selected = selected.isel({selected.dims[0]: 0})
+
+        arr = np.asarray(selected.values)
+        arr = np.squeeze(arr)
+        if arr.ndim != 2:
+            try:
+                ds.close()
+            except Exception:
+                pass
+            return {
+                "kind": "metadata",
+                "title": nc_path.name,
+                "message": f"变量 {selected_name} 不能转为二维图像，下面显示文件结构。",
+                "meta": meta,
+            }
+
+        max_size = 1600
+        h, w = arr.shape
+        scale = min(1.0, max_size / max(h, w)) if max(h, w) else 1.0
+        gray = _normalize_to_uint8(arr)
+        image = Image.fromarray(gray, mode="L")
+        if scale < 1.0:
+            image = image.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        try:
+            ds.close()
+        except Exception:
+            pass
+
+        meta["preview_variable"] = selected_name
+        meta["preview_shape"] = list(arr.shape)
+        return {
+            "kind": "image",
+            "title": nc_path.name,
+            "image_data_url": _png_data_url(buf.getvalue()),
+            "meta": meta,
+            "message": f"已预览变量：{selected_name}（多维数据默认取第一个切片）。",
+        }
+    except Exception as exc:
+        return {
+            "kind": "metadata",
+            "title": nc_path.name,
+            "message": f"无法生成图像预览：{exc}",
+            "meta": meta,
+        }
+
+
+def build_uploaded_file_preview(target: Path) -> dict:
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    if not is_previewable_path(target):
+        raise HTTPException(status_code=400, detail="当前仅支持预览 tif/tiff/nc/nc4/cdf/hdf/h5 文件")
+
+    suffix = target.suffix.lower()
+    if suffix in {".tif", ".tiff"}:
+        png = render_tif_to_png_bytes(target)
+        return {
+            "kind": "image",
+            "title": target.name,
+            "image_data_url": _png_data_url(png),
+            "meta": {"name": target.name, "size": target.stat().st_size, "suffix": suffix},
+            "message": "已将上传的 GeoTIFF 转为浏览器可显示的 PNG 预览。",
+        }
+
+    return render_nc_to_preview(target)
+
+
 @app.get("/api/files")
 def api_list_user_files(authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
@@ -531,6 +750,15 @@ def api_download_user_file(filename: str, authorization: str | None = Header(def
         raise HTTPException(status_code=404, detail="文件不存在")
 
     return FileResponse(str(target), filename=target.name)
+
+
+@app.get("/api/files/{filename}/preview")
+def api_preview_uploaded_file(filename: str, authorization: str | None = Header(default=None)):
+    user = get_current_user(authorization)
+    user_dir = UPLOADS_DIR / user.username
+    safe_name = sanitize_filename(filename)
+    target = user_dir / safe_name
+    return build_uploaded_file_preview(target)
 
 def upsert_module(module_data: dict):
     module_data = normalize_module_record(module_data)
