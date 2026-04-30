@@ -155,7 +155,29 @@ function normalize(v) {
 // 默认工具栏由后端首次初始化 toolbars.json 时提供。
 // 前端不再强制追加 cloud/aerosol，避免删除后又在页面上复活。
 const DEFAULT_TOOLBARS = [];
+const ACTIVE_TAB_STORAGE_KEY = 'local_web_active_tab';
 
+function getSavedActiveTab() {
+  try {
+    return localStorage.getItem(ACTIVE_TAB_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function saveActiveTab(tab) {
+  try {
+    if (tab) {
+      localStorage.setItem(ACTIVE_TAB_STORAGE_KEY, tab);
+    }
+  } catch {}
+}
+
+function clearSavedActiveTab() {
+  try {
+    localStorage.removeItem(ACTIVE_TAB_STORAGE_KEY);
+  } catch {}
+}
 function normalizeToolKey(v) {
   return String(v || '')
     .trim()
@@ -1007,7 +1029,7 @@ export default function App() {
   const [users, setUsers] = useState([]);
   const [toolbars, setToolbars] = useState(DEFAULT_TOOLBARS);
 
-  const [activeTab, setActiveTab] = useState('tool:cloud');
+  const [activeTab, setActiveTab] = useState(() => getSavedActiveTab() || 'tool:cloud');
   const [activeModuleByTool, setActiveModuleByTool] = useState({});
   const [expandedToolTypes, setExpandedToolTypes] = useState({ cloud: true, aerosol: true });
   const [cloudForms, setCloudForms] = useState({});
@@ -1080,7 +1102,7 @@ export default function App() {
       try {
         const me = await getMe();
         setCurrentUser(me);
-        setActiveTab(me.role === 'admin' ? 'module_mgmt' : 'tool:cloud');
+        setActiveTab(getSavedActiveTab() || 'tool:cloud');
 
         const [toolbarList, mods, taskList] = await Promise.all([
           getToolbars(),
@@ -1133,13 +1155,23 @@ useEffect(() => {
 useEffect(() => {
   if (!currentUser) return;
 
+  // 工具栏还没加载完成时，不要急着把 tool:cloud 切到 tasks
+  if (visibleToolbars.length === 0) return;
+
   const hasTool = (key) => visibleToolbars.some((tb) => tb.key === key);
   const firstKey = visibleToolbars[0]?.key || '';
 
   if (activeTab.startsWith('tool:')) {
     const key = activeTab.slice('tool:'.length);
     if (!hasTool(key)) {
-      setActiveTab(firstKey ? `tool:${firstKey}` : isAdmin ? 'module_mgmt' : 'tasks');
+      const fallback = hasTool('cloud')
+        ? 'tool:cloud'
+        : firstKey
+          ? `tool:${firstKey}`
+          : 'tasks';
+
+      setActiveTab(fallback);
+      saveActiveTab(fallback);
     }
   }
 
@@ -1152,7 +1184,7 @@ useEffect(() => {
     if (!firstKey) return prev;
     return { ...prev, tool_type: firstKey };
   });
-}, [currentUser, visibleToolbars, activeTab, uploadToolType, isAdmin]);
+}, [currentUser, visibleToolbars, activeTab, uploadToolType]);
   useEffect(() => {
     if (!currentUser) {
       if (pollTimerRef.current) {
@@ -1206,7 +1238,10 @@ useEffect(() => {
       }
     };
   }, [currentUser, tasks, windows]);
-
+useEffect(() => {
+  if (!currentUser) return;
+  saveActiveTab(activeTab);
+}, [currentUser, activeTab]);
   async function handleLogin() {
     try {
       setLoginError('');
@@ -1302,18 +1337,21 @@ async function handleRegister() {
       alert(e?.message || '重置密码失败');
     }
   }
-
   async function handleLogout() {
     try {
       await logout();
     } catch {}
+
     clearAuthToken();
+    clearSavedActiveTab();
+
     setCurrentUser(null);
+    setActiveTab('tool:cloud');
     setModules([]);
     setTasks([]);
     setUsers([]);
     setWindows([]);
-  }
+}
 
   async function refreshModules() {
     const list = isAdmin ? await getAdminModules() : await getModules();
@@ -2231,19 +2269,22 @@ async function handleRegister() {
           <div style={{ fontSize: 26, fontWeight: 900 }}>云和气溶胶反演系统</div>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
             {navItems.map((item) => (
-              <button
-                key={item.key}
-                onClick={() => setActiveTab(item.key)}
-                style={activeTab === item.key ? styles.topBtnActive : styles.topBtn}
-              >
-                {item.label}
-              </button>
+                <button
+                    key={item.key}
+                    onClick={() => {
+                      setActiveTab(item.key);
+                      saveActiveTab(item.key);
+                    }}
+                    style={activeTab === item.key ? styles.topBtnActive : styles.topBtn}
+                >
+                  {item.label}
+                </button>
             ))}
           </div>
         </div>
 
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-          <div style={{ fontWeight: 700 }}>
+        <div style={{display: 'flex', gap: 12, alignItems: 'center'}}>
+          <div style={{fontWeight: 700}}>
             当前用户：{currentUser.username}（{currentUser.role}）
           </div>
           <button style={styles.topBtn} onClick={handleLogout}>退出登录</button>
