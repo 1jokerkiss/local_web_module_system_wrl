@@ -38,12 +38,14 @@
       "h8"
     ],
     "tool_type": "cloud",
-    "parallel_mode": "folder_chunks",
-    "parallel_input_key": "",
-    "parallel_output_key": "",
-    "parallel_file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
-    "parallel_output_suffix": ".tif",
-    "enabled": true
+    "enabled": true,
+    "parallel": {
+      "mode": "folder_chunks",
+      "input_key": "",
+      "output_key": "",
+      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
+      "output_suffix": ".tif"
+    }
   },
   {
     "id": "h8aod",
@@ -207,11 +209,55 @@
       "batch"
     ],
     "tool_type": "aerosol",
-    "parallel_mode": "single_file",
-    "parallel_input_key": "",
-    "parallel_output_key": "",
-    "parallel_file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
-    "parallel_output_suffix": ".tif",
-    "enabled": true
+    "enabled": true,
+    "parallel": {
+      "mode": "single_file",
+      "input_key": "",
+      "output_key": "",
+      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
+      "output_suffix": ".tif"
+    }
+  },
+  {
+    "id": "CTH_FY",
+    "name": "FY气溶胶反演",
+    "category": "aerosol",
+    "description": "基于风云的气溶胶反演模块",
+    "executable": "D:\\NEPU\\实验室\\项目\\气溶胶\\local_web\\backend\\installed_modules\\CTH_FY\\backend\\installed_modules\\fy\\CTH_FY.exe",
+    "working_dir": "D:\\NEPU\\实验室\\项目\\气溶胶\\local_web\\backend\\installed_modules\\CTH_FY\\backend\\installed_modules\\fy",
+    "config_mode": "json",
+    "command_template": [
+      "{executable}",
+      "{config_json}"
+    ],
+    "inputs": [
+      {
+        "key": "file",
+        "label": "输入文件目录",
+        "type": "dir_path",
+        "required": true
+      },
+      {
+        "key": "cm_files",
+        "label": "输出文件目录",
+        "type": "dir_path",
+        "required": true
+      }
+    ],
+    "tags": [
+      "cthfy",
+      "aerosol",
+      "气溶胶类型",
+      "fy4"
+    ],
+    "enabled": true,
+    "tool_type": "cloud",
+    "parallel": {
+      "mode": "auto",
+      "input_key": "",
+      "output_key": "",
+      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
+      "output_suffix": ".tif"
+    }
   }
 ]

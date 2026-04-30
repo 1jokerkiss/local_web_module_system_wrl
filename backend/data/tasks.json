@@ -156,55 +156,6 @@
     "ended_at": "2026-04-26T16:42:41"
   },
   {
-    "id": "7b31675d2eed",
-    "module_id": "cloud_type",
-    "module_name": "云类型反演",
-    "kind": "module",
-    "status": "failed",
-    "return_code": 1,
-    "pid": 12840,
-    "command": [
-      "D:\\NEPU\\实验室\\项目\\气溶胶\\local_module_web_system\\backend\\installed_modules\\cth\\CM_CTH.exe",
-      "D:\\NEPU\\实验室\\项目\\气溶胶\\local_module_web_system\\backend\\runtime\\job_b8eld5fp\\config.json"
-    ],
-    "inputs": {
-      "file": "D:/NEPU/实验室/项目/气溶胶/h8model_weiles/NC",
-      "cm_files": "D:/NEPU/实验室/项目/气溶胶/h8model_weiles/CM_24",
-      "outpath": "D:/NEPU/实验室/项目/气溶胶/h8model_weiles/NC_1"
-    },
-    "logs": [
-      "[INFO] 准备启动模块",
-      "[INFO] cwd = D:\\NEPU\\实验室\\项目\\气溶胶\\local_module_web_system\\backend\\installed_modules\\cth",
-      "[INFO] command = D:\\NEPU\\实验室\\项目\\气溶胶\\local_module_web_system\\backend\\installed_modules\\cth\\CM_CTH.exe D:\\NEPU\\实验室\\项目\\气溶胶\\local_module_web_system\\backend\\runtime\\job_b8eld5fp\\config.json",
-      "[INFO] PATH 前 10 项如下：",
-      "[INFO]   1. D:\\NEPU\\实验室\\项目\\气溶胶\\local_module_web_system\\backend\\installed_modules\\cth",
-      "[INFO]   2. D:\\local_module_web_system\\local_module_web_system\\backend\\.venv\\Scripts",
-      "[INFO]   3. C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8\\bin",
-      "[INFO]   4. C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8\\libnvvp",
-      "[INFO]   5. C:\\WINDOWS\\system32",
-      "[INFO]   6. C:\\WINDOWS",
-      "[INFO]   7. C:\\WINDOWS\\System32\\Wbem",
-      "[INFO]   8. C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\",
-      "[INFO]   9. C:\\WINDOWS\\System32\\OpenSSH\\",
-      "[INFO]   10. C:\\Program Files\\NVIDIA Corporation\\NVIDIA App\\NvDLISR",
-      "[INFO] OPENBLAS_NUM_THREADS = 1",
-      "[INFO] OMP_NUM_THREADS = 1",
-      "[INFO] GOTO_NUM_THREADS = 1",
-      "[INFO] config/input = D:\\NEPU\\实验室\\项目\\气溶胶\\local_module_web_system\\backend\\runtime\\job_b8eld5fp\\config.json",
-      "[INFO] config.json 内容如下：",
-      "{",
-      "  \"file\": \"D:/NEPU/实验室/项目/气溶胶/h8model_weiles/NC\",",
-      "  \"cm_files\": \"D:/NEPU/实验室/项目/气溶胶/h8model_weiles/CM_24\",",
-      "  \"outpath\": \"D:/NEPU/实验室/项目/气溶胶/h8model_weiles/NC_1\"",
-      "}",
-      "[INFO] 进程已启动，PID = 12840",
-      "[SYSTEM] 任务已被手动终止",
-      "[INFO] 进程结束，return_code = 1"
-    ],
-    "started_at": "2026-04-27T09:22:03",
-    "ended_at": "2026-04-27T09:22:11"
-  },
-  {
     "id": "706480c7e846",
     "module_id": "h8aod",
     "module_name": "H8 AOD 反演",
