@@ -242,6 +242,11 @@ def install_module_zip(zip_path: Path) -> ModuleDefinition:
         inputs=inputs,
         tags=manifest.get("tags", []),
         tool_type=manifest.get("tool_type", manifest.get("category", "cloud")),
+        parallel_mode=manifest.get("parallel_mode", "auto"),
+        parallel_input_key=manifest.get("parallel_input_key", ""),
+        parallel_output_key=manifest.get("parallel_output_key", ""),
+        parallel_file_patterns=manifest.get("parallel_file_patterns", "*.tif;*.tiff;*.nc;*.hdf;*.h5"),
+        parallel_output_suffix=manifest.get("parallel_output_suffix", ".tif"),
         enabled=True,
     )
 

@@ -49,6 +49,11 @@ const emptyModuleForm = {
   inputs_text: '[]',
   tags_text: '',
   tool_type: 'cloud',
+  parallel_mode: 'auto',
+  parallel_input_key: '',
+  parallel_output_key: '',
+  parallel_file_patterns: '*.tif;*.tiff;*.nc;*.hdf;*.h5',
+  parallel_output_suffix: '.tif',
   enabled: true,
 };
 
@@ -1100,7 +1105,7 @@ useEffect(() => {
   modules.forEach((m) => {
     setRuntimeForms((prev) => {
       if (prev[m.id]) return prev;
-      const init = { task_name: m.name };
+      const init = { task_name: m.name, _parallel_workers: 1 };
       (m.inputs || []).forEach((f) => {
         init[f.key] = f.default ?? '';
       });
@@ -1448,9 +1453,11 @@ async function handleRegister() {
       const form = runtimeForms[module.id] || {};
       const inputs = { ...form };
       const title = form.task_name || module.name;
+      const parallelWorkers = Number(form._parallel_workers || 1);
       delete inputs.task_name;
+      delete inputs._parallel_workers;
 
-      const task = await runModule(module.id, inputs);
+      const task = await runModule(module.id, inputs, parallelWorkers);
       const detail = await getTask(task.id);
       addTaskWindow(detail, title);
       await refreshTasks();
@@ -1472,6 +1479,11 @@ async function handleRegister() {
       inputs_text: JSON.stringify(module.inputs || [], null, 2),
       tags_text: (module.tags || []).join(','),
       tool_type: getModuleToolType(module),
+      parallel_mode: module.parallel_mode || 'auto',
+      parallel_input_key: module.parallel_input_key || '',
+      parallel_output_key: module.parallel_output_key || '',
+      parallel_file_patterns: module.parallel_file_patterns || '*.tif;*.tiff;*.nc;*.hdf;*.h5',
+      parallel_output_suffix: module.parallel_output_suffix || '.tif',
       enabled: module.enabled !== false,
     });
   }
@@ -1492,6 +1504,11 @@ async function handleRegister() {
           .map((x) => x.trim())
           .filter(Boolean),
         tool_type: moduleForm.tool_type || 'cloud',
+        parallel_mode: moduleForm.parallel_mode || 'auto',
+        parallel_input_key: moduleForm.parallel_input_key || '',
+        parallel_output_key: moduleForm.parallel_output_key || '',
+        parallel_file_patterns: moduleForm.parallel_file_patterns || '*.tif;*.tiff;*.nc;*.hdf;*.h5',
+        parallel_output_suffix: moduleForm.parallel_output_suffix || '.tif',
         enabled: moduleForm.enabled,
       });
       setModuleForm(emptyModuleForm);
@@ -1770,6 +1787,32 @@ async function handleRegister() {
               }
               style={styles.input}
             />
+          </label>
+
+          <label>
+            <div style={{ fontWeight: 800, color: '#173353', marginBottom: 8 }}>
+              并行进程数
+            </div>
+            <select
+              value={form._parallel_workers || 1}
+              onChange={(e) =>
+                setRuntimeForms((prev) => ({
+                  ...prev,
+                  [module.id]: {
+                    ...prev[module.id],
+                    _parallel_workers: Number(e.target.value),
+                  },
+                }))
+              }
+              style={styles.input}
+            >
+              {[1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32].map((n) => (
+                <option key={n} value={n}>{n}</option>
+              ))}
+            </select>
+            <div style={{ marginTop: 6, color: '#6a7f96', fontSize: 13, lineHeight: 1.6 }}>
+              单文件模块：输入字段可填文件夹，平台按文件拆成多个进程；文件夹遍历模块：平台把输入文件夹拆成多个临时子文件夹并行运行。
+            </div>
           </label>
 
           {(module.inputs || []).map((field) => (
@@ -2087,6 +2130,37 @@ async function handleRegister() {
                   <input placeholder="可执行文件" value={moduleForm.executable} onChange={(e) => setModuleForm({ ...moduleForm, executable: e.target.value })} style={styles.input} />
                   <input placeholder="工作目录" value={moduleForm.working_dir} onChange={(e) => setModuleForm({ ...moduleForm, working_dir: e.target.value })} style={styles.input} />
                   <input placeholder="标签，英文逗号分隔" value={moduleForm.tags_text} onChange={(e) => setModuleForm({ ...moduleForm, tags_text: e.target.value })} style={styles.input} />
+
+                  <label>
+                    <div style={labelStyle}>并行模式</div>
+                    <select value={moduleForm.parallel_mode} onChange={(e) => setModuleForm({ ...moduleForm, parallel_mode: e.target.value })} style={styles.input}>
+                      <option value="auto">auto：自动判断</option>
+                      <option value="single_file">single_file：单文件源码，多文件多进程</option>
+                      <option value="folder_chunks">folder_chunks：文件夹源码，拆分子目录并行</option>
+                      <option value="module_internal">module_internal：源码内部自己并行</option>
+                      <option value="none">none：不启用并行拆分</option>
+                    </select>
+                  </label>
+                  <label>
+                    <div style={labelStyle}>并行输入字段 key</div>
+                    <input placeholder="例如 file、input_path、infile；留空则自动识别" value={moduleForm.parallel_input_key} onChange={(e) => setModuleForm({ ...moduleForm, parallel_input_key: e.target.value })} style={styles.input} />
+                  </label>
+                  <label>
+                    <div style={labelStyle}>并行输出字段 key</div>
+                    <input placeholder="可选，例如 output_path；输出目录字段可留空" value={moduleForm.parallel_output_key} onChange={(e) => setModuleForm({ ...moduleForm, parallel_output_key: e.target.value })} style={styles.input} />
+                  </label>
+                  <label>
+                    <div style={labelStyle}>输出文件后缀</div>
+                    <input placeholder="例如 .tif" value={moduleForm.parallel_output_suffix} onChange={(e) => setModuleForm({ ...moduleForm, parallel_output_suffix: e.target.value })} style={styles.input} />
+                  </label>
+                  <label style={{ gridColumn: '1 / span 2' }}>
+                    <div style={labelStyle}>批量文件通配符</div>
+                    <input placeholder="例如 *.tif;*.tiff 或 *R21*.nc" value={moduleForm.parallel_file_patterns} onChange={(e) => setModuleForm({ ...moduleForm, parallel_file_patterns: e.target.value })} style={styles.input} />
+                  </label>
+                  <div style={{ gridColumn: '1 / span 2', color: '#6a7f96', fontSize: 13, lineHeight: 1.7 }}>
+                    single_file 适合源码一次接收一个 tif/nc；folder_chunks 适合像 CM_CTH.py 一样接收文件夹并在源码内部遍历文件夹的模块。
+                  </div>
+
                   <textarea placeholder="描述" value={moduleForm.description} onChange={(e) => setModuleForm({ ...moduleForm, description: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 80 }} />
                   <textarea placeholder="命令模板(JSON数组)" value={moduleForm.command_template_text} onChange={(e) => setModuleForm({ ...moduleForm, command_template_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2' }} />
                   <textarea placeholder="输入字段(JSON数组)" value={moduleForm.inputs_text} onChange={(e) => setModuleForm({ ...moduleForm, inputs_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 180 }} />

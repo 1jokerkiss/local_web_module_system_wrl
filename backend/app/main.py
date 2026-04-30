@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import shutil
 import tempfile
 import zipfile
@@ -115,6 +117,7 @@ class ToolBarSaveRequest(BaseModel):
 class ModuleRunRequest(BaseModel):
     module_id: str
     inputs: Dict[str, Any] = {}
+    parallel_workers: int = 1
 class ModuleSaveRequest(BaseModel):
     id: str
     name: str
@@ -126,6 +129,11 @@ class ModuleSaveRequest(BaseModel):
     inputs: List[Dict[str, Any]] = []
     tags: List[str] = []
     tool_type: str = "cloud"
+    parallel_mode: str = "auto"
+    parallel_input_key: str = ""
+    parallel_output_key: str = ""
+    parallel_file_patterns: str = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
+    parallel_output_suffix: str = ".tif"
     enabled: bool = True
 
 
@@ -249,6 +257,13 @@ def normalize_module_record(module: dict) -> dict:
         return {}
     copied = dict(module)
     copied["tool_type"] = guess_module_tool_type(copied)
+    copied["parallel_mode"] = str(copied.get("parallel_mode") or "auto")
+    copied["parallel_input_key"] = str(copied.get("parallel_input_key") or "")
+    copied["parallel_output_key"] = str(copied.get("parallel_output_key") or "")
+    copied["parallel_file_patterns"] = str(
+        copied.get("parallel_file_patterns") or "*.tif;*.tiff;*.nc;*.hdf;*.h5"
+    )
+    copied["parallel_output_suffix"] = str(copied.get("parallel_output_suffix") or ".tif")
     return copied
 
 
@@ -840,6 +855,268 @@ def api_install_modules_from_local_drop(
     }
 
 
+
+# =========================
+# 并行执行辅助逻辑
+# =========================
+VALID_PARALLEL_MODES = {"none", "auto", "single_file", "folder_chunks", "module_internal"}
+DEFAULT_PARALLEL_PATTERNS = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
+
+
+def clamp_parallel_workers(value: int | str | None) -> int:
+    try:
+        n = int(value or 1)
+    except Exception:
+        n = 1
+    return max(1, min(n, 64))
+
+
+def parse_parallel_patterns(pattern_text: str | None) -> list[str]:
+    raw = str(pattern_text or DEFAULT_PARALLEL_PATTERNS)
+    parts = []
+    for item in raw.replace(",", ";").split(";"):
+        item = item.strip()
+        if item:
+            parts.append(item)
+    return parts or ["*"]
+
+
+def field_meta(module: dict, key: str) -> dict:
+    for item in module.get("inputs", []) or []:
+        if item.get("key") == key:
+            return item
+    return {}
+
+
+def choose_parallel_input_key(module: dict, inputs: dict) -> str:
+    explicit = str(module.get("parallel_input_key") or "").strip()
+    if explicit:
+        return explicit
+
+    input_fields = module.get("inputs", []) or []
+    for field in input_fields:
+        key = field.get("key")
+        if key in inputs and field.get("type") in {"file_path", "dir_path"}:
+            return key
+
+    preferred_words = ["input", "infile", "file", "inpath", "folder", "dir", "path"]
+    for word in preferred_words:
+        for key, value in inputs.items():
+            if word in str(key).lower() and value not in ("", None):
+                return key
+
+    for key, value in inputs.items():
+        if value not in ("", None):
+            return key
+
+    return ""
+
+
+def discover_batch_files(path_value: str, patterns: list[str]) -> list[Path]:
+    root = Path(path_value).expanduser()
+    if root.is_file():
+        return [root.resolve()]
+    if not root.exists() or not root.is_dir():
+        raise HTTPException(status_code=400, detail=f"并行输入路径不存在或不是文件夹: {root}")
+
+    found: list[Path] = []
+    seen = set()
+    for pattern in patterns:
+        for item in root.rglob(pattern):
+            if item.is_file():
+                rp = item.resolve()
+                if rp not in seen:
+                    seen.add(rp)
+                    found.append(rp)
+    found.sort(key=lambda x: str(x).lower())
+    return found
+
+
+def split_evenly(items: list[Path], parts: int) -> list[list[Path]]:
+    parts = max(1, min(parts, len(items)))
+    buckets = [[] for _ in range(parts)]
+    for idx, item in enumerate(items):
+        buckets[idx % parts].append(item)
+    return [bucket for bucket in buckets if bucket]
+
+
+def link_or_copy_file(src: Path, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        return
+    try:
+        os.link(src, dst)
+    except Exception:
+        try:
+            if hasattr(os, "symlink"):
+                os.symlink(src, dst)
+            else:
+                shutil.copy2(src, dst)
+        except Exception:
+            shutil.copy2(src, dst)
+
+
+def unique_chunk_filename(src: Path, used: set[str]) -> str:
+    name = src.name
+    if name not in used:
+        used.add(name)
+        return name
+    stem, suffix = src.stem, src.suffix
+    idx = 1
+    while True:
+        candidate = f"{stem}_{idx}{suffix}"
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+        idx += 1
+
+
+def is_probably_dir_output(module: dict, output_key: str, output_value: str) -> bool:
+    meta = field_meta(module, output_key)
+    k = output_key.lower()
+    label = str(meta.get("label") or "").lower()
+    if meta.get("type") == "dir_path":
+        return True
+    if "dir" in k or "folder" in k or "目录" in label or "文件夹" in label:
+        return True
+    p = Path(output_value)
+    return bool(output_value) and (p.exists() and p.is_dir())
+
+
+def apply_single_file_output_mapping(module: dict, base_inputs: dict, input_file: Path) -> dict:
+    new_inputs = dict(base_inputs)
+    output_key = str(module.get("parallel_output_key") or "").strip()
+    if not output_key or output_key not in new_inputs:
+        return new_inputs
+
+    output_value = str(new_inputs.get(output_key) or "").strip()
+    if not output_value:
+        return new_inputs
+
+    if is_probably_dir_output(module, output_key, output_value):
+        # 输出字段本身就是目录时，不改字段值，让模块自己在目录里生成结果。
+        Path(output_value).mkdir(parents=True, exist_ok=True)
+        return new_inputs
+
+    out_path = Path(output_value)
+    suffix = str(module.get("parallel_output_suffix") or ".tif")
+    if not suffix.startswith("."):
+        suffix = "." + suffix
+
+    if out_path.suffix:
+        mapped = out_path.with_name(f"{out_path.stem}_{input_file.stem}{out_path.suffix}")
+    else:
+        out_path.mkdir(parents=True, exist_ok=True)
+        mapped = out_path / f"{input_file.stem}{suffix}"
+
+    mapped.parent.mkdir(parents=True, exist_ok=True)
+    new_inputs[output_key] = str(mapped.resolve())
+    return new_inputs
+
+
+def infer_parallel_mode(module: dict, inputs: dict, input_key: str) -> str:
+    mode = str(module.get("parallel_mode") or "auto").strip() or "auto"
+    if mode not in VALID_PARALLEL_MODES:
+        mode = "auto"
+    if mode != "auto":
+        return mode
+
+    value = inputs.get(input_key)
+    if not value:
+        return "none"
+    p = Path(str(value))
+    meta = field_meta(module, input_key)
+    if p.is_file():
+        return "single_file"
+    if meta.get("type") == "file_path":
+        return "single_file"
+    return "folder_chunks"
+
+
+def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> list[dict]:
+    workers = clamp_parallel_workers(parallel_workers)
+    if workers <= 1:
+        return []
+
+    input_key = choose_parallel_input_key(module, inputs)
+    mode = infer_parallel_mode(module, inputs, input_key) if input_key else "none"
+
+    if mode == "none":
+        return []
+
+    if mode == "module_internal":
+        # 该模式不拆任务，只在 api_run_module 中把 parallel_workers 传给模块。
+        return []
+
+    if not input_key:
+        raise HTTPException(status_code=400, detail="未找到并行输入字段，请在模块配置中填写 parallel_input_key")
+
+    input_value = inputs.get(input_key)
+    if input_value in ("", None):
+        raise HTTPException(status_code=400, detail=f"并行输入字段为空: {input_key}")
+
+    patterns = parse_parallel_patterns(module.get("parallel_file_patterns"))
+    files = discover_batch_files(str(input_value), patterns)
+    if not files:
+        raise HTTPException(status_code=400, detail=f"未匹配到可并行处理的文件，匹配规则: {';'.join(patterns)}")
+
+    jobs: list[dict] = []
+    if mode == "single_file":
+        for idx, file_path in enumerate(files, start=1):
+            job_inputs = apply_single_file_output_mapping(module, inputs, file_path)
+            job_inputs[input_key] = str(file_path)
+            job_inputs["_parallel_workers"] = 1
+            job_inputs["_parallel_index"] = idx
+            job_inputs["_parallel_total"] = len(files)
+            command, working_dir, runtime_env = build_runtime_for_module(module, job_inputs)
+            jobs.append({
+                "module_id": module.get("id", ""),
+                "module_name": module.get("name", module.get("id", "")),
+                "label": file_path.name,
+                "command": command,
+                "working_dir": working_dir,
+                "env": runtime_env,
+                "inputs": job_inputs,
+            })
+        return jobs
+
+    if mode == "folder_chunks":
+        if Path(str(input_value)).is_file():
+            # 传入单个文件时退化为 single_file。
+            return prepare_parallel_jobs({**module, "parallel_mode": "single_file"}, inputs, workers)
+
+        chunks = split_evenly(files, workers)
+        chunk_root = RUNTIME_DIR / "parallel_chunks" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        chunk_root.mkdir(parents=True, exist_ok=True)
+
+        for idx, chunk in enumerate(chunks, start=1):
+            chunk_dir = chunk_root / f"worker_{idx:02d}"
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            used_names: set[str] = set()
+            for src in chunk:
+                dst = chunk_dir / unique_chunk_filename(src, used_names)
+                link_or_copy_file(src, dst)
+
+            job_inputs = dict(inputs)
+            job_inputs[input_key] = str(chunk_dir.resolve())
+            job_inputs["_parallel_workers"] = 1
+            job_inputs["_parallel_index"] = idx
+            job_inputs["_parallel_total"] = len(chunks)
+            job_inputs["_parallel_chunk_file_count"] = len(chunk)
+            command, working_dir, runtime_env = build_runtime_for_module(module, job_inputs)
+            jobs.append({
+                "module_id": module.get("id", ""),
+                "module_name": module.get("name", module.get("id", "")),
+                "label": f"worker_{idx:02d} ({len(chunk)} files)",
+                "command": command,
+                "working_dir": working_dir,
+                "env": runtime_env,
+                "inputs": job_inputs,
+            })
+        return jobs
+
+    raise HTTPException(status_code=400, detail=f"不支持的并行模式: {mode}")
+
 # =========================
 # 任务接口
 # =========================
@@ -887,12 +1164,30 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
         raise HTTPException(status_code=400, detail="模块已禁用")
 
     inputs = payload.inputs or {}
+    parallel_workers = clamp_parallel_workers(payload.parallel_workers)
 
     for field in module.get("inputs", []):
         key = field.get("key")
         required = field.get("required", False)
         if required and (key not in inputs or inputs.get(key) in ("", None)):
             raise HTTPException(status_code=400, detail=f"缺少必填参数: {key}")
+
+    mode = str(module.get("parallel_mode") or "auto").strip() or "auto"
+    if parallel_workers > 1 and mode == "module_internal":
+        # 模块源码自己处理并行，平台只负责传参，不拆成多个进程。
+        inputs = dict(inputs)
+        inputs["parallel_workers"] = parallel_workers
+        inputs["_parallel_workers"] = parallel_workers
+
+    jobs = prepare_parallel_jobs(module, inputs, parallel_workers)
+    if parallel_workers > 1 and len(jobs) > 1:
+        return task_manager.submit_parallel_module_task(
+            module_id=module["id"],
+            module_name=module.get("name", module["id"]),
+            jobs=jobs,
+            inputs={**inputs, "parallel_workers": parallel_workers},
+            max_workers=parallel_workers,
+        )
 
     command, working_dir, runtime_env = build_runtime_for_module(module, inputs)
 

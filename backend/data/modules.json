@@ -38,88 +38,186 @@
       "云类型",
       "h8"
     ],
-    "enabled": true
+    "enabled": true,
+    "tool_type": "cloud",
+    "parallel_mode": "auto",
+    "parallel_input_key": "",
+    "parallel_output_key": "",
+    "parallel_file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
+    "parallel_output_suffix": ".tif"
   },
   {
     "id": "h8aod",
     "name": "H8 AOD 反演",
-    "category": "aerosol",
-    "description": "H8 AOD 本地原生模块，按 JSON 配置文件模式运行",
-    "executable": "backend/installed_modules/h8aod/AOD_AHI.exe",
-    "working_dir": "backend/installed_modules/h8aod",
-    "config_mode": "json",
+    "description": "H8 AOD 本地原生模块。用户按目录输入 B01、B03、B06、SOLAR，系统后端自动按文件名时次匹配并拆分为多个单文件 job，再按并发进程数调用 AOD_AHI.exe 执行。",
+    "runtime": "native",
+    "entry": "AOD_AHI.exe",
+    "executable": "D:\\local_web_module_system_wrl\\backend\\installed_modules\\h8aod\\AOD_AHI.exe",
+    "working_dir": "D:\\local_web_module_system_wrl\\backend\\installed_modules\\h8aod",
+    "config_mode": "json_file",
     "dependency_dirs": [
-      "deps",
-      "bin",
-      "dlls",
-      "libs",
-      "runtime"
+      "deps"
     ],
     "command_template": [
       "{executable}",
-      "{config_json}"
+      "{config_path}"
     ],
     "tags": [
       "h8",
       "aod",
-      "remote-sensing"
+      "remote-sensing",
+      "batch"
     ],
     "enabled": true,
     "inputs": [
       {
         "key": "B01_file",
-        "label": "B01 文件路径",
+        "label": "B01 文件夹",
         "type": "dir_path",
-        "required": true
+        "required": true,
+        "placeholder": "请选择 B01 文件所在目录",
+        "default": "",
+        "help_text": "批量输入目录。目录中放 B01 数据文件，系统会按文件名时次自动匹配生成 job。",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "B01",
+        "match_mode": "timeslot"
       },
       {
         "key": "B03_file",
-        "label": "B03 文件路径",
+        "label": "B03 文件夹",
         "type": "dir_path",
-        "required": true
+        "required": true,
+        "placeholder": "请选择 B03 文件所在目录",
+        "default": "",
+        "help_text": "批量输入目录。目录中放 B03 数据文件，系统会按文件名时次自动匹配生成 job。",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "B03",
+        "match_mode": "timeslot"
       },
       {
         "key": "B06_file",
-        "label": "B06 文件路径",
+        "label": "B06 文件夹",
         "type": "dir_path",
-        "required": true
+        "required": true,
+        "placeholder": "请选择 B06 文件所在目录",
+        "default": "",
+        "help_text": "批量输入目录。目录中放 B06 数据文件，系统会按文件名时次自动匹配生成 job。",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "B06",
+        "match_mode": "timeslot"
       },
       {
         "key": "SOLAR_file",
-        "label": "SOLAR 文件路径",
+        "label": "SOLAR 文件夹",
         "type": "dir_path",
-        "required": true
+        "required": true,
+        "placeholder": "请选择 SOLAR 文件所在目录",
+        "default": "",
+        "help_text": "批量输入目录。目录中放 SOLAR 数据文件，系统会按文件名时次自动匹配生成 job。",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "SOLAR",
+        "match_mode": "timeslot"
       },
       {
         "key": "GEO1_file",
         "label": "GEO1 文件路径",
-        "type": "dir_path",
-        "required": true
+        "type": "file_path",
+        "required": true,
+        "placeholder": "",
+        "default": "resources/lon_lat_az_zen_1000_73_19_140_54.tif",
+        "help_text": "管理员固定输入，用户界面隐藏。该文件需要随模块一起放在 resources 目录下。",
+        "visible_to_user": false,
+        "admin_fixed": true,
+        "path_mode": "relative_to_module",
+        "batch_role": "",
+        "match_mode": "none"
       },
       {
         "key": "al_igbp",
         "label": "IGBP 文件路径",
-        "type": "dir_path",
-        "required": true
+        "type": "file_path",
+        "required": true,
+        "placeholder": "",
+        "default": "resources/h8_aod_igbp.tif",
+        "help_text": "管理员固定输入，用户界面隐藏。该文件需要随模块一起放在 resources 目录下。",
+        "visible_to_user": false,
+        "admin_fixed": true,
+        "path_mode": "relative_to_module",
+        "batch_role": "",
+        "match_mode": "none"
       },
       {
         "key": "al_lut",
         "label": "LUT 文件路径",
-        "type": "dir_path",
-        "required": true
+        "type": "file_path",
+        "required": true,
+        "placeholder": "",
+        "default": "resources/h8_aod_lut.dat",
+        "help_text": "管理员固定输入，用户界面隐藏。该文件需要随模块一起放在 resources 目录下。",
+        "visible_to_user": false,
+        "admin_fixed": true,
+        "path_mode": "relative_to_module",
+        "batch_role": "",
+        "match_mode": "none"
       },
       {
         "key": "al_dem",
         "label": "DEM 文件路径",
-        "type": "dir_path",
-        "required": true
+        "type": "file_path",
+        "required": true,
+        "placeholder": "",
+        "default": "resources/dem_1000_73_19_140_54.tif",
+        "help_text": "管理员固定输入，用户界面隐藏。该文件需要随模块一起放在 resources 目录下。",
+        "visible_to_user": false,
+        "admin_fixed": true,
+        "path_mode": "relative_to_module",
+        "batch_role": "",
+        "match_mode": "none"
       },
       {
         "key": "output",
-        "label": "输出文件路径",
+        "label": "输出目录",
         "type": "dir_path",
-        "required": true
+        "required": true,
+        "placeholder": "请选择输出目录",
+        "default": "",
+        "help_text": "输出目录可以为空目录。系统会为每个匹配 job 自动生成输出 tif 文件名。",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "",
+        "match_mode": "none",
+        "output_ext": ".tif"
+      },
+      {
+        "key": "parallel_workers",
+        "label": "并发进程数",
+        "type": "integer",
+        "required": true,
+        "placeholder": "例如 2",
+        "default": 2,
+        "help_text": "系统调度参数，只用于控制同时运行几个子任务，不会写入单个 exe 的 config.json。",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "",
+        "match_mode": "none",
+        "control_only": true
       }
-    ]
+    ],
+    "tool_type": "aerosol",
+    "parallel_mode": "auto",
+    "parallel_input_key": "",
+    "parallel_output_key": "",
+    "parallel_file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
+    "parallel_output_suffix": ".tif"
   }
 ]

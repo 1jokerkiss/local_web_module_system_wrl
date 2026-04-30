@@ -183,10 +183,14 @@ export async function getTask(taskId) {
   return request(`/api/tasks/${taskId}`);
 }
 
-export async function runModule(moduleId, inputs) {
+export async function runModule(moduleId, inputs, parallelWorkers = 1) {
   return request('/api/tasks/run', {
     method: 'POST',
-    body: JSON.stringify({ module_id: moduleId, inputs }),
+    body: JSON.stringify({
+      module_id: moduleId,
+      inputs,
+      parallel_workers: Number(parallelWorkers || 1),
+    }),
   });
 }
 
