@@ -1052,6 +1052,7 @@ const labelStyle = {
 export default function App() {
     const [userFiles, setUserFiles] = useState([]);
     const [uploadingFile, setUploadingFile] = useState(false);
+    const [fileActionMode, setFileActionMode] = useState('');
     const fileInputRef = useRef(null);
   const [currentUser, setCurrentUser] = useState(null);
   const [authMode, setAuthMode] = useState('login');
@@ -1862,16 +1863,227 @@ async function handleRegister() {
       }
     }
 
-    async function handleDeleteManagedFile(filename) {
-      if (!window.confirm(`确认删除文件：${filename}？`)) return;
-      try {
-        await deleteUserFile(filename);
-        await loadUserFiles();
-      } catch (err) {
-        alert(err?.message || '删除失败');
-      }
+  async function handleDeleteManagedFile(filename) {
+    try {
+      await deleteUserFile(filename);
+      await loadUserFiles();
+    } catch (err) {
+      alert(err?.message || '删除失败');
     }
+  }
+  function buildFileTree(files) {
+    const root = {
+      name: 'uploads',
+      type: 'dir',
+      children: {},
+      files: [],
+    };
 
+    (files || []).forEach((file) => {
+      const rawPath = String(file.path || file.name || '');
+      const normalized = rawPath.replace(/\\/g, '/');
+      const parts = normalized.split('/').filter(Boolean);
+
+      const fileName = file.name || parts[parts.length - 1] || '未命名文件';
+
+      let usefulParts = parts;
+      const uploadIndex = parts.findIndex((p) => p === 'uploads');
+      if (uploadIndex >= 0) {
+        usefulParts = parts.slice(uploadIndex + 1);
+      }
+
+      if (usefulParts.length <= 1) {
+        root.files.push({ ...file, name: fileName });
+        return;
+      }
+
+      const dirParts = usefulParts.slice(0, -1);
+      let node = root;
+
+      dirParts.forEach((part) => {
+        if (!node.children[part]) {
+          node.children[part] = {
+            name: part,
+            type: 'dir',
+            children: {},
+            files: [],
+          };
+        }
+        node = node.children[part];
+      });
+
+      node.files.push({ ...file, name: fileName });
+    });
+
+    return root;
+  }
+
+  function renderFileTreeNode(node, depth = 0) {
+    const childDirs = Object.values(node.children || {});
+    const files = node.files || [];
+
+    return (
+      <div>
+        {depth === 0 && (
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              padding: '7px 8px',
+              borderRadius: 8,
+              background: '#f3f7fc',
+              color: '#1d3d63',
+              fontWeight: 900,
+              marginBottom: 6,
+              minWidth: 0,
+            }}
+          >
+            <span>▾</span>
+            <span>📁</span>
+            <span
+              style={{
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {node.name}
+            </span>
+          </div>
+        )}
+
+        {childDirs.map((child) => (
+          <div key={`${depth}-${child.name}`} style={{ marginLeft: depth === 0 ? 10 : 14 }}>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '5px 6px',
+                borderRadius: 8,
+                color: '#26384d',
+                fontSize: 13,
+                minWidth: 0,
+              }}
+            >
+              <span style={{ color: '#7b8ba1' }}>▾</span>
+              <span>📁</span>
+              <span
+                title={child.name}
+                style={{
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {child.name}
+              </span>
+            </div>
+
+            {renderFileTreeNode(child, depth + 1)}
+          </div>
+        ))}
+
+        {files.map((f) => (
+          <div
+            key={f.path || f.name}
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'minmax(0, 1fr) auto',
+              alignItems: 'center',
+              gap: 6,
+              marginLeft: depth === 0 ? 14 : 24,
+              padding: '6px 6px',
+              borderRadius: 8,
+              color: '#26384d',
+              minWidth: 0,
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = '#f5f9ff';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = 'transparent';
+            }}
+          >
+            <div
+              title={f.path}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                minWidth: 0,
+                fontSize: 13,
+                color: '#26384d',
+              }}
+            >
+              <span style={{ color: '#7b8ba1' }}>▸</span>
+              <span>📄</span>
+              <span
+                style={{
+                  minWidth: 0,
+                  overflow: 'hidden',
+                  whiteSpace: 'nowrap',
+                  textOverflow: 'ellipsis',
+                }}
+              >
+                {f.name}
+              </span>
+            </div>
+
+            {fileActionMode === 'copy' && (
+              <button
+                title="复制路径"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(f.path);
+                    alert('路径已复制');
+                  } catch {
+                    alert('复制失败，请手动复制路径');
+                  }
+                }}
+                style={{
+                  border: 'none',
+                  background: 'transparent',
+                  color: '#2d7cf6',
+                  fontSize: 15,
+                  cursor: 'pointer',
+                  padding: '0 4px',
+                  lineHeight: 1,
+                }}
+              >
+                📋
+              </button>
+            )}
+
+            {fileActionMode === 'delete' && (
+              <button
+                title="删除文件"
+                onClick={() => {
+                  const ok = window.confirm(`确认删除文件：${f.name}？`);
+                  if (ok) {
+                    handleDeleteManagedFile(f.name);
+                  }
+                }}
+                style={{
+                  border: 'none',
+                  background: 'transparent',
+                  color: '#e53935',
+                  fontSize: 18,
+                  fontWeight: 900,
+                  cursor: 'pointer',
+                  padding: '0 4px',
+                  lineHeight: 1,
+                }}
+              >
+                ×
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+    );
+  }
   async function handleDeleteUser(username) {
     try {
       await deleteUser(username);
@@ -1910,94 +2122,150 @@ async function handleRegister() {
     }
   }
   function renderFileManagerPanel() {
-  return (
-    <div style={{ ...styles.card, padding: 18, minHeight: '100%' }}>
-      <div style={{ fontSize: 22, fontWeight: 900, color: '#0b2d51', marginBottom: 16 }}>
-        文件管理
-      </div>
-          <input
-            ref={fileInputRef}
-            type="file"
-            style={{ display: 'none' }}
-            onChange={handleUploadManagedFile}
-          />
+    const fileTree = buildFileTree(userFiles);
 
-      <div style={{ display: 'grid', gap: 10, marginBottom: 16 }}>
-            <button
-              style={styles.blueBtn}
-              onClick={() => fileInputRef.current?.click()}
-              disabled={uploadingFile}
-            >
-              {uploadingFile ? '上传中...' : '上传文件'}
-            </button>
+    return (
+      <div
+        style={{
+          ...styles.card,
+          padding: 14,
+          minHeight: '100%',
+          minWidth: 0,
+          maxWidth: '100%',
+          overflow: 'hidden',
+          background: '#ffffff',
+        }}
+      >
+        <div
+          style={{
+            fontSize: 22,
+            fontWeight: 900,
+            color: '#0b2d51',
+            marginBottom: 12,
+          }}
+        >
+          文件管理
+        </div>
 
-            <button
-              style={styles.whiteBtn}
-              onClick={loadUserFiles}
-            >
-              刷新列表
-            </button>
-      </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          style={{ display: 'none' }}
+          onChange={handleUploadManagedFile}
+        />
 
-      <div style={{ fontSize: 14, color: '#6b7d90', marginBottom: 10 }}>
-        已上传文件
-      </div>
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: '1fr 1fr',
+            gap: 8,
+            marginBottom: 12,
+            padding: 8,
+            border: '1px solid #d8e3ef',
+            borderRadius: 12,
+            background: '#ffffff',
+          }}
+        >
+          <button
+            style={{
+              ...styles.blueBtn,
+              height: 36,
+              borderRadius: 8,
+              padding: '0 8px',
+              fontSize: 13,
+            }}
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploadingFile}
+          >
+            {uploadingFile ? '上传中...' : '上传文件'}
+          </button>
 
-      <div style={{ display: 'grid', gap: 10 }}>
-        {userFiles.length === 0 ? (
-          <div style={{ color: '#99a6b5', fontSize: 14, padding: '8px 0' }}>
-            暂无文件
-          </div>
-        ) : (
-          userFiles.map((f) => (
+          <button
+            style={{
+              ...styles.whiteBtn,
+              height: 36,
+              borderRadius: 8,
+              padding: '0 8px',
+              fontSize: 13,
+            }}
+            onClick={loadUserFiles}
+          >
+            刷新列表
+          </button>
+
+          <button
+            style={{
+              ...(fileActionMode === 'copy' ? styles.blueBtn : styles.whiteBtn),
+              height: 36,
+              borderRadius: 8,
+              padding: '0 8px',
+              fontSize: 13,
+            }}
+            onClick={() =>
+              setFileActionMode((prev) => (prev === 'copy' ? '' : 'copy'))
+            }
+          >
+            复制路径
+          </button>
+
+          <button
+            style={{
+              ...(fileActionMode === 'delete' ? styles.redBtn : styles.whiteBtn),
+              height: 36,
+              borderRadius: 8,
+              padding: '0 8px',
+              fontSize: 13,
+            }}
+            onClick={() =>
+              setFileActionMode((prev) => (prev === 'delete' ? '' : 'delete'))
+            }
+          >
+            删除文件
+          </button>
+        </div>
+
+        <div
+          style={{
+            fontSize: 14,
+            fontWeight: 800,
+            color: '#4b6078',
+            marginBottom: 8,
+          }}
+        >
+          已上传文件
+        </div>
+
+        <div
+          style={{
+            border: '1px solid #d8e3ef',
+            borderRadius: 12,
+            background: '#ffffff',
+            minHeight: 320,
+            maxHeight: 'calc(100vh - 270px)',
+            overflowY: 'auto',
+            overflowX: 'hidden',
+            padding: 8,
+            minWidth: 0,
+          }}
+        >
+          {userFiles.length === 0 ? (
             <div
-              key={f.path}
               style={{
-                border: '1px solid #d7e3f0',
-                borderRadius: 12,
-                padding: 12,
-                background: '#fff',
+                color: '#99a6b5',
+                fontSize: 14,
+                padding: '12px 10px',
               }}
             >
-              <div
-                style={{
-                  fontWeight: 700,
-                  color: '#173353',
-                  wordBreak: 'break-all',
-                  marginBottom: 6,
-                }}
-              >
-                {f.name}
-              </div>
-
-              <div style={{ fontSize: 12, color: '#7b8ba1', marginBottom: 10 }}>
-                {f.path}
-              </div>
-
-              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                <button
-                  style={styles.whiteBtn}
-                  onClick={() => navigator.clipboard.writeText(f.path)}
-                >
-                  复制路径
-                </button>
-
-                <button
-                  style={styles.redBtn}
-                  onClick={() => handleDeleteManagedFile(f.name)}
-                >
-                  删除
-                </button>
-              </div>
+              暂无文件
             </div>
-          ))
-        )}
+          ) : (
+            renderFileTreeNode(fileTree)
+          )}
+        </div>
       </div>
-    </div>
-  );
-}
+    );
+  }
   function renderModuleRuntime(module) {
-    console.log("当前渲染的模块信息:", module);// 加这一行
     if (!module) {
       return <div style={{ padding: 20 }}>当前没有匹配到可运行模块</div>;
     }
@@ -2255,9 +2523,11 @@ async function handleRegister() {
       <section
         style={{
           display: 'grid',
-          gridTemplateColumns: '300px minmax(0, 1fr) 280px',
+          gridTemplateColumns: '280px minmax(0, 1fr) 320px',
           gap: 12,
           minHeight: 'calc(100vh - 98px)',
+          width: '100%',
+          overflow: 'hidden',
         }}
       >
         <div style={{ ...styles.card, padding: 18 }}>
@@ -2374,190 +2644,233 @@ async function handleRegister() {
         </div>
       </div>
 
-      <div style={{ padding: 12 }}>
+      <div style={{padding: 12, overflowX: 'hidden'}}>
         {activeTab === 'module_mgmt' && isAdmin && (
-          <section style={{ ...styles.card, padding: 16, minHeight: 'calc(100vh - 98px)' }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '380px 1fr', gap: 16 }}>
-              <div style={{ ...styles.card, padding: 16 }}>
-                <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
-                  模块上传 / 本地投放
+            <section style={{...styles.card, padding: 16, minHeight: 'calc(100vh - 98px)'}}>
+              <div style={{display: 'grid', gridTemplateColumns: '380px 1fr', gap: 16}}>
+                <div style={{...styles.card, padding: 16}}>
+                  <div style={{fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12}}>
+                    模块上传 / 本地投放
+                  </div>
+
+                  <div style={{display: 'grid', gap: 10, marginBottom: 14}}>
+                    <label>
+                      <div style={labelStyle}>模块所属工具栏</div>
+                      <select value={uploadToolType} onChange={(e) => setUploadToolType(e.target.value)}
+                              style={styles.input}>
+                        {renderToolbarOptions()}
+                      </select>
+                    </label>
+
+                    <label>
+                      <div style={labelStyle}>可选：上传模块 zip</div>
+                      <input type="file" accept=".zip" onChange={(e) => setZipFile(e.target.files?.[0] || null)}/>
+                    </label>
+                  </div>
+
+                  <div style={{display: 'flex', gap: 10, flexWrap: 'wrap'}}>
+                    <button style={styles.blueBtn} onClick={uploadZip}>上传并安装</button>
+                    <button style={styles.blueBtn} onClick={() => installFromDrop()}>扫描本地目录安装</button>
+                    <button style={styles.whiteBtn} onClick={refreshDropZipList}>刷新目录</button>
+                    <button style={styles.whiteBtn} onClick={() => setShowDropHint(true)}>本地模块目录说明</button>
+                  </div>
+
+                  {uploadMsg && <div style={{marginTop: 12, color: '#4f6682'}}>{uploadMsg}</div>}
+                  {dropInfo.drop_dir && (
+                      <div style={{marginTop: 12, color: '#6a7f96', fontSize: 13, wordBreak: 'break-all'}}>
+                        本地投放目录：{dropInfo.drop_dir}
+                      </div>
+                  )}
+
+                  {dropInfo.items?.length > 0 && (
+                      <div style={{marginTop: 12, display: 'grid', gap: 8}}>
+                        <div style={{fontWeight: 800, color: '#12385f'}}>目录中待安装 zip</div>
+                        {dropInfo.items.map((item) => (
+                            <div key={item.path} style={{
+                              border: '1px solid #e1eaf3',
+                              background: '#fff',
+                              borderRadius: 10,
+                              padding: 10
+                            }}>
+                              <div style={{fontWeight: 700, wordBreak: 'break-all'}}>{item.name}</div>
+                              <button style={{...styles.whiteBtn, marginTop: 8}}
+                                      onClick={() => installFromDrop(item.name)}>
+                                安装这个 zip
+                              </button>
+                            </div>
+                        ))}
+                      </div>
+                  )}
+
+                  <div style={{marginTop: 20, fontSize: 20, fontWeight: 900, color: '#12385f'}}>
+                    已安装模块
+                  </div>
+                  {renderInstalledModulesTree()}
+
+                  <div style={{marginTop: 20, fontSize: 18, fontWeight: 900, color: '#12385f', marginBottom: 10}}>
+                    工具栏列表
+                  </div>
+                  <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8, marginBottom: 10}}>
+                    <input
+                        placeholder="新增工具栏名称"
+                        value={newToolbarForm.label}
+                        onChange={(e) => setNewToolbarForm({...newToolbarForm, label: e.target.value})}
+                        style={{...styles.input, minHeight: 38, fontSize: 13}}
+                    />
+                    <input
+                        placeholder="标识，可选"
+                        value={newToolbarForm.key}
+                        onChange={(e) => setNewToolbarForm({...newToolbarForm, key: e.target.value})}
+                        style={{...styles.input, minHeight: 38, fontSize: 13}}
+                    />
+                    <button style={{...styles.blueBtn, padding: '8px 12px', fontSize: 13}}
+                            onClick={handleAddToolbar}>添加
+                    </button>
+                  </div>
+                  {renderToolbarAdminList()}
                 </div>
 
-                <div style={{ display: 'grid', gap: 10, marginBottom: 14 }}>
-                  <label>
-                    <div style={labelStyle}>模块所属工具栏</div>
-                    <select value={uploadToolType} onChange={(e) => setUploadToolType(e.target.value)} style={styles.input}>
+                <div style={{...styles.card, padding: 16}}>
+                  <div style={{fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12}}>
+                    {editingModuleId ? `编辑模块：${editingModuleId}` : '手工新增 / 更新模块'}
+                  </div>
+
+                  <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12}}>
+                    <select value={moduleForm.tool_type}
+                            onChange={(e) => setModuleForm({...moduleForm, tool_type: e.target.value})}
+                            style={styles.input}>
                       {renderToolbarOptions()}
                     </select>
-                  </label>
+                    <input placeholder="ID" value={moduleForm.id}
+                           onChange={(e) => setModuleForm({...moduleForm, id: e.target.value})} style={styles.input}/>
+                    <input placeholder="名称" value={moduleForm.name}
+                           onChange={(e) => setModuleForm({...moduleForm, name: e.target.value})} style={styles.input}/>
+                    <input placeholder="可执行文件" value={moduleForm.executable}
+                           onChange={(e) => setModuleForm({...moduleForm, executable: e.target.value})}
+                           style={styles.input}/>
+                    <input placeholder="工作目录" value={moduleForm.working_dir}
+                           onChange={(e) => setModuleForm({...moduleForm, working_dir: e.target.value})}
+                           style={styles.input}/>
+                    <input placeholder="标签，英文逗号分隔" value={moduleForm.tags_text}
+                           onChange={(e) => setModuleForm({...moduleForm, tags_text: e.target.value})}
+                           style={styles.input}/>
 
-                  <label>
-                    <div style={labelStyle}>可选：上传模块 zip</div>
-                    <input type="file" accept=".zip" onChange={(e) => setZipFile(e.target.files?.[0] || null)} />
-                  </label>
-                </div>
-
-                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                  <button style={styles.blueBtn} onClick={uploadZip}>上传并安装</button>
-                  <button style={styles.blueBtn} onClick={() => installFromDrop()}>扫描本地目录安装</button>
-                  <button style={styles.whiteBtn} onClick={refreshDropZipList}>刷新目录</button>
-                  <button style={styles.whiteBtn} onClick={() => setShowDropHint(true)}>本地模块目录说明</button>
-                </div>
-
-                {uploadMsg && <div style={{ marginTop: 12, color: '#4f6682' }}>{uploadMsg}</div>}
-                {dropInfo.drop_dir && (
-                  <div style={{ marginTop: 12, color: '#6a7f96', fontSize: 13, wordBreak: 'break-all' }}>
-                    本地投放目录：{dropInfo.drop_dir}
+                    <textarea placeholder="描述" value={moduleForm.description}
+                              onChange={(e) => setModuleForm({...moduleForm, description: e.target.value})}
+                              style={{...styles.textarea, gridColumn: '1 / span 2', minHeight: 80}}/>
+                    <textarea placeholder="命令模板(JSON数组)" value={moduleForm.command_template_text}
+                              onChange={(e) => setModuleForm({...moduleForm, command_template_text: e.target.value})}
+                              style={{...styles.textarea, gridColumn: '1 / span 2'}}/>
+                    <textarea placeholder="输入字段(JSON数组)：包含输入/输出路径、是否用户可见、管理员预填 resources 等"
+                              value={moduleForm.inputs_text}
+                              onChange={(e) => setModuleForm({...moduleForm, inputs_text: e.target.value})}
+                              style={{...styles.textarea, gridColumn: '1 / span 2', minHeight: 180}}/>
+                    <textarea placeholder="并行配置(JSON对象)，保存在 module.json 的 parallel 字段"
+                              value={moduleForm.parallel_json_text}
+                              onChange={(e) => setModuleForm({...moduleForm, parallel_json_text: e.target.value})}
+                              style={{...styles.textarea, gridColumn: '1 / span 2', minHeight: 110}}/>
                   </div>
-                )}
 
-                {dropInfo.items?.length > 0 && (
-                  <div style={{ marginTop: 12, display: 'grid', gap: 8 }}>
-                    <div style={{ fontWeight: 800, color: '#12385f' }}>目录中待安装 zip</div>
-                    {dropInfo.items.map((item) => (
-                      <div key={item.path} style={{ border: '1px solid #e1eaf3', background: '#fff', borderRadius: 10, padding: 10 }}>
-                        <div style={{ fontWeight: 700, wordBreak: 'break-all' }}>{item.name}</div>
-                        <button style={{ ...styles.whiteBtn, marginTop: 8 }} onClick={() => installFromDrop(item.name)}>
-                          安装这个 zip
-                        </button>
-                      </div>
-                    ))}
+                  <div style={{display: 'flex', gap: 10, marginTop: 14, flexWrap: 'wrap'}}>
+                    <button style={styles.blueBtn} onClick={saveCurrentModule}>保存模块</button>
+                    <button style={styles.whiteBtn} onClick={openInputEditor}>编辑输入文件</button>
+                    <button
+                        style={styles.whiteBtn}
+                        onClick={() => {
+                          setEditingModuleId('');
+                          setModuleForm(emptyModuleForm);
+                        }}
+                    >
+                      新建空白
+                    </button>
                   </div>
-                )}
-
-                <div style={{ marginTop: 20, fontSize: 20, fontWeight: 900, color: '#12385f' }}>
-                  已安装模块
-                </div>
-                {renderInstalledModulesTree()}
-
-                <div style={{ marginTop: 20, fontSize: 18, fontWeight: 900, color: '#12385f', marginBottom: 10 }}>
-                  工具栏列表
-                </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8, marginBottom: 10 }}>
-                  <input
-                    placeholder="新增工具栏名称"
-                    value={newToolbarForm.label}
-                    onChange={(e) => setNewToolbarForm({ ...newToolbarForm, label: e.target.value })}
-                    style={{ ...styles.input, minHeight: 38, fontSize: 13 }}
-                  />
-                  <input
-                    placeholder="标识，可选"
-                    value={newToolbarForm.key}
-                    onChange={(e) => setNewToolbarForm({ ...newToolbarForm, key: e.target.value })}
-                    style={{ ...styles.input, minHeight: 38, fontSize: 13 }}
-                  />
-                  <button style={{ ...styles.blueBtn, padding: '8px 12px', fontSize: 13 }} onClick={handleAddToolbar}>添加</button>
-                </div>
-                {renderToolbarAdminList()}
-              </div>
-
-              <div style={{ ...styles.card, padding: 16 }}>
-                <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
-                  {editingModuleId ? `编辑模块：${editingModuleId}` : '手工新增 / 更新模块'}
-                </div>
-
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                  <select value={moduleForm.tool_type} onChange={(e) => setModuleForm({ ...moduleForm, tool_type: e.target.value })} style={styles.input}>
-                    {renderToolbarOptions()}
-                  </select>
-                  <input placeholder="ID" value={moduleForm.id} onChange={(e) => setModuleForm({ ...moduleForm, id: e.target.value })} style={styles.input} />
-                  <input placeholder="名称" value={moduleForm.name} onChange={(e) => setModuleForm({ ...moduleForm, name: e.target.value })} style={styles.input} />
-                  <input placeholder="可执行文件" value={moduleForm.executable} onChange={(e) => setModuleForm({ ...moduleForm, executable: e.target.value })} style={styles.input} />
-                  <input placeholder="工作目录" value={moduleForm.working_dir} onChange={(e) => setModuleForm({ ...moduleForm, working_dir: e.target.value })} style={styles.input} />
-                  <input placeholder="标签，英文逗号分隔" value={moduleForm.tags_text} onChange={(e) => setModuleForm({ ...moduleForm, tags_text: e.target.value })} style={styles.input} />
-
-                  <textarea placeholder="描述" value={moduleForm.description} onChange={(e) => setModuleForm({ ...moduleForm, description: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 80 }} />
-                  <textarea placeholder="命令模板(JSON数组)" value={moduleForm.command_template_text} onChange={(e) => setModuleForm({ ...moduleForm, command_template_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2' }} />
-                  <textarea placeholder="输入字段(JSON数组)：包含输入/输出路径、是否用户可见、管理员预填 resources 等" value={moduleForm.inputs_text} onChange={(e) => setModuleForm({ ...moduleForm, inputs_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 180 }} />
-                  <textarea placeholder="并行配置(JSON对象)，保存在 module.json 的 parallel 字段" value={moduleForm.parallel_json_text} onChange={(e) => setModuleForm({ ...moduleForm, parallel_json_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 110 }} />
-                </div>
-
-                <div style={{ display: 'flex', gap: 10, marginTop: 14, flexWrap: 'wrap' }}>
-                  <button style={styles.blueBtn} onClick={saveCurrentModule}>保存模块</button>
-                  <button style={styles.whiteBtn} onClick={openInputEditor}>编辑输入文件</button>
-                  <button
-                    style={styles.whiteBtn}
-                    onClick={() => {
-                      setEditingModuleId('');
-                      setModuleForm(emptyModuleForm);
-                    }}
-                  >
-                    新建空白
-                  </button>
                 </div>
               </div>
-            </div>
-          </section>
+            </section>
         )}
         {activeTab === 'user_mgmt' && isAdmin && (
-          <section style={{ ...styles.card, padding: 16, minHeight: 'calc(100vh - 98px)' }}>
-            <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
-              用户管理
-            </div>
+            <section style={{...styles.card, padding: 16, minHeight: 'calc(100vh - 98px)'}}>
+              <div style={{fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 14}}>
+                用户管理
+              </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 180px', gap: 12 }}>
-              <input placeholder="用户名" value={newUserForm.username} onChange={(e) => setNewUserForm({ ...newUserForm, username: e.target.value })} style={styles.input} />
-              <input placeholder="密码" type="password" value={newUserForm.password} onChange={(e) => setNewUserForm({ ...newUserForm, password: e.target.value })} style={styles.input} />
-              <select value={newUserForm.role} onChange={(e) => setNewUserForm({ ...newUserForm, role: e.target.value })} style={styles.input}>
-                <option value="user">user</option>
-                <option value="admin">admin</option>
-              </select>
-              <input placeholder="安全问题" value={newUserForm.security_question} onChange={(e) => setNewUserForm({ ...newUserForm, security_question: e.target.value })} style={{ ...styles.input, gridColumn: '1 / span 2' }} />
-              <input placeholder="安全答案" value={newUserForm.security_answer} onChange={(e) => setNewUserForm({ ...newUserForm, security_answer: e.target.value })} style={styles.input} />
-            </div>
+              <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr 180px', gap: 12}}>
+                <input placeholder="用户名" value={newUserForm.username}
+                       onChange={(e) => setNewUserForm({...newUserForm, username: e.target.value})}
+                       style={styles.input}/>
+                <input placeholder="密码" type="password" value={newUserForm.password}
+                       onChange={(e) => setNewUserForm({...newUserForm, password: e.target.value})}
+                       style={styles.input}/>
+                <select value={newUserForm.role}
+                        onChange={(e) => setNewUserForm({...newUserForm, role: e.target.value})} style={styles.input}>
+                  <option value="user">user</option>
+                  <option value="admin">admin</option>
+                </select>
+                <input placeholder="安全问题" value={newUserForm.security_question}
+                       onChange={(e) => setNewUserForm({...newUserForm, security_question: e.target.value})}
+                       style={{...styles.input, gridColumn: '1 / span 2'}}/>
+                <input placeholder="安全答案" value={newUserForm.security_answer}
+                       onChange={(e) => setNewUserForm({...newUserForm, security_answer: e.target.value})}
+                       style={styles.input}/>
+              </div>
 
-            <div style={{ marginTop: 12 }}>
-              <button style={styles.blueBtn} onClick={handleAddUser}>新增用户</button>
-            </div>
+              <div style={{marginTop: 12}}>
+                <button style={styles.blueBtn} onClick={handleAddUser}>新增用户</button>
+              </div>
 
-            <div style={{ overflowX: 'auto', marginTop: 16 }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
-                <thead>
+              <div style={{overflowX: 'auto', marginTop: 16}}>
+                <table style={{width: '100%', borderCollapse: 'collapse', background: '#fff'}}>
+                  <thead>
                   <tr>
                     <th style={thStyle}>用户名</th>
                     <th style={thStyle}>角色</th>
                     <th style={thStyle}>状态</th>
                     <th style={thStyle}>操作</th>
                   </tr>
-                </thead>
-                <tbody>
+                  </thead>
+                  <tbody>
                   {users.map((u) => (
-                    <tr key={u.username}>
-                      <td style={tdStyle}>{u.username}</td>
-                      <td style={tdStyle}>
-                        <select value={u.role} onChange={(e) => handleRoleChange(u.username, e.target.value)} style={styles.input}>
-                          <option value="user">user</option>
-                          <option value="admin">admin</option>
-                        </select>
-                      </td>
-                      <td style={tdStyle}>
-                        <select value={u.enabled ? 'enabled' : 'disabled'} onChange={(e) => handleEnabledChange(u.username, e.target.value === 'enabled')} style={styles.input}>
-                          <option value="enabled">enabled</option>
-                          <option value="disabled">disabled</option>
-                        </select>
-                      </td>
-                      <td style={tdStyle}>
-                        <div style={{ display: 'flex', gap: 8 }}>
-                          <button style={styles.whiteBtn} onClick={() => handleAdminResetPassword(u.username)}>重置密码</button>
-                          {u.username !== 'admin' && (
-                            <button style={styles.redBtn} onClick={() => handleDeleteUser(u.username)}>删除</button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
+                      <tr key={u.username}>
+                        <td style={tdStyle}>{u.username}</td>
+                        <td style={tdStyle}>
+                          <select value={u.role} onChange={(e) => handleRoleChange(u.username, e.target.value)}
+                                  style={styles.input}>
+                            <option value="user">user</option>
+                            <option value="admin">admin</option>
+                          </select>
+                        </td>
+                        <td style={tdStyle}>
+                          <select value={u.enabled ? 'enabled' : 'disabled'}
+                                  onChange={(e) => handleEnabledChange(u.username, e.target.value === 'enabled')}
+                                  style={styles.input}>
+                            <option value="enabled">enabled</option>
+                            <option value="disabled">disabled</option>
+                          </select>
+                        </td>
+                        <td style={tdStyle}>
+                          <div style={{display: 'flex', gap: 8}}>
+                            <button style={styles.whiteBtn}
+                                    onClick={() => handleAdminResetPassword(u.username)}>重置密码
+                            </button>
+                            {u.username !== 'admin' && (
+                                <button style={styles.redBtn} onClick={() => handleDeleteUser(u.username)}>删除</button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
                   ))}
-                </tbody>
-              </table>
-            </div>
-          </section>
+                  </tbody>
+                </table>
+              </div>
+            </section>
         )}
         {activeTab.startsWith('tool:') && renderToolPage(activeTab.slice('tool:'.length))}
         {activeTab === 'tasks' && (
-          <section style={{ ...styles.card, padding: 18, minHeight: 'calc(100vh - 98px)' }}>
-            <div style={{ fontSize: 28, fontWeight: 900, color: '#0b2d51', marginBottom: 16 }}>任务列表</div>
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
-                <thead>
+            <section style={{...styles.card, padding: 18, minHeight: 'calc(100vh - 98px)'}}>
+              <div style={{fontSize: 28, fontWeight: 900, color: '#0b2d51', marginBottom: 16}}>任务列表</div>
+              <div style={{overflowX: 'auto'}}>
+                <table style={{width: '100%', borderCollapse: 'collapse', background: '#fff'}}>
+                  <thead>
                   <tr>
                     <th style={thStyle}>任务 ID</th>
                     <th style={thStyle}>模块</th>
@@ -2567,66 +2880,66 @@ async function handleRegister() {
                     <th style={thStyle}>结束时间</th>
                     <th style={thStyle}>操作</th>
                   </tr>
-                </thead>
-                <tbody>
+                  </thead>
+                  <tbody>
                   {tasks.map((task) => (
-                    <tr key={task.id}>
-                      <td style={tdStyle}>{task.id}</td>
-                      <td style={tdStyle}>{task.module_name}</td>
-                      <td style={tdStyle}>{task.kind}</td>
-                      <td style={tdStyle}>{statusBadge(task.status)}</td>
-                      <td style={tdStyle}>{task.started_at || '-'}</td>
-                      <td style={tdStyle}>{task.ended_at || '-'}</td>
-                      <td style={tdStyle}>
-                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                          <button
-                            style={styles.whiteBtn}
-                            onClick={async () => {
-                              try {
-                                const detail = await getTask(task.id);
-                                addTaskWindow(detail, task.module_name || task.id);
-                              } catch (e) {
-                                alert(e?.message || '获取任务详情失败');
-                              }
-                            }}
-                          >
-                            查看
-                          </button>
-
-                          {(task.status === 'running' || task.status === 'queued') && (
+                      <tr key={task.id}>
+                        <td style={tdStyle}>{task.id}</td>
+                        <td style={tdStyle}>{task.module_name}</td>
+                        <td style={tdStyle}>{task.kind}</td>
+                        <td style={tdStyle}>{statusBadge(task.status)}</td>
+                        <td style={tdStyle}>{task.started_at || '-'}</td>
+                        <td style={tdStyle}>{task.ended_at || '-'}</td>
+                        <td style={tdStyle}>
+                          <div style={{display: 'flex', gap: 8, flexWrap: 'wrap'}}>
                             <button
-                              style={styles.redBtn}
-                              onClick={async () => {
-                                try {
-                                  await cancelTask(task.id);
-                                  await refreshTasks();
-                                } catch (e) {
-                                  alert(e?.message || '关闭失败');
-                                }
-                              }}
+                                style={styles.whiteBtn}
+                                onClick={async () => {
+                                  try {
+                                    const detail = await getTask(task.id);
+                                    addTaskWindow(detail, task.module_name || task.id);
+                                  } catch (e) {
+                                    alert(e?.message || '获取任务详情失败');
+                                  }
+                                }}
                             >
-                              关闭
+                              查看
                             </button>
-                          )}
 
-                          <button style={styles.redBtn} onClick={() => handleDeleteTask(task.id)}>
-                            删除
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
+                            {(task.status === 'running' || task.status === 'queued') && (
+                                <button
+                                    style={styles.redBtn}
+                                    onClick={async () => {
+                                      try {
+                                        await cancelTask(task.id);
+                                        await refreshTasks();
+                                      } catch (e) {
+                                        alert(e?.message || '关闭失败');
+                                      }
+                                    }}
+                                >
+                                  关闭
+                                </button>
+                            )}
+
+                            <button style={styles.redBtn} onClick={() => handleDeleteTask(task.id)}>
+                              删除
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
                   ))}
                   {tasks.length === 0 && (
-                    <tr>
-                      <td colSpan={7} style={{ padding: 30, textAlign: 'center', color: '#6c8098' }}>
-                        暂无任务
-                      </td>
-                    </tr>
+                      <tr>
+                        <td colSpan={7} style={{padding: 30, textAlign: 'center', color: '#6c8098'}}>
+                          暂无任务
+                        </td>
+                      </tr>
                   )}
-                </tbody>
-              </table>
-            </div>
-          </section>
+                  </tbody>
+                </table>
+              </div>
+            </section>
         )}
       </div>
 
