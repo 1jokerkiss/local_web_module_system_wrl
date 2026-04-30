@@ -2,7 +2,6 @@
   {
     "id": "cloud_type",
     "name": "云类型反演",
-    "category": "cloud",
     "description": "基于葵花8的云类型反演模块（CM_CTH.exe）",
     "executable": "backend/installed_modules/cth/CM_CTH.exe",
     "working_dir": "backend/installed_modules/cth",
@@ -38,37 +37,25 @@
       "云类型",
       "h8"
     ],
-    "enabled": true,
     "tool_type": "cloud",
-    "parallel_mode": "auto",
+    "parallel_mode": "folder_chunks",
     "parallel_input_key": "",
     "parallel_output_key": "",
     "parallel_file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
-    "parallel_output_suffix": ".tif"
+    "parallel_output_suffix": ".tif",
+    "enabled": true
   },
   {
     "id": "h8aod",
     "name": "H8 AOD 反演",
     "description": "H8 AOD 本地原生模块。用户按目录输入 B01、B03、B06、SOLAR，系统后端自动按文件名时次匹配并拆分为多个单文件 job，再按并发进程数调用 AOD_AHI.exe 执行。",
-    "runtime": "native",
-    "entry": "AOD_AHI.exe",
     "executable": "D:\\local_web_module_system_wrl\\backend\\installed_modules\\h8aod\\AOD_AHI.exe",
     "working_dir": "D:\\local_web_module_system_wrl\\backend\\installed_modules\\h8aod",
     "config_mode": "json_file",
-    "dependency_dirs": [
-      "deps"
-    ],
     "command_template": [
       "{executable}",
       "{config_path}"
     ],
-    "tags": [
-      "h8",
-      "aod",
-      "remote-sensing",
-      "batch"
-    ],
-    "enabled": true,
     "inputs": [
       {
         "key": "B01_file",
@@ -213,11 +200,18 @@
         "control_only": true
       }
     ],
+    "tags": [
+      "h8",
+      "aod",
+      "remote-sensing",
+      "batch"
+    ],
     "tool_type": "aerosol",
-    "parallel_mode": "auto",
+    "parallel_mode": "single_file",
     "parallel_input_key": "",
     "parallel_output_key": "",
     "parallel_file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
-    "parallel_output_suffix": ".tif"
+    "parallel_output_suffix": ".tif",
+    "enabled": true
   }
 ]

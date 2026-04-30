@@ -141,6 +141,20 @@ export async function addToolbar(payload) {
   });
 }
 
+export async function updateToolbar(toolbarKey, payload) {
+  return request(`/api/admin/toolbars/${encodeURIComponent(toolbarKey)}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteToolbar(toolbarKey) {
+  // 使用 POST 删除，兼容部分本地服务/代理环境对 DELETE 方法的限制。
+  return request(`/api/admin/toolbars/${encodeURIComponent(toolbarKey)}/delete`, {
+    method: 'POST',
+  });
+}
+
 export async function saveModule(payload) {
   return request('/api/admin/modules', {
     method: 'POST',

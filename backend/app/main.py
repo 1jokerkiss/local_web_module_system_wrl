@@ -114,6 +114,13 @@ class ResetUserPasswordRequest(BaseModel):
 class ToolBarSaveRequest(BaseModel):
     key: str = ""
     label: str
+
+
+class ToolBarUpdateRequest(BaseModel):
+    key: str = ""
+    label: str
+
+
 class ModuleRunRequest(BaseModel):
     module_id: str
     inputs: Dict[str, Any] = {}
@@ -141,9 +148,11 @@ class InstallLocalDropRequest(BaseModel):
     tool_type: str = "cloud"
     filename: str = ""
 # 通用辅助函数
+# 初始默认工具栏。现在云反演 / 气溶胶反演也按普通动态工具栏处理，
+# 只在第一次创建 toolbars.json 时写入；之后不会强制重新合并回来。
 DEFAULT_TOOLBARS = [
-    {"key": "cloud", "label": "云反演", "system": True},
-    {"key": "aerosol", "label": "气溶胶反演", "system": True},
+    {"key": "cloud", "label": "云反演", "system": False},
+    {"key": "aerosol", "label": "气溶胶反演", "system": False},
 ]
 
 
@@ -177,12 +186,16 @@ def load_toolbars() -> List[dict]:
     try:
         raw = json.loads(TOOLBARS_FILE.read_text(encoding="utf-8"))
         if not isinstance(raw, list):
-            raw = []
+            raw = list(DEFAULT_TOOLBARS)
     except Exception:
-        raw = []
+        raw = list(DEFAULT_TOOLBARS)
 
+    # 不再把 DEFAULT_TOOLBARS 每次强制合并进来。
+    # 这样 cloud / aerosol 删除后不会自动复活，真正变成动态工具栏。
     merged: Dict[str, dict] = {}
-    for item in DEFAULT_TOOLBARS + raw:
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
         key = normalize_tool_key(str(item.get("key", "")))
         label = str(item.get("label") or key).strip()
         if not key or not label:
@@ -190,20 +203,31 @@ def load_toolbars() -> List[dict]:
         merged[key] = {
             "key": key,
             "label": label,
-            "system": bool(item.get("system", key in {"cloud", "aerosol"})),
+            "system": False,
         }
 
     result = list(merged.values())
     result.sort(key=lambda x: (0 if x.get("key") in {"cloud", "aerosol"} else 1, x.get("label", "")))
     return result
 
-
 def save_toolbars(toolbars: List[dict]):
+    cleaned: List[dict] = []
+    seen = set()
+    for item in toolbars:
+        if not isinstance(item, dict):
+            continue
+        key = normalize_tool_key(str(item.get("key", "")))
+        label = str(item.get("label") or key).strip()
+        if not key or not label or key in seen:
+            continue
+        seen.add(key)
+        # 所有工具栏都按动态工具栏保存，不再写 system=True。
+        cleaned.append({"key": key, "label": label, "system": False})
+
     TOOLBARS_FILE.write_text(
-        json.dumps(toolbars, ensure_ascii=False, indent=2),
+        json.dumps(cleaned, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-
 
 def add_toolbar(key: str, label: str) -> dict:
     label = (label or "").strip()
@@ -220,6 +244,111 @@ def add_toolbar(key: str, label: str) -> dict:
     save_toolbars(toolbars)
     return item
 
+
+def update_toolbar(old_key: str, new_key: str, label: str) -> dict:
+    old_key = normalize_tool_key(old_key)
+    if not old_key:
+        raise ValueError("工具类型标识不能为空")
+
+    label = (label or "").strip()
+    if not label:
+        raise ValueError("工具类型名称不能为空")
+
+    toolbars = load_toolbars()
+    found = None
+    for item in toolbars:
+        if item.get("key") == old_key:
+            found = item
+            break
+
+    # 有些历史模块可能只有 tool_type，没有在 toolbars.json 中登记；
+    # 编辑时也允许把这个虚拟工具栏补登记后更新。
+    if not found:
+        modules = load_modules()
+        if any(module.get("tool_type") == old_key for module in modules):
+            found = {"key": old_key, "label": old_key, "system": False}
+            toolbars.append(found)
+        else:
+            raise ValueError("工具栏不存在")
+
+    candidate_key = normalize_tool_key(new_key) or old_key
+
+    if candidate_key != old_key and any(t.get("key") == candidate_key for t in toolbars):
+        raise ValueError("新的工具类型标识已存在")
+
+    updated = {
+        "key": candidate_key,
+        "label": label,
+        "system": False,
+    }
+
+    new_toolbars = []
+    replaced = False
+    for item in toolbars:
+        if item.get("key") == old_key and not replaced:
+            new_toolbars.append(updated)
+            replaced = True
+        elif item.get("key") != old_key:
+            new_toolbars.append(item)
+
+    if not replaced:
+        new_toolbars.append(updated)
+
+    save_toolbars(new_toolbars)
+
+    # 修改 key 时，同步迁移该工具栏下模块的 tool_type。
+    if candidate_key != old_key:
+        modules = load_modules()
+        changed = False
+        for module in modules:
+            if module.get("tool_type") == old_key:
+                module["tool_type"] = candidate_key
+                changed = True
+        if changed:
+            save_modules(modules)
+
+    return updated
+
+def delete_toolbar(key: str) -> dict:
+    key = normalize_tool_key(key)
+    if not key:
+        raise ValueError("工具类型标识不能为空")
+
+    toolbars = load_toolbars()
+    exists_in_toolbar_file = any(item.get("key") == key for item in toolbars)
+
+    modules = load_modules()
+    affected_modules = [module for module in modules if module.get("tool_type") == key]
+
+    if not exists_in_toolbar_file and not affected_modules:
+        raise ValueError("工具栏不存在")
+
+    remaining_toolbars = [item for item in toolbars if item.get("key") != key]
+
+    moved_count = 0
+    target_tool_type = ""
+    if affected_modules:
+        # 删除有模块的工具栏时，不删除模块；自动移动到其它工具栏。
+        # 如果没有其它工具栏，则自动创建“未分类”。
+        if remaining_toolbars:
+            target_tool_type = remaining_toolbars[0].get("key") or "uncategorized"
+        else:
+            target_tool_type = "uncategorized"
+            remaining_toolbars.append({"key": target_tool_type, "label": "未分类", "system": False})
+
+        for module in modules:
+            if module.get("tool_type") == key:
+                module["tool_type"] = target_tool_type
+                moved_count += 1
+
+        save_modules(modules)
+
+    save_toolbars(remaining_toolbars)
+    return {
+        "deleted_key": key,
+        "moved_count": moved_count,
+        "target_tool_type": target_tool_type,
+    }
 
 def ensure_toolbar_exists(key: str, label: str | None = None):
     key = normalize_tool_key(key) or "cloud"
@@ -731,6 +860,41 @@ def api_add_toolbar(payload: ToolBarSaveRequest, authorization: str | None = Hea
     try:
         item = add_toolbar(payload.key, payload.label)
         return {"ok": True, "toolbar": item}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/api/admin/toolbars/{toolbar_key}")
+def api_update_toolbar(
+    toolbar_key: str,
+    payload: ToolBarUpdateRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        item = update_toolbar(toolbar_key, payload.key, payload.label)
+        return {"ok": True, "toolbar": item}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/admin/toolbars/{toolbar_key}")
+def api_delete_toolbar(toolbar_key: str, authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    try:
+        result = delete_toolbar(toolbar_key)
+        return {"ok": True, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# 有些本地打包/代理环境对 DELETE 支持不好，前端删除工具栏统一走这个 POST 接口。
+@app.post("/api/admin/toolbars/{toolbar_key}/delete")
+def api_delete_toolbar_post(toolbar_key: str, authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    try:
+        result = delete_toolbar(toolbar_key)
+        return {"ok": True, **result}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

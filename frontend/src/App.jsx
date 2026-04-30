@@ -16,6 +16,8 @@ import {
   getAdminModules,
   getToolbars,
   addToolbar,
+  updateToolbar,
+  deleteToolbar,
   getTasks,
   runModule,
   saveModule,
@@ -48,7 +50,7 @@ const emptyModuleForm = {
   command_template_text: '["{executable}"]',
   inputs_text: '[]',
   tags_text: '',
-  tool_type: 'cloud',
+  tool_type: '',
   parallel_mode: 'auto',
   parallel_input_key: '',
   parallel_output_key: '',
@@ -150,10 +152,9 @@ function normalize(v) {
   return String(v || '').toLowerCase();
 }
 
-const DEFAULT_TOOLBARS = [
-  { key: 'cloud', label: '云反演', system: true },
-  { key: 'aerosol', label: '气溶胶反演', system: true },
-];
+// 默认工具栏由后端首次初始化 toolbars.json 时提供。
+// 前端不再强制追加 cloud/aerosol，避免删除后又在页面上复活。
+const DEFAULT_TOOLBARS = [];
 
 function normalizeToolKey(v) {
   return String(v || '')
@@ -183,7 +184,6 @@ function getModuleToolType(module) {
 
 function uniqToolbars(toolbars, modules) {
   const map = new Map();
-  DEFAULT_TOOLBARS.forEach((t) => map.set(t.key, t));
   (toolbars || []).forEach((t) => {
     const key = normalizeToolKey(t.key || t.label);
     if (key) map.set(key, { key, label: t.label || key, system: !!t.system });
@@ -1016,10 +1016,12 @@ export default function App() {
   const [moduleForm, setModuleForm] = useState(emptyModuleForm);
   const [editingModuleId, setEditingModuleId] = useState('');
   const [zipFile, setZipFile] = useState(null);
-  const [uploadToolType, setUploadToolType] = useState('cloud');
+  const [uploadToolType, setUploadToolType] = useState('');
   const [dropInfo, setDropInfo] = useState({ drop_dir: '', items: [] });
   const [uploadMsg, setUploadMsg] = useState('');
   const [newToolbarForm, setNewToolbarForm] = useState({ key: '', label: '' });
+  const [editingToolbarKey, setEditingToolbarKey] = useState('');
+  const [toolbarEditForm, setToolbarEditForm] = useState({ key: '', label: '' });
   const [newUserForm, setNewUserForm] = useState({
     username: '',
     password: '',
@@ -1127,6 +1129,30 @@ useEffect(() => {
     return next;
   });
 }, [visibleToolbars, modulesByTool]);
+
+useEffect(() => {
+  if (!currentUser) return;
+
+  const hasTool = (key) => visibleToolbars.some((tb) => tb.key === key);
+  const firstKey = visibleToolbars[0]?.key || '';
+
+  if (activeTab.startsWith('tool:')) {
+    const key = activeTab.slice('tool:'.length);
+    if (!hasTool(key)) {
+      setActiveTab(firstKey ? `tool:${firstKey}` : isAdmin ? 'module_mgmt' : 'tasks');
+    }
+  }
+
+  if (!uploadToolType || !hasTool(uploadToolType)) {
+    setUploadToolType(firstKey);
+  }
+
+  setModuleForm((prev) => {
+    if (prev.tool_type && hasTool(prev.tool_type)) return prev;
+    if (!firstKey) return prev;
+    return { ...prev, tool_type: firstKey };
+  });
+}, [currentUser, visibleToolbars, activeTab, uploadToolType, isAdmin]);
   useEffect(() => {
     if (!currentUser) {
       if (pollTimerRef.current) {
@@ -1296,7 +1322,9 @@ async function handleRegister() {
 
   async function refreshToolbars() {
     const list = await getToolbars();
-    setToolbars(Array.isArray(list) ? list : DEFAULT_TOOLBARS);
+    const next = Array.isArray(list) ? list : DEFAULT_TOOLBARS;
+    setToolbars(next);
+    return next;
   }
 
   async function refreshDropZipList() {
@@ -1503,7 +1531,7 @@ async function handleRegister() {
           .split(',')
           .map((x) => x.trim())
           .filter(Boolean),
-        tool_type: moduleForm.tool_type || 'cloud',
+        tool_type: moduleForm.tool_type || visibleToolbars[0]?.key || 'uncategorized',
         parallel_mode: moduleForm.parallel_mode || 'auto',
         parallel_input_key: moduleForm.parallel_input_key || '',
         parallel_output_key: moduleForm.parallel_output_key || '',
@@ -1525,6 +1553,10 @@ async function handleRegister() {
       setUploadMsg('未选择 zip 文件；如果已放入本地投放目录，请点“扫描本地目录安装”。');
       return;
     }
+    if (!uploadToolType) {
+      alert('请先添加或选择一个工具栏');
+      return;
+    }
     setUploadMsg('上传中...');
     try {
       await uploadModuleZip(zipFile, uploadToolType);
@@ -1537,6 +1569,10 @@ async function handleRegister() {
   }
 
   async function installFromDrop(filename = '') {
+    if (!uploadToolType) {
+      alert('请先添加或选择一个工具栏');
+      return;
+    }
     setUploadMsg('正在扫描本地投放目录...');
     try {
       const data = await installLocalDropModules(uploadToolType, filename);
@@ -1564,10 +1600,93 @@ async function handleRegister() {
         label,
       });
       setNewToolbarForm({ key: '', label: '' });
+      const createdKey = normalizeToolKey(newToolbarForm.key || label);
       await refreshToolbars();
+      if (!uploadToolType) setUploadToolType(createdKey);
       alert('工具栏已添加');
     } catch (e) {
       alert(e?.message || '添加工具栏失败');
+    }
+  }
+
+  function startEditToolbar(toolbar) {
+    setEditingToolbarKey(toolbar.key);
+    setToolbarEditForm({ key: toolbar.key, label: toolbar.label || toolbar.key });
+  }
+
+  function cancelEditToolbar() {
+    setEditingToolbarKey('');
+    setToolbarEditForm({ key: '', label: '' });
+  }
+
+  async function handleUpdateToolbar() {
+    try {
+      const label = toolbarEditForm.label.trim();
+      if (!editingToolbarKey || !label) {
+        alert('请输入工具类型名称');
+        return;
+      }
+      const data = await updateToolbar(editingToolbarKey, {
+        key: normalizeToolKey(toolbarEditForm.key || label),
+        label,
+      });
+      const updatedKey = data?.toolbar?.key || normalizeToolKey(toolbarEditForm.key || label);
+      if (activeTab === `tool:${editingToolbarKey}`) {
+        setActiveTab(`tool:${updatedKey}`);
+      }
+      if (uploadToolType === editingToolbarKey) {
+        setUploadToolType(updatedKey);
+      }
+      setActiveModuleByTool((prev) => {
+        if (updatedKey === editingToolbarKey || !prev[editingToolbarKey]) return prev;
+        const next = { ...prev, [updatedKey]: prev[editingToolbarKey] };
+        delete next[editingToolbarKey];
+        return next;
+      });
+      setExpandedToolTypes((prev) => {
+        if (updatedKey === editingToolbarKey) return prev;
+        const next = { ...prev, [updatedKey]: prev[editingToolbarKey] };
+        delete next[editingToolbarKey];
+        return next;
+      });
+      cancelEditToolbar();
+      await Promise.all([refreshToolbars(), refreshModules()]);
+      alert('工具栏已更新');
+    } catch (e) {
+      alert(e?.message || '更新工具栏失败');
+    }
+  }
+
+  async function handleDeleteToolbar(toolbar) {
+    try {
+      const list = modulesByTool[toolbar.key] || [];
+      const extra = list.length > 0
+        ? `\n该工具栏下有 ${list.length} 个模块，删除工具栏后这些模块会自动移动到其它工具栏；如果没有其它工具栏，会自动移动到“未分类”。`
+        : '';
+      if (!window.confirm(`确定删除工具栏「${toolbar.label || toolbar.key}」吗？${extra}`)) return;
+      const data = await deleteToolbar(toolbar.key);
+      const targetKey = data?.target_tool_type || '';
+      const latestToolbars = await refreshToolbars();
+      await refreshModules();
+
+      if (activeTab === `tool:${toolbar.key}`) {
+        const nextKey = targetKey || latestToolbars?.[0]?.key || '';
+        setActiveTab(nextKey ? `tool:${nextKey}` : 'module_mgmt');
+      }
+      if (uploadToolType === toolbar.key) {
+        const nextKey = targetKey || latestToolbars?.[0]?.key || '';
+        setUploadToolType(nextKey);
+      }
+      if (editingToolbarKey === toolbar.key) {
+        cancelEditToolbar();
+      }
+      if (data?.moved_count) {
+        alert(`工具栏已删除，${data.moved_count} 个模块已移动到其它工具栏`);
+      } else {
+        alert('工具栏已删除');
+      }
+    } catch (e) {
+      alert(e?.message || '删除工具栏失败');
     }
   }
 
@@ -1875,6 +1994,97 @@ async function handleRegister() {
     ));
   }
 
+  function renderToolbarAdminList() {
+    return (
+      <div
+        style={{
+          border: '1px solid #d7e3f0',
+          borderRadius: 12,
+          background: '#fff',
+          overflow: 'hidden',
+        }}
+      >
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: '1.3fr 1fr 70px 128px',
+            gap: 8,
+            padding: '10px 12px',
+            background: 'rgba(240,246,252,0.95)',
+            color: '#1a3c63',
+            fontWeight: 900,
+            fontSize: 13,
+          }}
+        >
+          <div>名称</div>
+          <div>标识</div>
+          <div>模块</div>
+          <div>操作</div>
+        </div>
+
+        {visibleToolbars.map((tb) => {
+          const list = modulesByTool[tb.key] || [];
+          const isEditing = editingToolbarKey === tb.key;
+
+          return (
+            <div
+              key={tb.key}
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '1.3fr 1fr 70px 128px',
+                gap: 8,
+                alignItems: 'center',
+                padding: '10px 12px',
+                borderTop: '1px solid #edf2f7',
+                fontSize: 13,
+              }}
+            >
+              {isEditing ? (
+                <>
+                  <input
+                    placeholder="工具类型名称"
+                    value={toolbarEditForm.label}
+                    onChange={(e) => setToolbarEditForm({ ...toolbarEditForm, label: e.target.value })}
+                    style={{ ...styles.input, minHeight: 36, fontSize: 13 }}
+                  />
+                  <input
+                    placeholder="工具类型标识"
+                    value={toolbarEditForm.key}
+                    onChange={(e) => setToolbarEditForm({ ...toolbarEditForm, key: e.target.value })}
+                    style={{ ...styles.input, minHeight: 36, fontSize: 13 }}
+                  />
+                  <div style={{ color: '#6a7f96' }}>{list.length}</div>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button style={{ ...styles.blueBtn, padding: '8px 10px', fontSize: 13 }} onClick={handleUpdateToolbar}>保存</button>
+                    <button style={{ ...styles.whiteBtn, padding: '8px 10px', fontSize: 13 }} onClick={cancelEditToolbar}>取消</button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontWeight: 800, color: '#12385f' }}>
+                    {tb.label}
+                  </div>
+                  <div style={{ color: '#6a7f96', wordBreak: 'break-all' }}>{tb.key}</div>
+                  <div style={{ color: '#6a7f96' }}>{list.length}</div>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button style={{ ...styles.whiteBtn, padding: '8px 10px', fontSize: 13 }} onClick={() => startEditToolbar(tb)}>编辑</button>
+                    <button
+                      style={{ ...styles.redBtn, padding: '8px 10px', fontSize: 13 }}
+                      title={list.length > 0 ? '删除工具栏后模块会自动移动到其它工具栏' : ''}
+                      onClick={() => handleDeleteToolbar(tb)}
+                    >
+                      删除
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
   function renderInstalledModulesTree() {
     return (
       <div style={{ display: 'grid', gap: 10, marginTop: 12, maxHeight: 'calc(100vh - 520px)', overflow: 'auto' }}>
@@ -2046,25 +2256,6 @@ async function handleRegister() {
             <div style={{ display: 'grid', gridTemplateColumns: '380px 1fr', gap: 16 }}>
               <div style={{ ...styles.card, padding: 16 }}>
                 <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
-                  添加工具栏
-                </div>
-                <div style={{ display: 'grid', gap: 10, marginBottom: 18 }}>
-                  <input
-                    placeholder="工具类型名称，例如：地表温度反演"
-                    value={newToolbarForm.label}
-                    onChange={(e) => setNewToolbarForm({ ...newToolbarForm, label: e.target.value })}
-                    style={styles.input}
-                  />
-                  <input
-                    placeholder="工具类型标识，可选，例如：lst"
-                    value={newToolbarForm.key}
-                    onChange={(e) => setNewToolbarForm({ ...newToolbarForm, key: e.target.value })}
-                    style={styles.input}
-                  />
-                  <button style={styles.blueBtn} onClick={handleAddToolbar}>添加工具栏</button>
-                </div>
-
-                <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
                   模块上传 / 本地投放
                 </div>
 
@@ -2114,6 +2305,26 @@ async function handleRegister() {
                   已安装模块
                 </div>
                 {renderInstalledModulesTree()}
+
+                <div style={{ marginTop: 20, fontSize: 18, fontWeight: 900, color: '#12385f', marginBottom: 10 }}>
+                  工具栏列表
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8, marginBottom: 10 }}>
+                  <input
+                    placeholder="新增工具栏名称"
+                    value={newToolbarForm.label}
+                    onChange={(e) => setNewToolbarForm({ ...newToolbarForm, label: e.target.value })}
+                    style={{ ...styles.input, minHeight: 38, fontSize: 13 }}
+                  />
+                  <input
+                    placeholder="标识，可选"
+                    value={newToolbarForm.key}
+                    onChange={(e) => setNewToolbarForm({ ...newToolbarForm, key: e.target.value })}
+                    style={{ ...styles.input, minHeight: 38, fontSize: 13 }}
+                  />
+                  <button style={{ ...styles.blueBtn, padding: '8px 12px', fontSize: 13 }} onClick={handleAddToolbar}>添加</button>
+                </div>
+                {renderToolbarAdminList()}
               </div>
 
               <div style={{ ...styles.card, padding: 16 }}>
