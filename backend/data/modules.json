@@ -113,7 +113,7 @@
         "admin_fixed": false,
         "path_mode": "absolute",
         "batch_role": "SOLAR",
-        "match_mode": "timeslot"
+        "match_mode": "first"
       },
       {
         "key": "GEO1_file",
@@ -209,14 +209,14 @@
       "batch"
     ],
     "tool_type": "aerosol",
-    "enabled": true,
     "parallel": {
       "mode": "single_file",
       "input_key": "",
       "output_key": "",
       "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
       "output_suffix": ".tif"
-    }
+    },
+    "enabled": true
   },
   {
     "id": "CTH_FY",

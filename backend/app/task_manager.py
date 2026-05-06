@@ -4,6 +4,7 @@ import subprocess
 import threading
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -77,6 +78,7 @@ class TaskManager:
         inputs: Dict[str, Any],
         kind: str = "module",
         extra: Dict[str, Any] | None = None,
+        auto_save: bool = True,
     ) -> Dict[str, Any]:
         task_id = uuid.uuid4().hex[:12]
         task = {
@@ -101,7 +103,8 @@ class TaskManager:
         with self.lock:
             self.tasks[task_id] = task
 
-        self._save_tasks()
+        if auto_save:
+            self._save_tasks()
         return task
 
     def append_log(self, task_id: str, text: str):
@@ -175,6 +178,146 @@ class TaskManager:
         )
         thread.start()
         return parent
+
+    def submit_batch_group(
+        self,
+        module_id: str,
+        module_name: str,
+        jobs: List[Dict[str, Any]],
+        max_parallel: int,
+    ) -> Dict[str, Any]:
+        """Submit a batch parent task using the old tested ThreadPoolExecutor process-pool style.
+
+        Each job becomes one child task. max_parallel controls how many child jobs are
+        executed at the same time. Closing a task window in the UI does not stop the
+        background job; cancel_task is still available to terminate running processes.
+        """
+        max_parallel = max(1, int(max_parallel or 1))
+        parent = self.create_task(
+            module_id=module_id,
+            module_name=f"{module_name} 批处理",
+            command=[],
+            inputs={"job_count": len(jobs), "parallel_workers": max_parallel},
+            kind="batch_parent",
+            extra={
+                "parallel_total": len(jobs),
+                "parallel_done": 0,
+                "parallel_failed": 0,
+                "max_workers": max_parallel,
+            },
+        )
+
+        child_ids: list[str] = []
+        child_job_map: dict[str, Dict[str, Any]] = {}
+
+        for idx, job in enumerate(jobs, start=1):
+            child = self.create_task(
+                module_id=module_id,
+                module_name=f"{module_name} [{idx}/{len(jobs)}]",
+                command=job["command"],
+                inputs=job["inputs"],
+                kind="module",
+                extra={"parent_id": parent["id"], "job_index": idx},
+                auto_save=False,
+            )
+            child_ids.append(child["id"])
+            child_job_map[child["id"]] = job
+
+        with self.lock:
+            self.tasks[parent["id"]]["children"] = child_ids
+            self.tasks[parent["id"]]["status"] = "queued"
+        self._save_tasks()
+
+        thread = threading.Thread(
+            target=self._run_batch_group,
+            args=(parent["id"], child_job_map, max_parallel),
+            daemon=True,
+        )
+        thread.start()
+        return self.get_task(parent["id"]) or parent
+
+    def _run_batch_group(
+        self,
+        parent_id: str,
+        child_job_map: Dict[str, Dict[str, Any]],
+        max_parallel: int,
+    ):
+        total = len(child_job_map)
+        self.update_task(
+            parent_id,
+            status="running",
+            started_at=now_iso(),
+            parallel_total=total,
+            parallel_done=0,
+            parallel_failed=0,
+        )
+        self.append_log(parent_id, f"[INFO] 批处理开始，共 {total} 个子任务")
+        self.append_log(parent_id, f"[INFO] 最大并发数 = {max_parallel}")
+
+        progress_lock = threading.Lock()
+        progress = {"done": 0, "failed": 0}
+
+        def _worker(child_id: str, job: Dict[str, Any]):
+            if parent_id in self.cancel_flags:
+                self.update_task(child_id, status="cancelled", ended_at=now_iso())
+                return child_id
+            self._run_process_task(
+                child_id,
+                job["command"],
+                job.get("working_dir"),
+                job.get("env"),
+            )
+            return child_id
+
+        failures = 0
+        with ThreadPoolExecutor(max_workers=max(1, int(max_parallel or 1))) as executor:
+            futures = {
+                executor.submit(_worker, child_id, job): child_id
+                for child_id, job in child_job_map.items()
+            }
+            for future in as_completed(futures):
+                child_id = futures[future]
+                try:
+                    future.result()
+                    task = self.get_task(child_id) or {}
+                    status = task.get("status")
+                    return_code = task.get("return_code")
+                    if status != "success":
+                        failures += 1
+                    self.append_log(
+                        parent_id,
+                        f"[INFO] 子任务完成: {child_id}, 状态={status}, return_code={return_code}",
+                    )
+                except Exception as e:
+                    failures += 1
+                    self.append_log(parent_id, f"[ERROR] 子任务异常: {child_id} -> {repr(e)}")
+
+                with progress_lock:
+                    progress["done"] += 1
+                    progress["failed"] = failures
+                    self.update_task(
+                        parent_id,
+                        parallel_done=progress["done"],
+                        parallel_failed=progress["failed"],
+                    )
+
+        if parent_id in self.cancel_flags:
+            final_status = "cancelled"
+            return_code = -1
+        else:
+            final_status = "success" if failures == 0 else "failed"
+            return_code = 0 if failures == 0 else 1
+
+        self.update_task(
+            parent_id,
+            status=final_status,
+            ended_at=now_iso(),
+            return_code=return_code,
+            parallel_done=total,
+            parallel_failed=failures,
+        )
+        self.append_log(parent_id, f"[INFO] 批处理结束，失败数={failures}")
+        self.cancel_flags.discard(parent_id)
 
     def _stream_reader(self, pipe, task_id: str, prefix: str):
         try:
@@ -455,7 +598,7 @@ class TaskManager:
             return False
 
         # 并行父任务：标记取消，并尽量停止已经启动的所有子进程。
-        if task.get("kind") == "parallel":
+        if task.get("kind") in {"parallel", "batch_parent"}:
             self.cancel_flags.add(task_id)
             any_stopped = False
             for child_id in task.get("children") or []:
@@ -510,7 +653,7 @@ class TaskManager:
 
         # 删除并行父任务时，同步删除子任务。
         ids_to_delete = [task_id]
-        if task.get("kind") == "parallel":
+        if task.get("kind") in {"parallel", "batch_parent"}:
             ids_to_delete.extend(task.get("children") or [])
 
         for tid in ids_to_delete:
