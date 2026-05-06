@@ -1858,23 +1858,42 @@ async function handleRegister() {
         console.error('加载用户文件失败', e);
       }
     }
+    function isAllowedUploadFile(file) {
+      const name = String(file?.name || '').toLowerCase();
 
-    async function handleUploadManagedFile(e) {
-      const file = e.target.files?.[0];
-      if (!file) return;
-
-      try {
-        setUploadingFile(true);
-        await uploadUserFile(file);
-        await loadUserFiles();
-        alert('文件上传成功');
-      } catch (err) {
-        alert(err?.message || '文件上传失败');
-      } finally {
-        setUploadingFile(false);
-        e.target.value = '';
-      }
+      return (
+        name.endsWith('.tif') ||
+        name.endsWith('.tiff') ||
+        name.endsWith('.nc') ||
+        name.endsWith('.nc4') ||
+        name.endsWith('.cdf') ||
+        name.endsWith('.hdf') ||
+        name.endsWith('.h5')
+      );
     }
+
+async function handleUploadManagedFile(e) {
+  const file = e.target.files?.[0];
+  if (!file) return;
+
+  if (!isAllowedUploadFile(file)) {
+    alert('文件格式不支持！仅支持上传 tif、tiff、nc、nc4、cdf、hdf、h5 格式文件。');
+    e.target.value = '';
+    return;
+  }
+
+  try {
+    setUploadingFile(true);
+    await uploadUserFile(file);
+    await loadUserFiles();
+    alert('文件上传成功');
+  } catch (err) {
+    alert(err?.message || '文件上传失败');
+  } finally {
+    setUploadingFile(false);
+    e.target.value = '';
+  }
+}
 
     async function handleDeleteManagedFile(filename) {
       if (!window.confirm(`确认删除文件：${filename}？`)) return;
@@ -2082,7 +2101,13 @@ async function handleRegister() {
     return (
       <div style={{ ...styles.card, padding: 14, minHeight: '100%', minWidth: 0, maxWidth: '100%', overflow: 'hidden', background: '#ffffff' }}>
         <div style={{ fontSize: 22, fontWeight: 900, color: '#0b2d51', marginBottom: 12 }}>文件管理</div>
-        <input ref={fileInputRef} type="file" style={{ display: 'none' }} onChange={handleUploadManagedFile} />
+        <input
+            ref={fileInputRef}
+            type="file"
+            accept=".tif,.tiff,.nc,.nc4,.cdf,.hdf,.h5"
+            style={{ display: 'none' }}
+            onChange={handleUploadManagedFile}
+          />
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 12, padding: 8, border: '1px solid #d8e3ef', borderRadius: 12, background: '#ffffff' }}>
           <button style={{ ...styles.blueBtn, height: 36, borderRadius: 8, padding: '0 8px', fontSize: 13 }} onClick={() => fileInputRef.current?.click()} disabled={uploadingFile}>{uploadingFile ? '上传中...' : '上传文件'}</button>
