@@ -2108,7 +2108,6 @@ async function handleUploadManagedFile(e) {
             style={{ display: 'none' }}
             onChange={handleUploadManagedFile}
           />
-
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 12, padding: 8, border: '1px solid #d8e3ef', borderRadius: 12, background: '#ffffff' }}>
           <button style={{ ...styles.blueBtn, height: 36, borderRadius: 8, padding: '0 8px', fontSize: 13 }} onClick={() => fileInputRef.current?.click()} disabled={uploadingFile}>{uploadingFile ? '上传中...' : '上传文件'}</button>
           <button style={{ ...styles.whiteBtn, height: 36, borderRadius: 8, padding: '0 8px', fontSize: 13 }} onClick={loadUserFiles}>刷新列表</button>
