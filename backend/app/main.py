@@ -1,7 +1,6 @@
 from __future__ import annotations
-
+import shutil
 import base64
-import io
 import json
 import os
 import subprocess
@@ -40,9 +39,6 @@ from .task_manager import TaskManager
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-UPLOADS_DIR = BASE_DIR / "uploads"
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-
 MODULES_FILE = DATA_DIR / "modules.json"
 TASKS_FILE = DATA_DIR / "tasks.json"
 TOOLBARS_FILE = DATA_DIR / "toolbars.json"
@@ -694,309 +690,12 @@ def _render_tif_with_gdal_cli(tif_path: Path, meta: dict[str, Any] | None = None
         meta["preview_engine"] = "gdal_translate_cli"
         meta["gdal_command"] = " ".join(cmd)
         return {"png": out_png.read_bytes(), "meta": meta}
-
-
-def render_tif_to_preview_result(tif_path: Path) -> dict:
-    """把 tif/tiff 渲染成浏览器可显示的 PNG，同时返回拉伸统计信息。"""
-    if not tif_path.exists() or not tif_path.is_file():
-        raise HTTPException(status_code=404, detail="文件不存在")
-    if not is_tif_path(tif_path):
-        raise HTTPException(status_code=400, detail="只支持预览 tif/tiff 文件")
-
-    try:
-        import numpy as np
-        from PIL import Image
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"缺少图片预览依赖 Pillow/numpy: {exc}")
-
-    max_size = 1600
-    meta: dict[str, Any] = {"name": tif_path.name, "size": tif_path.stat().st_size, "suffix": tif_path.suffix.lower()}
-
-    try:
-        from osgeo import gdal
-
-        ds = gdal.Open(str(tif_path))
-        if ds is None:
-            raise RuntimeError("GDAL 无法打开该 tif")
-
-        width = int(ds.RasterXSize)
-        height = int(ds.RasterYSize)
-        scale = min(1.0, max_size / max(width, height)) if max(width, height) else 1.0
-        out_w = max(1, int(width * scale))
-        out_h = max(1, int(height * scale))
-
-        meta.update({"width": width, "height": height, "bands": int(ds.RasterCount or 1), "preview_width": out_w, "preview_height": out_h, "preview_engine": "python_osgeo_gdal"})
-
-        band_count = int(ds.RasterCount or 1)
-        if band_count >= 3:
-            bands = []
-            band_stats = []
-            for band_index in (1, 2, 3):
-                band = ds.GetRasterBand(band_index)
-                nodata = band.GetNoDataValue()
-                arr = band.ReadAsArray(buf_xsize=out_w, buf_ysize=out_h)
-                band_stats.append({"band": band_index, **_array_preview_stats(arr, nodata=nodata)})
-                bands.append(_normalize_to_uint8(arr, nodata=nodata, prefer_nonzero=True))
-            rgb = np.dstack(bands)
-            image = Image.fromarray(rgb, mode="RGB")
-            meta["band_stats"] = band_stats
-            meta["render_mode"] = "rgb_stretched"
-        else:
-            band = ds.GetRasterBand(1)
-            nodata = band.GetNoDataValue()
-            arr = band.ReadAsArray(buf_xsize=out_w, buf_ysize=out_h)
-            gray = _normalize_to_uint8(arr, nodata=nodata, prefer_nonzero=True)
-            image = _colorize_gray(gray)
-            meta.update(_array_preview_stats(arr, nodata=nodata))
-            meta["render_mode"] = "single_band_contrast_colorized"
-    except HTTPException:
-        raise
-    except Exception as gdal_exc:
-        # 关键修复：Python 没有 osgeo，或 osgeo/GDAL 打不开时，不再直接依赖 Pillow。
-        # 优先调用系统 gdal_translate；你的电脑上 gdalinfo 能打开 AnnualCrop_1.tif，
-        # 因此这个分支可以处理 Pillow 无法识别的多波段 GeoTIFF。
-        try:
-            cli_meta = dict(meta)
-            cli_meta["python_gdal_error"] = str(gdal_exc)
-            return _render_tif_with_gdal_cli(tif_path, cli_meta)
-        except HTTPException:
-            raise
-        except Exception as cli_exc:
-            try:
-                image = Image.open(tif_path)
-                image.thumbnail((max_size, max_size))
-                if image.mode not in {"L", "RGB", "RGBA"}:
-                    image = image.convert("RGB")
-                meta["render_mode"] = "pillow_fallback"
-                meta["preview_engine"] = "pillow"
-                meta["width"], meta["height"] = image.size
-                meta["python_gdal_error"] = str(gdal_exc)
-                meta["gdal_cli_error"] = str(cli_exc)
-            except Exception as pil_exc:
-                raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        "tif 预览失败：Python 后端没有可用的 osgeo/GDAL，"
-                        "系统 gdal_translate 调用也失败，Pillow 也无法识别该 GeoTIFF。"
-                        f" Python GDAL 错误: {gdal_exc}; GDAL CLI 错误: {cli_exc}; Pillow 错误: {pil_exc}"
-                    ),
-                )
-
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    return {"png": buf.getvalue(), "meta": meta}
-
-
-def render_tif_to_png_bytes(tif_path: Path) -> bytes:
-    return render_tif_to_preview_result(tif_path)["png"]
-
-
-def is_previewable_path(path: Path) -> bool:
-    return path.suffix.lower() in {".tif", ".tiff", ".nc", ".nc4", ".cdf", ".hdf", ".h5"}
-
-
 def _png_data_url(png_bytes: bytes) -> str:
     encoded = base64.b64encode(png_bytes).decode("ascii")
     return f"data:image/png;base64,{encoded}"
-
-
-def render_nc_to_preview(nc_path: Path) -> dict:
-    """把上传的 nc/hdf/h5 文件预览为图片；如果没有可绘制变量，就返回元数据。"""
-    if not nc_path.exists() or not nc_path.is_file():
-        raise HTTPException(status_code=404, detail="文件不存在")
-
-    try:
-        import numpy as np
-        from PIL import Image
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"缺少预览依赖 Pillow/numpy: {exc}")
-
-    meta: dict[str, Any] = {
-        "name": nc_path.name,
-        "size": nc_path.stat().st_size,
-        "suffix": nc_path.suffix.lower(),
-    }
-
-    try:
-        import xarray as xr
-
-        ds = xr.open_dataset(nc_path, mask_and_scale=True)
-        meta["dimensions"] = {str(k): int(v) for k, v in ds.sizes.items()}
-        meta["variables"] = [str(k) for k in ds.data_vars.keys()]
-        meta["coords"] = [str(k) for k in ds.coords.keys()]
-
-        selected_name = ""
-        selected = None
-        for name, da in ds.data_vars.items():
-            try:
-                if da.ndim >= 2 and np.issubdtype(da.dtype, np.number):
-                    selected_name = str(name)
-                    selected = da
-                    break
-            except Exception:
-                continue
-
-        if selected is None:
-            try:
-                ds.close()
-            except Exception:
-                pass
-            return {
-                "kind": "metadata",
-                "title": nc_path.name,
-                "message": "该文件没有找到可直接绘图的二维数值变量，下面显示文件结构。",
-                "meta": meta,
-            }
-
-        while selected.ndim > 2:
-            selected = selected.isel({selected.dims[0]: 0})
-
-        arr = np.asarray(selected.values)
-        arr = np.squeeze(arr)
-        if arr.ndim != 2:
-            try:
-                ds.close()
-            except Exception:
-                pass
-            return {
-                "kind": "metadata",
-                "title": nc_path.name,
-                "message": f"变量 {selected_name} 不能转为二维图像，下面显示文件结构。",
-                "meta": meta,
-            }
-
-        max_size = 1600
-        h, w = arr.shape
-        scale = min(1.0, max_size / max(h, w)) if max(h, w) else 1.0
-        gray = _normalize_to_uint8(arr, nodata=None, prefer_nonzero=True)
-        image = _colorize_gray(gray)
-        if scale < 1.0:
-            image = image.resize((max(1, int(w * scale)), max(1, int(h * scale))))
-
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        try:
-            ds.close()
-        except Exception:
-            pass
-
-        meta["preview_variable"] = selected_name
-        meta["preview_shape"] = list(arr.shape)
-        meta["render_mode"] = "nc_single_variable_contrast_colorized"
-        meta["preview_stats"] = _array_preview_stats(arr, nodata=None)
-        return {
-            "kind": "image",
-            "title": nc_path.name,
-            "image_data_url": _png_data_url(buf.getvalue()),
-            "meta": meta,
-            "message": f"已预览变量：{selected_name}（多维数据默认取第一个切片）。",
-        }
-    except Exception as exc:
-        return {
-            "kind": "metadata",
-            "title": nc_path.name,
-            "message": f"无法生成图像预览：{exc}",
-            "meta": meta,
-        }
-
-
-def build_uploaded_file_preview(target: Path) -> dict:
-    if not target.exists() or not target.is_file():
-        raise HTTPException(status_code=404, detail="文件不存在")
-    if not is_previewable_path(target):
-        raise HTTPException(status_code=400, detail="当前仅支持预览 tif/tiff/nc/nc4/cdf/hdf/h5 文件")
-
-    suffix = target.suffix.lower()
-    if suffix in {".tif", ".tiff"}:
-        result = render_tif_to_preview_result(target)
-        zero_ratio = result.get("meta", {}).get("zero_ratio")
-        extra = ""
-        if isinstance(zero_ratio, (int, float)) and zero_ratio >= 0.5:
-            extra = " 已自动排除大量 0 背景后做对比度拉伸。"
-        return {
-            "kind": "image",
-            "title": target.name,
-            "image_data_url": _png_data_url(result["png"]),
-            "meta": result.get("meta", {"name": target.name, "size": target.stat().st_size, "suffix": suffix}),
-            "message": "已将上传的 GeoTIFF 转为浏览器可显示的 PNG 预览。" + extra,
-        }
-
-    return render_nc_to_preview(target)
-
-def get_user_upload_dirs(username: str):
-    user_dir = UPLOADS_DIR / username
-    input_dir = user_dir / "输入文件夹"
-    output_dir = user_dir / "输出文件夹"
-
-    input_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    return user_dir, input_dir, output_dir
-@app.get("/api/files")
-def api_list_user_files(authorization: str | None = Header(default=None)):
-    user = get_current_user(authorization)
-    user_dir, input_dir, output_dir = get_user_upload_dirs(user.username)
-
-    items = []
-    for p in sorted(user_dir.rglob("*"), key=lambda x: x.stat().st_mtime, reverse=True):
-        stat = p.stat()
-        items.append({
-            "name": p.name,
-            "path": str(p.resolve()),
-            "relative_path": str(p.relative_to(user_dir)),
-            "size": stat.st_size if p.is_file() else 0,
-            "type": "file" if p.is_file() else "dir",
-            "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-        })
-
-    return items
-
-
-@app.post("/api/files/upload")
-def api_upload_user_file(
-    file: UploadFile = File(...),
-    authorization: str | None = Header(default=None),
-):
-    user = get_current_user(authorization)
-    user_dir, input_dir, output_dir = get_user_upload_dirs(user.username)
-
-    original_name = sanitize_filename(file.filename or "uploaded_file")
-
-    allowed_suffixes = {".tif", ".tiff", ".nc", ".nc4", ".cdf", ".hdf", ".h5"}
-    if Path(original_name).suffix.lower() not in allowed_suffixes:
-        raise HTTPException(
-            status_code=400,
-            detail="文件格式不支持，仅支持 tif、tiff、nc、nc4、cdf、hdf、h5 文件",
-        )
-
-    target = input_dir / original_name
-
-    # 如重名，自动追加编号
-    if target.exists():
-        stem = target.stem
-        suffix = target.suffix
-        idx = 1
-        while True:
-            candidate = input_dir / f"{stem}_{idx}{suffix}"
-            if not candidate.exists():
-                target = candidate
-                break
-            idx += 1
-
-    with target.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    return {
-        "ok": True,
-        "name": target.name,
-        "path": str(target.resolve()),
-        "relative_path": str(target.relative_to(user_dir)),
-        "size": target.stat().st_size,
-    }
-
 @app.post("/api/tasks/run")
 def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header(default=None)):
-    user = get_current_user(authorization)
+    get_current_user(authorization)
 
     module = get_module(payload.module_id)
     if not module:
@@ -1004,60 +703,55 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
     if not module.get("enabled", True):
         raise HTTPException(status_code=400, detail="模块已禁用")
 
+    # 直接使用前端传来的用户选择路径
     inputs = merge_admin_fixed_inputs(module, payload.inputs or {})
     parallel_workers = clamp_parallel_workers(payload.parallel_workers)
 
-    # 先检查必填参数；输出字段由后端自动生成，所以不要求用户填写
-    for field in module.get("inputs", []):
+    # 必填校验：输出目录也由用户选择，所以也参与校验
+    for field in module.get("inputs", []) or []:
         key = field.get("key")
         required = field.get("required", False)
 
-        if is_output_field(field):
+        if not key:
+            continue
+
+        if field.get("control_only") is True:
             continue
 
         if required and (key not in inputs or inputs.get(key) in ("", None)):
             raise HTTPException(status_code=400, detail=f"缺少必填参数: {key}")
 
-    # 整理用户输入/输出目录：
-    # 输入文件/文件夹复制到 uploads/用户名/输入文件夹
-    # 输出目录保留用户选择的原始目录，任务结束后同步到 uploads/用户名/输出文件夹/输出目录名
-    inputs, job_output_dir, output_syncs = normalize_task_io_paths(
-        module=module,
-        inputs=inputs,
-        username=user.username,
-    )
-    # control_only 字段只用于平台控制，不写入模块 config.json
+    # control_only 字段不写入 config.json
     for field in module.get("inputs", []) or []:
         if field.get("control_only") is True:
-            inputs.pop(field.get("key"), None)
+            key = field.get("key")
+            if key:
+                inputs.pop(key, None)
 
-    mode = str(normalize_parallel_config(module).get("mode") or "auto").strip() or "auto"
+    # 输出目录只负责创建，不改写用户选择的路径
+    for field in module.get("inputs", []) or []:
+        key = field.get("key")
+        if not key or not is_output_field(field):
+            continue
 
-    if parallel_workers > 1 and mode == "module_internal":
-        # 模块源码自己处理并行，平台只负责传参，不拆成多个进程。
+        value = str(inputs.get(key) or "").strip()
+        if not value:
+            continue
+
+        field_type = str(field.get("type", "")).lower()
+        p = Path(value)
+
+        if field_type == "dir_path":
+            p.mkdir(parents=True, exist_ok=True)
+        elif field_type == "file_path" and p.parent:
+            p.parent.mkdir(parents=True, exist_ok=True)
+
+    # 不再由平台拆分输入文件夹；
+    # 如果模块内部需要并行，把并行数传给模块，让模块自己处理。
+    if parallel_workers > 1:
         inputs = dict(inputs)
         inputs["parallel_workers"] = parallel_workers
         inputs["_parallel_workers"] = parallel_workers
-
-    jobs = prepare_parallel_jobs(module, inputs, parallel_workers)
-
-    if parallel_workers > 1 and len(jobs) > 1:
-        task = task_manager.submit_parallel_module_task(
-            module_id=module["id"],
-            module_name=module.get("name", module["id"]),
-            jobs=jobs,
-            inputs={
-                **inputs,
-                "parallel_workers": parallel_workers,
-                "_user_output_dir": str(job_output_dir.resolve()),
-            },
-            max_workers=parallel_workers,
-        )
-
-        if output_syncs:
-            start_output_sync_after_task(task["id"], output_syncs)
-
-        return task
 
     command, working_dir, runtime_env = build_runtime_for_module(module, inputs)
 
@@ -1070,54 +764,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
         env=runtime_env,
     )
 
-    if output_syncs:
-        start_output_sync_after_task(task["id"], output_syncs)
-
     return task
-@app.delete("/api/files/{filename}")
-def api_delete_user_file(filename: str, authorization: str | None = Header(default=None)):
-    user = get_current_user(authorization)
-    user_dir, input_dir, output_dir = get_user_upload_dirs(user.username)
-
-    safe_name = sanitize_filename(filename)
-
-    matches = [p for p in user_dir.rglob(safe_name) if p.is_file()]
-    if not matches:
-        raise HTTPException(status_code=404, detail="文件不存在")
-
-    target = matches[0]
-    target.unlink()
-
-    return {"ok": True}
-
-
-@app.get("/api/files/{filename}/download")
-def api_download_user_file(filename: str, authorization: str | None = Header(default=None)):
-    user = get_current_user(authorization)
-    user_dir, input_dir, output_dir = get_user_upload_dirs(user.username)
-
-    safe_name = sanitize_filename(filename)
-    matches = [p for p in user_dir.rglob(safe_name) if p.is_file()]
-
-    if not matches:
-        raise HTTPException(status_code=404, detail="文件不存在")
-
-    target = matches[0]
-    return FileResponse(str(target), filename=target.name)
-
-
-@app.get("/api/files/{filename}/preview")
-def api_preview_uploaded_file(filename: str, authorization: str | None = Header(default=None)):
-    user = get_current_user(authorization)
-    user_dir, input_dir, output_dir = get_user_upload_dirs(user.username)
-    safe_name = sanitize_filename(filename)
-    matches = [p for p in user_dir.rglob(safe_name) if p.is_file()]
-    if not matches:
-        raise HTTPException(status_code=404, detail="文件不存在")
-
-    target = matches[0]
-    return build_uploaded_file_preview(target)
-
 def upsert_module(module_data: dict):
     module_data = normalize_module_record(module_data)
     ensure_toolbar_exists(module_data.get("tool_type") or "cloud")
@@ -1966,11 +1613,6 @@ def api_delete_task(task_id: str, authorization: str | None = Header(default=Non
         raise HTTPException(status_code=404, detail="任务不存在")
     return {"ok": True}
 
-import shutil
-import uuid
-from pathlib import Path
-
-
 def is_output_field(field: dict) -> bool:
     key = str(field.get("key", "")).lower()
     label = str(field.get("label", "")).lower()
@@ -1987,234 +1629,6 @@ def is_output_field(field: dict) -> bool:
     ]
 
     return any(k in key or k in label for k in output_keywords)
-
-
-def is_input_path_field(field: dict) -> bool:
-    if is_output_field(field):
-        return False
-
-    field_type = str(field.get("type", "")).lower()
-    key = str(field.get("key", "")).lower()
-    label = str(field.get("label", "")).lower()
-
-    if field_type not in {"file_path", "dir_path"}:
-        return False
-
-    input_keywords = [
-        "input",
-        "file",
-        "path",
-        "dir",
-        "folder",
-        "输入",
-        "文件",
-        "目录",
-    ]
-
-    return any(k in key or k in label for k in input_keywords)
-
-def get_field_dir_name(field: dict) -> str:
-    label = str(field.get("label") or "").strip()
-    key = str(field.get("key") or "").strip()
-    return safe_dir_name(label or key or "输入")
-
-
-def copy_input_to_managed_field_dir(value: str, input_root_dir: Path, target_dir: Path) -> str:
-    """
-    输入文件/文件夹复制到：
-    uploads/用户名/输入文件夹/字段名/
-    """
-    if not value:
-        return value
-
-    src = Path(str(value))
-    if not src.exists():
-        return value
-
-    src_resolved = src.resolve()
-    input_root_resolved = input_root_dir.resolve()
-
-    try:
-        src_resolved.relative_to(input_root_resolved)
-        return str(src_resolved)
-    except ValueError:
-        pass
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    if src.is_file():
-        target = target_dir / src.name
-        if target.exists():
-            stem = target.stem
-            suffix = target.suffix
-            idx = 1
-            while True:
-                candidate = target_dir / f"{stem}_{idx}{suffix}"
-                if not candidate.exists():
-                    target = candidate
-                    break
-                idx += 1
-
-        shutil.copy2(src, target)
-        return str(target.resolve())
-
-    if src.is_dir():
-        shutil.copytree(src, target_dir, dirs_exist_ok=True)
-        return str(target_dir.resolve())
-
-    return value
-
-
-def copy_output_to_managed_dir(src_dir: Path, dst_dir: Path):
-    """
-    把本地输出目录内容复制到右侧文件管理的输出文件夹。
-    支持递归复制文件和子文件夹。
-    """
-    src_dir = Path(src_dir)
-    dst_dir = Path(dst_dir)
-
-    if not src_dir.exists():
-        raise FileNotFoundError(f"源输出目录不存在: {src_dir}")
-
-    if not src_dir.is_dir():
-        raise NotADirectoryError(f"源输出路径不是文件夹: {src_dir}")
-
-    dst_dir.mkdir(parents=True, exist_ok=True)
-
-    for item in src_dir.rglob("*"):
-        rel = item.relative_to(src_dir)
-        target = dst_dir / rel
-
-        if item.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-        elif item.is_file():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(item, target)
-
-
-def start_output_sync_after_task(task_id: str, output_syncs: list[tuple[str, str]]):
-    """
-    任务结束后，把原始输出目录同步到 uploads/用户名/输出文件夹/xxx。
-    注意：有些 exe 即使生成了结果，也可能返回非 0 导致任务状态为 failed；
-    所以这里在 success / failed 时都尝试同步，cancelled 不同步。
-    """
-    import threading
-    import time
-
-    terminal_statuses = {"success", "failed", "cancelled"}
-
-    def worker():
-        while True:
-            task = task_manager.get_task(task_id)
-            if not task:
-                return
-
-            status = task.get("status")
-            if status in terminal_statuses:
-                if status != "cancelled":
-                    for src, dst in output_syncs:
-                        try:
-                            task_manager.append_log(
-                                task_id,
-                                f"[OUTPUT-SYNC] 开始同步输出目录: {src} -> {dst}",
-                            )
-                            copy_output_to_managed_dir(Path(src), Path(dst))
-                            task_manager.append_log(
-                                task_id,
-                                f"[OUTPUT-SYNC] 输出目录同步完成: {src} -> {dst}",
-                            )
-                        except Exception as exc:
-                            task_manager.append_log(
-                                task_id,
-                                f"[OUTPUT-SYNC-ERROR] 输出目录同步失败: {src} -> {dst}; {repr(exc)}",
-                            )
-                return
-
-            time.sleep(2)
-
-    threading.Thread(target=worker, daemon=True).start()
-
-def safe_dir_name(name: str) -> str:
-    name = str(name or "").strip()
-    name = name.replace("..", "_")
-    name = name.replace("/", "_").replace("\\", "_")
-    name = name.replace(":", "_").replace("*", "_").replace("?", "_")
-    name = name.replace('"', "_").replace("<", "_").replace(">", "_").replace("|", "_")
-    return name or "未命名目录"
-
-def normalize_task_io_paths(module: dict, inputs: dict, username: str) -> tuple[dict, Path, list[tuple[str, str]]]:
-    """
-    运行任务前整理路径：
-    1. 输入文件/文件夹复制到 uploads/用户名/输入文件夹/字段名/
-    2. 输出目录保留用户原始选择，让 exe 正常写结果
-    3. 同时准备同步规则：任务成功后复制到 uploads/用户名/输出文件夹/输出目录名/
-    """
-    user_dir, input_dir, output_dir = get_user_upload_dirs(username)
-
-    new_inputs = dict(inputs)
-    output_syncs: list[tuple[str, str]] = []
-
-    final_output_dir = output_dir / "输出结果"
-
-    for field in module.get("inputs", []) or []:
-        key = field.get("key")
-        if not key:
-            continue
-
-        field_type = str(field.get("type", "")).lower()
-
-        if is_output_field(field):
-            original_value = str(new_inputs.get(key) or "").strip()
-
-            if original_value:
-                source_output_dir = Path(original_value).resolve()
-                output_name = safe_dir_name(source_output_dir.name)
-            else:
-                output_name = safe_dir_name(field.get("label") or key or "输出结果")
-                source_output_dir = output_dir / output_name
-                new_inputs[key] = str(source_output_dir.resolve())
-
-            final_output_dir = output_dir / output_name
-            final_output_dir.mkdir(parents=True, exist_ok=True)
-
-            if field_type == "dir_path":
-                # 关键：这里不再改成 job_xxx，也不强行覆盖用户选择的 NC_1。
-                # exe 仍然写入用户选择的原始输出目录。
-                if original_value:
-                    new_inputs[key] = str(source_output_dir)
-                else:
-                    new_inputs[key] = str(final_output_dir.resolve())
-
-                if source_output_dir.resolve() != final_output_dir.resolve():
-                    output_syncs.append((str(source_output_dir), str(final_output_dir.resolve())))
-
-            else:
-                suffix = str(field.get("output_ext") or ".tif")
-                if not suffix.startswith("."):
-                    suffix = "." + suffix
-
-                if original_value:
-                    new_inputs[key] = str(source_output_dir)
-                    output_syncs.append((str(source_output_dir.parent), str(final_output_dir.resolve())))
-                else:
-                    new_inputs[key] = str((final_output_dir / f"{key}{suffix}").resolve())
-
-        elif is_input_path_field(field):
-            value = new_inputs.get(key)
-            if value:
-                field_dir = input_dir / get_field_dir_name(field)
-                new_inputs[key] = copy_input_to_managed_field_dir(
-                    value=value,
-                    input_root_dir=input_dir,
-                    target_dir=field_dir,
-                )
-
-    new_inputs["_user_upload_dir"] = str(user_dir.resolve())
-    new_inputs["_user_input_dir"] = str(input_dir.resolve())
-    new_inputs["_user_output_dir"] = str(final_output_dir.resolve())
-
-    return new_inputs, final_output_dir, output_syncs
-
 # =========================
 # 本地文件对话框接口
 # =========================

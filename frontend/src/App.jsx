@@ -34,10 +34,6 @@ import {
   setAuthToken,
   clearAuthToken,
   getAuthToken,
-  uploadUserFile,
-  deleteUserFile,
-  getUserFilePreviewData,
-    listUserFiles,
 } from './api';
 
 
@@ -156,10 +152,6 @@ const styles = {
 
 function normalize(v) {
   return String(v || '').toLowerCase();
-}
-
-function isPreviewableFileName(value) {
-  return /\.(tif|tiff|nc|nc4|cdf|hdf|h5)$/i.test(String(value || '').split('?')[0]);
 }
 
 // 默认工具栏由后端首次初始化 toolbars.json 时提供。
@@ -1055,14 +1047,6 @@ const labelStyle = {
 };
 
 export default function App() {
-    const [userFiles, setUserFiles] = useState([]);
-    const [uploadingFile, setUploadingFile] = useState(false);
-    const [previewFile, setPreviewFile] = useState(null);
-    const [previewData, setPreviewData] = useState(null);
-    const [previewLoading, setPreviewLoading] = useState(false);
-    const [previewError, setPreviewError] = useState('');
-    const [fileActionMode, setFileActionMode] = useState('');
-    const fileInputRef = useRef(null);
   const [currentUser, setCurrentUser] = useState(null);
   const [authMode, setAuthMode] = useState('login');
   const [loginType, setLoginType] = useState('user');
@@ -1151,13 +1135,6 @@ export default function App() {
     return arr;
   }, [isAdmin, visibleToolbars]);
 
-  useEffect(() => {
-    if (currentUser) {
-      loadUserFiles();
-    } else {
-      setUserFiles([]);
-    }
-  }, [currentUser]);
 
   useEffect(() => {
     const init = async () => {
@@ -1286,7 +1263,6 @@ useEffect(() => {
       try {
         const latestTasks = await getTasks();
         setTasks(Array.isArray(latestTasks) ? latestTasks : []);
-        await loadUserFiles();
 
         for (const w of windows) {
           if (!w.taskId) continue;
@@ -1595,8 +1571,6 @@ async function handleRegister() {
       const detail = await getTask(task.id);
       addTaskWindow(detail, title);
       await refreshTasks();
-
-      await loadUserFiles();
     } catch (e) {
       alert(e?.message || '运行失败');
     }
@@ -1853,60 +1827,6 @@ async function handleRegister() {
       alert(e?.message || '新增用户失败');
     }
   }
-    async function loadUserFiles() {
-      try {
-        const files = await listUserFiles();
-        setUserFiles(Array.isArray(files) ? files : []);
-      } catch (e) {
-        console.error('加载用户文件失败', e);
-      }
-    }
-    function isAllowedUploadFile(file) {
-      const name = String(file?.name || '').toLowerCase();
-
-      return (
-        name.endsWith('.tif') ||
-        name.endsWith('.tiff') ||
-        name.endsWith('.nc') ||
-        name.endsWith('.nc4') ||
-        name.endsWith('.cdf') ||
-        name.endsWith('.hdf') ||
-        name.endsWith('.h5')
-      );
-    }
-
-async function handleUploadManagedFile(e) {
-  const file = e.target.files?.[0];
-  if (!file) return;
-
-  if (!isAllowedUploadFile(file)) {
-    alert('文件格式不支持！仅支持上传 tif、tiff、nc、nc4、cdf、hdf、h5 格式文件。');
-    e.target.value = '';
-    return;
-  }
-
-  try {
-    setUploadingFile(true);
-    await uploadUserFile(file);
-    await loadUserFiles();
-    alert('文件上传成功');
-  } catch (err) {
-    alert(err?.message || '文件上传失败');
-  } finally {
-    setUploadingFile(false);
-    e.target.value = '';
-  }
-}
-
-    async function handleDeleteManagedFile(filename) {
-      if (!window.confirm(`确认删除文件：${filename}？`)) return;
-      try {
-        await deleteUserFile(filename);
-        await loadUserFiles();
-      } catch (err) {
-        alert(err?.message || '删除失败');
-      }
-    }
 
   async function handleDeleteUser(username) {
     try {
@@ -1945,273 +1865,6 @@ async function handleUploadManagedFile(e) {
       alert(e?.message || '重置密码失败');
     }
   }
-function buildFileTree(files, username = currentUser?.username || '当前用户') {
-  const root = { name: '文件管理', type: 'dir', children: {}, files: [] };
-
-  root.children[username] = {
-    name: username,
-    type: 'dir',
-    children: {
-      输入文件夹: {
-        name: '输入文件夹',
-        type: 'dir',
-        children: {},
-        files: [],
-      },
-      输出文件夹: {
-        name: '输出文件夹',
-        type: 'dir',
-        children: {},
-        files: [],
-      },
-    },
-    files: [],
-  };
-
-  const userNode = root.children[username];
-
-  function addFileToNode(baseNode, file, relativeParts) {
-    let node = baseNode;
-
-    const dirParts = relativeParts.slice(0, -1);
-    dirParts.forEach((part) => {
-      if (!node.children[part]) {
-        node.children[part] = {
-          name: part,
-          type: 'dir',
-          children: {},
-          files: [],
-        };
-      }
-      node = node.children[part];
-    });
-
-    node.files.push(file);
-  }
-
-  (files || []).forEach((file) => {
-    const rawPath = String(file.path || file.name || '');
-    const normalized = rawPath.replace(/\\/g, '/');
-    const parts = normalized.split('/').filter(Boolean);
-    const fileName = file.name || parts[parts.length - 1] || '未命名文件';
-
-    let usefulParts = parts;
-
-    const uploadsIndex = parts.findIndex((part) => part === 'uploads');
-    if (uploadsIndex >= 0) {
-      usefulParts = parts.slice(uploadsIndex + 1);
-    }
-
-    if (usefulParts[0] === username) {
-      usefulParts = usefulParts.slice(1);
-    }
-
-    let targetFolder = '输入文件夹';
-
-    if (
-      usefulParts.includes('输出文件夹') ||
-      usefulParts.includes('outputs') ||
-      usefulParts.includes('output')
-    ) {
-      targetFolder = '输出文件夹';
-    }
-
-    if (
-      usefulParts.includes('输入文件夹') ||
-      usefulParts.includes('inputs') ||
-      usefulParts.includes('input')
-    ) {
-      targetFolder = '输入文件夹';
-    }
-
-    const folderIndex = usefulParts.findIndex((part) =>
-      ['输入文件夹', '输出文件夹', 'inputs', 'input', 'outputs', 'output'].includes(part)
-    );
-
-    const relativeParts =
-      folderIndex >= 0
-        ? usefulParts.slice(folderIndex + 1)
-        : [fileName];
-
-    if (file.type === 'dir') {
-  let node = userNode.children[targetFolder];
-
-  relativeParts.forEach((part) => {
-    if (!node.children[part]) {
-      node.children[part] = {
-        name: part,
-        type: 'dir',
-        children: {},
-        files: [],
-      };
-    }
-    node = node.children[part];
-  });
-} else {
-  addFileToNode(userNode.children[targetFolder], { ...file, name: fileName }, relativeParts);
-}
-  });
-
-  return root;
-}
-
-  function clearFilePreview() {
-    setPreviewFile(null);
-    setPreviewData(null);
-    setPreviewError('');
-    setPreviewLoading(false);
-  }
-
-  async function openUploadedFilePreview(fileItem) {
-    if (!fileItem || !isPreviewableFileName(fileItem.name)) {
-      alert('当前仅支持预览 tif/tiff/nc/nc4/cdf/hdf/h5 文件');
-      return;
-    }
-    try {
-      setPreviewLoading(true);
-      setPreviewError('');
-      setPreviewData(null);
-      setPreviewFile({ name: fileItem.name, path: fileItem.path, source: '已上传文件' });
-      const data = await getUserFilePreviewData(fileItem.name);
-      setPreviewData(data);
-    } catch (e) {
-      setPreviewError(e?.message || '预览失败');
-    } finally {
-      setPreviewLoading(false);
-    }
-  }
-
-  function renderFilePreviewPanel() {
-    const meta = previewData?.meta || {};
-    return (
-      <div style={{ minHeight: 'calc(100vh - 150px)', display: 'flex', flexDirection: 'column' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 14 }}>
-          <div>
-            <div style={{ fontSize: 28, fontWeight: 900, color: '#0b2d51' }}>文件预览</div>
-            <div style={{ color: '#60748b', marginTop: 6, wordBreak: 'break-all' }}>
-              {previewFile?.source || ''}：{previewFile?.path || previewFile?.name || ''}
-            </div>
-            {previewData?.message && (
-              <div style={{ color: '#6a7f96', marginTop: 6, fontSize: 13 }}>{previewData.message}</div>
-            )}
-          </div>
-          <button style={styles.whiteBtn} onClick={clearFilePreview}>关闭预览</button>
-        </div>
-
-        {previewLoading && <div style={{ padding: 20, color: '#60748b' }}>正在生成预览...</div>}
-
-        {previewError && (
-          <div style={{ padding: 14, borderRadius: 12, background: '#fff4e5', color: '#8a4b08', border: '1px solid #f3d3a4' }}>
-            {previewError}
-          </div>
-        )}
-
-        {previewData?.kind === 'image' && previewData?.image_data_url && !previewLoading && (
-          <div style={{ flex: 1, minHeight: 520, border: '1px solid #d7e3f0', borderRadius: 16, background: '#0f172a', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'auto', padding: 12 }}>
-            <img src={previewData.image_data_url} alt={previewFile?.name || 'file preview'} style={{ maxWidth: '100%', maxHeight: '78vh', objectFit: 'contain', background: '#fff' }} />
-          </div>
-        )}
-
-        {previewData?.kind === 'metadata' && !previewLoading && (
-          <div style={{ border: '1px solid #d7e3f0', borderRadius: 16, background: '#fff', padding: 16, overflow: 'auto', maxHeight: '72vh' }}>
-            <div style={{ fontWeight: 900, color: '#12385f', marginBottom: 10 }}>文件结构</div>
-            <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: 0, color: '#203a58', background: '#f7fbff', padding: 12, borderRadius: 12 }}>
-              {JSON.stringify(meta, null, 2)}
-            </pre>
-          </div>
-        )}
-
-        <div style={{ marginTop: 10, color: '#6a7f96', fontSize: 13, lineHeight: 1.7 }}>
-          预览只覆盖中间运行区域，不会停止正在运行的任务；关闭后会回到模块参数界面。文件名支持双击预览。
-        </div>
-      </div>
-    );
-  }
-
-  function renderFileTreeNode(node, depth = 0) {
-    const childDirs = Object.values(node.children || {});
-    const files = node.files || [];
-
-    return (
-      <div>
-        {depth === 0 && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 8px', borderRadius: 8, background: '#f3f7fc', color: '#1d3d63', fontWeight: 900, marginBottom: 6, minWidth: 0 }}>
-            <span>▾</span><span>📁</span>
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{node.name}</span>
-          </div>
-        )}
-
-        {childDirs.map((child) => (
-          <div key={`${depth}-${child.name}`} style={{ marginLeft: depth === 0 ? 10 : 14 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '5px 6px', borderRadius: 8, color: '#26384d', fontSize: 13, minWidth: 0 }}>
-              <span style={{ color: '#7b8ba1' }}>▾</span><span>📁</span>
-              <span title={child.name} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{child.name}</span>
-            </div>
-            {renderFileTreeNode(child, depth + 1)}
-          </div>
-        ))}
-
-        {files.map((f) => {
-          const canPreview = isPreviewableFileName(f.name);
-          return (
-            <div key={f.path || f.name} style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', alignItems: 'center', gap: 6, marginLeft: depth === 0 ? 14 : 24, padding: '6px 6px', borderRadius: 8, color: '#26384d', minWidth: 0 }} onMouseEnter={(e) => { e.currentTarget.style.background = '#f5f9ff'; }} onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}>
-              <div title={canPreview ? `${f.path || f.name}\n双击文件名预览` : `${f.path || f.name}\n该格式暂不支持预览`} style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, fontSize: 13, color: '#26384d' }}>
-                <span style={{ color: '#7b8ba1' }}>▸</span><span>📄</span>
-                <button type="button" onDoubleClick={() => canPreview && openUploadedFilePreview(f)} style={{ minWidth: 0, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis', border: 'none', background: 'transparent', padding: 0, color: canPreview ? '#1d4ed8' : '#26384d', textDecoration: canPreview ? 'underline' : 'none', cursor: canPreview ? 'pointer' : 'default', textAlign: 'left' }}>
-                  {f.name}
-                </button>
-              </div>
-
-              {fileActionMode === 'copy' && (
-                <button title="复制路径" onClick={async () => { try { await navigator.clipboard.writeText(f.path); alert('路径已复制'); } catch { alert('复制失败，请手动复制路径'); } }} style={{ border: 'none', background: 'transparent', color: '#2d7cf6', fontSize: 15, cursor: 'pointer', padding: '0 4px', lineHeight: 1 }}>📋</button>
-              )}
-
-              {fileActionMode === 'delete' && (
-                <button title="删除文件" onClick={() => { const ok = window.confirm(`确认删除文件：${f.name}？`); if (ok) handleDeleteManagedFile(f.name); }} style={{ border: 'none', background: 'transparent', color: '#e53935', fontSize: 18, fontWeight: 900, cursor: 'pointer', padding: '0 4px', lineHeight: 1 }}>×</button>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    );
-  }
-
-  function renderFileManagerPanel() {
-    const fileTree = buildFileTree(userFiles, currentUser?.username);
-
-    return (
-      <div style={{ ...styles.card, padding: 14, minHeight: '100%', minWidth: 0, maxWidth: '100%', overflow: 'hidden', background: '#ffffff' }}>
-        <div style={{ fontSize: 22, fontWeight: 900, color: '#0b2d51', marginBottom: 12 }}>文件管理</div>
-        <input
-            ref={fileInputRef}
-            type="file"
-            accept=".tif,.tiff,.nc,.nc4,.cdf,.hdf,.h5"
-            style={{ display: 'none' }}
-            onChange={handleUploadManagedFile}
-          />
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 12, padding: 8, border: '1px solid #d8e3ef', borderRadius: 12, background: '#ffffff' }}>
-          <button style={{ ...styles.blueBtn, height: 36, borderRadius: 8, padding: '0 8px', fontSize: 13 }} onClick={() => fileInputRef.current?.click()} disabled={uploadingFile}>{uploadingFile ? '上传中...' : '上传文件'}</button>
-          <button style={{ ...styles.whiteBtn, height: 36, borderRadius: 8, padding: '0 8px', fontSize: 13 }} onClick={loadUserFiles}>刷新列表</button>
-          <button style={{ ...(fileActionMode === 'copy' ? styles.blueBtn : styles.whiteBtn), height: 36, borderRadius: 8, padding: '0 8px', fontSize: 13 }} onClick={() => setFileActionMode((prev) => (prev === 'copy' ? '' : 'copy'))}>复制路径</button>
-          <button style={{ ...(fileActionMode === 'delete' ? styles.redBtn : styles.whiteBtn), height: 36, borderRadius: 8, padding: '0 8px', fontSize: 13 }} onClick={() => setFileActionMode((prev) => (prev === 'delete' ? '' : 'delete'))}>删除文件</button>
-        </div>
-
-        <div style={{ fontSize: 13, color: '#6b7d90', marginBottom: 8, lineHeight: 1.6 }}>
-          双击蓝色文件名进入文件预览，支持 tif/tiff/nc/nc4/cdf/hdf/h5。
-        </div>
-
-        <div style={{ fontSize: 14, fontWeight: 800, color: '#4b6078', marginBottom: 8 }}>已上传文件</div>
-        <div style={{ border: '1px solid #d8e3ef', borderRadius: 12, background: '#ffffff', minHeight: 320, maxHeight: 'calc(100vh - 270px)', overflowY: 'auto', overflowX: 'hidden', padding: 8, minWidth: 0 }}>
-          {userFiles.length === 0 ? (
-            <div style={{ color: '#99a6b5', fontSize: 14, padding: '12px 10px' }}>暂无文件</div>
-          ) : (
-            renderFileTreeNode(fileTree)
-          )}
-        </div>
-      </div>
-    );
-  }
-
   function renderModuleRuntime(module) {
 
     if (!module) {
@@ -2511,14 +2164,22 @@ function buildFileTree(files, username = currentUser?.username || '当前用户'
         </div>
 
         <div style={{ ...styles.card, padding: 22 }}>
-          {previewFile
-            ? renderFilePreviewPanel()
-            : selectedModule
+          {selectedModule
               ? renderModuleRuntime(selectedModule)
               : <div style={{ padding: 20, color: '#999' }}>当前工具栏暂无可运行模块</div>}
         </div>
 
-        {renderFileManagerPanel()}
+        <div
+          style={{
+            ...styles.card,
+            padding: 14,
+            minHeight: '100%',
+            minWidth: 0,
+            maxWidth: '100%',
+            overflow: 'hidden',
+            background: '#ffffff',
+          }}
+        />
       </section>
     );
   }
