@@ -6,6 +6,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
@@ -461,30 +462,244 @@ def is_tif_path(path: Path) -> bool:
     return path.suffix.lower() in {".tif", ".tiff"}
 
 
-def _normalize_to_uint8(array):
+def _preview_valid_mask(array, nodata=None, prefer_nonzero: bool = True):
+    """生成预览用的有效像元掩膜。
+
+    很多遥感产品会把背景、无效区域写成 0、-9999、65535 等值。
+    如果直接用全图 2%-98% 分位拉伸，背景 0 占比过高时整张预览会被压成黑色。
+    """
     import numpy as np
 
     arr = array.astype("float32", copy=False)
     finite = np.isfinite(arr)
-    if not finite.any():
+    mask = finite.copy()
+
+    if nodata is not None:
+        try:
+            nd = float(nodata)
+            if np.isfinite(nd):
+                mask &= ~np.isclose(arr, nd, rtol=0, atol=1e-6)
+        except Exception:
+            pass
+
+    for fill_value in (-999999.0, -99999.0, -9999.0, -999.0, -32768.0, 32767.0, 65535.0):
+        mask &= ~np.isclose(arr, fill_value, rtol=0, atol=1e-6)
+
+    if not mask.any():
+        return mask
+
+    if prefer_nonzero:
+        valid = arr[mask]
+        zero_ratio = float(np.mean(np.isclose(valid, 0.0, rtol=0, atol=1e-12))) if valid.size else 0.0
+        nonzero_mask = mask & ~np.isclose(arr, 0.0, rtol=0, atol=1e-12)
+        if zero_ratio >= 0.50 and nonzero_mask.any():
+            return nonzero_mask
+
+    return mask
+
+
+def _array_preview_stats(array, nodata=None) -> dict:
+    import numpy as np
+
+    arr = array.astype("float32", copy=False)
+    finite = np.isfinite(arr)
+    base_mask = finite.copy()
+
+    if nodata is not None:
+        try:
+            nd = float(nodata)
+            if np.isfinite(nd):
+                base_mask &= ~np.isclose(arr, nd, rtol=0, atol=1e-6)
+        except Exception:
+            pass
+
+    stretch_mask = _preview_valid_mask(arr, nodata=nodata, prefer_nonzero=True)
+    stats: dict[str, Any] = {
+        "shape": list(arr.shape),
+        "nodata": nodata,
+        "finite_pixels": int(finite.sum()),
+        "valid_pixels": int(base_mask.sum()),
+        "stretch_pixels": int(stretch_mask.sum()),
+    }
+
+    if base_mask.any():
+        vals = arr[base_mask]
+        stats.update({
+            "min": float(np.nanmin(vals)),
+            "max": float(np.nanmax(vals)),
+            "mean": float(np.nanmean(vals)),
+            "p2": float(np.nanpercentile(vals, 2)),
+            "p98": float(np.nanpercentile(vals, 98)),
+            "zero_ratio": float(np.mean(np.isclose(vals, 0.0, rtol=0, atol=1e-12))),
+        })
+    if stretch_mask.any():
+        vals = arr[stretch_mask]
+        stats.update({
+            "stretch_min": float(np.nanmin(vals)),
+            "stretch_max": float(np.nanmax(vals)),
+            "stretch_p2": float(np.nanpercentile(vals, 2)),
+            "stretch_p98": float(np.nanpercentile(vals, 98)),
+        })
+    return stats
+
+
+def _normalize_to_uint8(array, nodata=None, prefer_nonzero: bool = True):
+    import numpy as np
+
+    arr = array.astype("float32", copy=False)
+    mask = _preview_valid_mask(arr, nodata=nodata, prefer_nonzero=prefer_nonzero)
+    if not mask.any():
         return np.zeros(arr.shape, dtype="uint8")
 
-    valid = arr[finite]
+    valid = arr[mask]
     lo, hi = np.nanpercentile(valid, [2, 98])
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
         lo = float(np.nanmin(valid))
         hi = float(np.nanmax(valid))
-    if hi <= lo:
-        return np.zeros(arr.shape, dtype="uint8")
 
-    arr = (arr - lo) / (hi - lo) * 255.0
-    arr = np.clip(arr, 0, 255)
-    arr[~finite] = 0
-    return arr.astype("uint8")
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        out = np.zeros(arr.shape, dtype="uint8")
+        out[mask] = 180
+        return out
+
+    out = np.zeros(arr.shape, dtype="float32")
+    out[mask] = (arr[mask] - lo) / (hi - lo) * 255.0
+    out = np.clip(out, 0, 255)
+    return out.astype("uint8")
 
 
-def render_tif_to_png_bytes(tif_path: Path) -> bytes:
-    """把 tif/tiff 渲染成浏览器可显示的 PNG。优先使用 GDAL 读取 GeoTIFF。"""
+def _colorize_gray(gray):
+    """单波段数据转为更容易辨识的伪彩色预览。"""
+    from PIL import Image
+
+    img = Image.fromarray(gray, mode="L")
+    try:
+        from PIL import ImageOps
+        return ImageOps.colorize(img, black="#000000", mid="#1d4ed8", white="#fff7a8")
+    except Exception:
+        return img.convert("RGB")
+
+
+def _clean_cli_text(value: str) -> str:
+    return (value or "").strip().replace("\r", " ").replace("\n", " ")
+
+
+def _find_gdal_command(command_name: str) -> str:
+    """查找系统 GDAL 命令。Windows 下 gdalinfo 可用但 Python 没装 osgeo 时会走这里。"""
+    candidate = shutil.which(command_name)
+    if candidate:
+        return candidate
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            f"系统未找到 {command_name} 命令。当前 Python 没有 osgeo 模块时，"
+            f"需要把 GDAL 命令行工具加入 PATH，或给后端 Python 安装 GDAL/osgeo。"
+        ),
+    )
+
+
+def _run_gdal_cli(args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=timeout,
+            shell=False,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail=f"未找到 GDAL 命令: {args[0]}")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=500, detail=f"GDAL 命令执行超时: {' '.join(args)}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"GDAL 命令执行失败: {exc}")
+
+
+def _read_tif_meta_with_gdalinfo_cli(tif_path: Path) -> dict:
+    """用 gdalinfo -json 读取基础元数据。失败也不影响预览。"""
+    try:
+        gdalinfo = _find_gdal_command("gdalinfo")
+        result = _run_gdal_cli([gdalinfo, "-json", str(tif_path)], timeout=60)
+        if result.returncode != 0:
+            return {"gdalinfo_error": _clean_cli_text(result.stderr or result.stdout)}
+        data = json.loads(result.stdout or "{}")
+        size = data.get("size") or []
+        bands = data.get("bands") or []
+        meta: dict[str, Any] = {
+            "gdalinfo_driver": (data.get("driverShortName") or data.get("driverLongName") or ""),
+            "width": int(size[0]) if len(size) > 0 else None,
+            "height": int(size[1]) if len(size) > 1 else None,
+            "bands": len(bands),
+        }
+        band_types = []
+        nodata_values = []
+        for band in bands[:8]:
+            if band.get("type"):
+                band_types.append(str(band.get("type")))
+            if band.get("noDataValue") is not None:
+                nodata_values.append(band.get("noDataValue"))
+        if band_types:
+            meta["band_types"] = band_types
+        if nodata_values:
+            meta["nodata_values"] = nodata_values
+        return meta
+    except Exception as exc:
+        return {"gdalinfo_error": str(exc)}
+
+
+def _render_tif_with_gdal_cli(tif_path: Path, meta: dict[str, Any] | None = None) -> dict:
+    """
+    Python 环境没有 osgeo 时，调用系统 gdal_translate 把 GeoTIFF 转成 PNG。
+    这样只要命令行 gdalinfo/gdal_translate 可用，就能预览多波段遥感 TIFF。
+    """
+    meta = dict(meta or {})
+    cli_meta = _read_tif_meta_with_gdalinfo_cli(tif_path)
+    meta.update({k: v for k, v in cli_meta.items() if v is not None})
+
+    band_count = int(meta.get("bands") or 1)
+    gdal_translate = _find_gdal_command("gdal_translate")
+
+    with tempfile.TemporaryDirectory(prefix="tif_preview_") as tmpdir:
+        out_png = Path(tmpdir) / "preview.png"
+
+        cmd = [
+            gdal_translate,
+            "-q",
+            "-of",
+            "PNG",
+            "-ot",
+            "Byte",
+            "-scale",
+            "-outsize",
+            "1600",
+            "0",
+        ]
+
+        if band_count >= 3:
+            # 多波段遥感 TIFF 默认取 1/2/3 波段做 RGB 预览。
+            # 后续如需严格真彩色/假彩色，可再在前端加波段选择。
+            cmd.extend(["-b", "1", "-b", "2", "-b", "3"]);
+            meta["render_mode"] = "gdal_translate_cli_rgb_1_2_3"
+        else:
+            cmd.extend(["-b", "1"]);
+            meta["render_mode"] = "gdal_translate_cli_single_band"
+
+        cmd.extend([str(tif_path), str(out_png)])
+
+        result = _run_gdal_cli(cmd, timeout=120)
+        if result.returncode != 0 or not out_png.exists():
+            err = _clean_cli_text(result.stderr or result.stdout)
+            raise HTTPException(status_code=500, detail=f"gdal_translate 预览失败: {err}")
+
+        meta["preview_engine"] = "gdal_translate_cli"
+        meta["gdal_command"] = " ".join(cmd)
+        return {"png": out_png.read_bytes(), "meta": meta}
+
+
+def render_tif_to_preview_result(tif_path: Path) -> dict:
+    """把 tif/tiff 渲染成浏览器可显示的 PNG，同时返回拉伸统计信息。"""
     if not tif_path.exists() or not tif_path.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
     if not is_tif_path(tif_path):
@@ -497,6 +712,7 @@ def render_tif_to_png_bytes(tif_path: Path) -> bytes:
         raise HTTPException(status_code=500, detail=f"缺少图片预览依赖 Pillow/numpy: {exc}")
 
     max_size = 1600
+    meta: dict[str, Any] = {"name": tif_path.name, "size": tif_path.stat().st_size, "suffix": tif_path.suffix.lower()}
 
     try:
         from osgeo import gdal
@@ -511,35 +727,70 @@ def render_tif_to_png_bytes(tif_path: Path) -> bytes:
         out_w = max(1, int(width * scale))
         out_h = max(1, int(height * scale))
 
+        meta.update({"width": width, "height": height, "bands": int(ds.RasterCount or 1), "preview_width": out_w, "preview_height": out_h, "preview_engine": "python_osgeo_gdal"})
+
         band_count = int(ds.RasterCount or 1)
         if band_count >= 3:
             bands = []
+            band_stats = []
             for band_index in (1, 2, 3):
                 band = ds.GetRasterBand(band_index)
+                nodata = band.GetNoDataValue()
                 arr = band.ReadAsArray(buf_xsize=out_w, buf_ysize=out_h)
-                bands.append(_normalize_to_uint8(arr))
+                band_stats.append({"band": band_index, **_array_preview_stats(arr, nodata=nodata)})
+                bands.append(_normalize_to_uint8(arr, nodata=nodata, prefer_nonzero=True))
             rgb = np.dstack(bands)
             image = Image.fromarray(rgb, mode="RGB")
+            meta["band_stats"] = band_stats
+            meta["render_mode"] = "rgb_stretched"
         else:
             band = ds.GetRasterBand(1)
+            nodata = band.GetNoDataValue()
             arr = band.ReadAsArray(buf_xsize=out_w, buf_ysize=out_h)
-            gray = _normalize_to_uint8(arr)
-            image = Image.fromarray(gray, mode="L")
+            gray = _normalize_to_uint8(arr, nodata=nodata, prefer_nonzero=True)
+            image = _colorize_gray(gray)
+            meta.update(_array_preview_stats(arr, nodata=nodata))
+            meta["render_mode"] = "single_band_contrast_colorized"
     except HTTPException:
         raise
-    except Exception:
-        # 兜底：普通 TIFF 用 Pillow 直接打开。
+    except Exception as gdal_exc:
+        # 关键修复：Python 没有 osgeo，或 osgeo/GDAL 打不开时，不再直接依赖 Pillow。
+        # 优先调用系统 gdal_translate；你的电脑上 gdalinfo 能打开 AnnualCrop_1.tif，
+        # 因此这个分支可以处理 Pillow 无法识别的多波段 GeoTIFF。
         try:
-            image = Image.open(tif_path)
-            image.thumbnail((max_size, max_size))
-            if image.mode not in {"L", "RGB", "RGBA"}:
-                image = image.convert("RGB")
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"tif 预览失败: {exc}")
+            cli_meta = dict(meta)
+            cli_meta["python_gdal_error"] = str(gdal_exc)
+            return _render_tif_with_gdal_cli(tif_path, cli_meta)
+        except HTTPException:
+            raise
+        except Exception as cli_exc:
+            try:
+                image = Image.open(tif_path)
+                image.thumbnail((max_size, max_size))
+                if image.mode not in {"L", "RGB", "RGBA"}:
+                    image = image.convert("RGB")
+                meta["render_mode"] = "pillow_fallback"
+                meta["preview_engine"] = "pillow"
+                meta["width"], meta["height"] = image.size
+                meta["python_gdal_error"] = str(gdal_exc)
+                meta["gdal_cli_error"] = str(cli_exc)
+            except Exception as pil_exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "tif 预览失败：Python 后端没有可用的 osgeo/GDAL，"
+                        "系统 gdal_translate 调用也失败，Pillow 也无法识别该 GeoTIFF。"
+                        f" Python GDAL 错误: {gdal_exc}; GDAL CLI 错误: {cli_exc}; Pillow 错误: {pil_exc}"
+                    ),
+                )
 
     buf = io.BytesIO()
     image.save(buf, format="PNG")
-    return buf.getvalue()
+    return {"png": buf.getvalue(), "meta": meta}
+
+
+def render_tif_to_png_bytes(tif_path: Path) -> bytes:
+    return render_tif_to_preview_result(tif_path)["png"]
 
 
 def is_previewable_path(path: Path) -> bool:
@@ -619,8 +870,8 @@ def render_nc_to_preview(nc_path: Path) -> dict:
         max_size = 1600
         h, w = arr.shape
         scale = min(1.0, max_size / max(h, w)) if max(h, w) else 1.0
-        gray = _normalize_to_uint8(arr)
-        image = Image.fromarray(gray, mode="L")
+        gray = _normalize_to_uint8(arr, nodata=None, prefer_nonzero=True)
+        image = _colorize_gray(gray)
         if scale < 1.0:
             image = image.resize((max(1, int(w * scale)), max(1, int(h * scale))))
 
@@ -633,6 +884,8 @@ def render_nc_to_preview(nc_path: Path) -> dict:
 
         meta["preview_variable"] = selected_name
         meta["preview_shape"] = list(arr.shape)
+        meta["render_mode"] = "nc_single_variable_contrast_colorized"
+        meta["preview_stats"] = _array_preview_stats(arr, nodata=None)
         return {
             "kind": "image",
             "title": nc_path.name,
@@ -657,13 +910,17 @@ def build_uploaded_file_preview(target: Path) -> dict:
 
     suffix = target.suffix.lower()
     if suffix in {".tif", ".tiff"}:
-        png = render_tif_to_png_bytes(target)
+        result = render_tif_to_preview_result(target)
+        zero_ratio = result.get("meta", {}).get("zero_ratio")
+        extra = ""
+        if isinstance(zero_ratio, (int, float)) and zero_ratio >= 0.5:
+            extra = " 已自动排除大量 0 背景后做对比度拉伸。"
         return {
             "kind": "image",
             "title": target.name,
-            "image_data_url": _png_data_url(png),
-            "meta": {"name": target.name, "size": target.stat().st_size, "suffix": suffix},
-            "message": "已将上传的 GeoTIFF 转为浏览器可显示的 PNG 预览。",
+            "image_data_url": _png_data_url(result["png"]),
+            "meta": result.get("meta", {"name": target.name, "size": target.stat().st_size, "suffix": suffix}),
+            "message": "已将上传的 GeoTIFF 转为浏览器可显示的 PNG 预览。" + extra,
         }
 
     return render_nc_to_preview(target)
