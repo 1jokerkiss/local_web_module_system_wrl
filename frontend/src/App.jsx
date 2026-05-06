@@ -1286,6 +1286,7 @@ useEffect(() => {
       try {
         const latestTasks = await getTasks();
         setTasks(Array.isArray(latestTasks) ? latestTasks : []);
+        await loadUserFiles();
 
         for (const w of windows) {
           if (!w.taskId) continue;
@@ -1594,6 +1595,8 @@ async function handleRegister() {
       const detail = await getTask(task.id);
       addTaskWindow(detail, title);
       await refreshTasks();
+
+      await loadUserFiles();
     } catch (e) {
       alert(e?.message || '运行失败');
     }
@@ -2030,7 +2033,23 @@ function buildFileTree(files, username = currentUser?.username || '当前用户'
         ? usefulParts.slice(folderIndex + 1)
         : [fileName];
 
-    addFileToNode(userNode.children[targetFolder], { ...file, name: fileName }, relativeParts);
+    if (file.type === 'dir') {
+  let node = userNode.children[targetFolder];
+
+  relativeParts.forEach((part) => {
+    if (!node.children[part]) {
+      node.children[part] = {
+        name: part,
+        type: 'dir',
+        children: {},
+        files: [],
+      };
+    }
+    node = node.children[part];
+  });
+} else {
+  addFileToNode(userNode.children[targetFolder], { ...file, name: fileName }, relativeParts);
+}
   });
 
   return root;
@@ -2194,7 +2213,7 @@ function buildFileTree(files, username = currentUser?.username || '当前用户'
   }
 
   function renderModuleRuntime(module) {
-    console.log("当前渲染的模块信息:", module);// 加这一行
+
     if (!module) {
       return <div style={{ padding: 20 }}>当前没有匹配到可运行模块</div>;
     }
