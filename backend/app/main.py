@@ -3,9 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
-import math
 import os
-import shutil
 import subprocess
 import tempfile
 import zipfile
@@ -15,7 +13,7 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 
@@ -925,23 +923,32 @@ def build_uploaded_file_preview(target: Path) -> dict:
 
     return render_nc_to_preview(target)
 
+def get_user_upload_dirs(username: str):
+    user_dir = UPLOADS_DIR / username
+    input_dir = user_dir / "输入文件夹"
+    output_dir = user_dir / "输出文件夹"
 
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    return user_dir, input_dir, output_dir
 @app.get("/api/files")
 def api_list_user_files(authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
-    user_dir = UPLOADS_DIR / user.username
-    user_dir.mkdir(parents=True, exist_ok=True)
+    user_dir, input_dir, output_dir = get_user_upload_dirs(user.username)
 
     items = []
-    for p in sorted(user_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+    for p in sorted(user_dir.rglob("*"), key=lambda x: x.stat().st_mtime, reverse=True):
         if p.is_file():
             stat = p.stat()
             items.append({
                 "name": p.name,
                 "path": str(p.resolve()),
+                "relative_path": str(p.relative_to(user_dir)),
                 "size": stat.st_size,
                 "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
             })
+
     return items
 
 
@@ -951,11 +958,18 @@ def api_upload_user_file(
     authorization: str | None = Header(default=None),
 ):
     user = get_current_user(authorization)
-    user_dir = UPLOADS_DIR / user.username
-    user_dir.mkdir(parents=True, exist_ok=True)
+    user_dir, input_dir, output_dir = get_user_upload_dirs(user.username)
 
     original_name = sanitize_filename(file.filename or "uploaded_file")
-    target = user_dir / original_name
+
+    allowed_suffixes = {".tif", ".tiff", ".nc", ".nc4", ".cdf", ".hdf", ".h5"}
+    if Path(original_name).suffix.lower() not in allowed_suffixes:
+        raise HTTPException(
+            status_code=400,
+            detail="文件格式不支持，仅支持 tif、tiff、nc、nc4、cdf、hdf、h5 文件",
+        )
+
+    target = input_dir / original_name
 
     # 如重名，自动追加编号
     if target.exists():
@@ -963,7 +977,7 @@ def api_upload_user_file(
         suffix = target.suffix
         idx = 1
         while True:
-            candidate = user_dir / f"{stem}_{idx}{suffix}"
+            candidate = input_dir / f"{stem}_{idx}{suffix}"
             if not candidate.exists():
                 target = candidate
                 break
@@ -976,45 +990,120 @@ def api_upload_user_file(
         "ok": True,
         "name": target.name,
         "path": str(target.resolve()),
+        "relative_path": str(target.relative_to(user_dir)),
         "size": target.stat().st_size,
     }
 
+@app.post("/api/tasks/run")
+def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header(default=None)):
+    user = get_current_user(authorization)
 
+    module = get_module(payload.module_id)
+    if not module:
+        raise HTTPException(status_code=404, detail="模块不存在")
+    if not module.get("enabled", True):
+        raise HTTPException(status_code=400, detail="模块已禁用")
+
+    inputs = merge_admin_fixed_inputs(module, payload.inputs or {})
+    parallel_workers = clamp_parallel_workers(payload.parallel_workers)
+
+    # 先检查必填参数；输出字段由后端自动生成，所以不要求用户填写
+    for field in module.get("inputs", []):
+        key = field.get("key")
+        required = field.get("required", False)
+
+        if is_output_field(field):
+            continue
+
+        if required and (key not in inputs or inputs.get(key) in ("", None)):
+            raise HTTPException(status_code=400, detail=f"缺少必填参数: {key}")
+
+    # 整理用户输入/输出目录：
+    # 输入文件/文件夹复制到 uploads/用户名/输入文件夹
+    # 输出字段自动设置到 uploads/用户名/输出文件夹/job_xxx
+    inputs, job_output_dir = normalize_task_io_paths(
+        module=module,
+        inputs=inputs,
+        username=user.username,
+    )
+
+    mode = str(normalize_parallel_config(module).get("mode") or "auto").strip() or "auto"
+
+    if parallel_workers > 1 and mode == "module_internal":
+        # 模块源码自己处理并行，平台只负责传参，不拆成多个进程。
+        inputs = dict(inputs)
+        inputs["parallel_workers"] = parallel_workers
+        inputs["_parallel_workers"] = parallel_workers
+
+    jobs = prepare_parallel_jobs(module, inputs, parallel_workers)
+
+    if parallel_workers > 1 and len(jobs) > 1:
+        return task_manager.submit_parallel_module_task(
+            module_id=module["id"],
+            module_name=module.get("name", module["id"]),
+            jobs=jobs,
+            inputs={
+                **inputs,
+                "parallel_workers": parallel_workers,
+                "_user_output_dir": str(job_output_dir.resolve()),
+            },
+            max_workers=parallel_workers,
+        )
+
+    command, working_dir, runtime_env = build_runtime_for_module(module, inputs)
+
+    task = task_manager.submit_module_task(
+        module_id=module["id"],
+        module_name=module.get("name", module["id"]),
+        command=command,
+        inputs=inputs,
+        working_dir=working_dir,
+        env=runtime_env,
+    )
+
+    return task
 @app.delete("/api/files/{filename}")
 def api_delete_user_file(filename: str, authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
-    user_dir = UPLOADS_DIR / user.username
-    user_dir.mkdir(parents=True, exist_ok=True)
+    user_dir, input_dir, output_dir = get_user_upload_dirs(user.username)
 
     safe_name = sanitize_filename(filename)
-    target = user_dir / safe_name
-    if not target.exists() or not target.is_file():
+
+    matches = [p for p in user_dir.rglob(safe_name) if p.is_file()]
+    if not matches:
         raise HTTPException(status_code=404, detail="文件不存在")
 
+    target = matches[0]
     target.unlink()
+
     return {"ok": True}
 
 
 @app.get("/api/files/{filename}/download")
 def api_download_user_file(filename: str, authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
-    user_dir = UPLOADS_DIR / user.username
-    user_dir.mkdir(parents=True, exist_ok=True)
+    user_dir, input_dir, output_dir = get_user_upload_dirs(user.username)
 
     safe_name = sanitize_filename(filename)
-    target = user_dir / safe_name
-    if not target.exists() or not target.is_file():
+    matches = [p for p in user_dir.rglob(safe_name) if p.is_file()]
+
+    if not matches:
         raise HTTPException(status_code=404, detail="文件不存在")
 
+    target = matches[0]
     return FileResponse(str(target), filename=target.name)
 
 
 @app.get("/api/files/{filename}/preview")
 def api_preview_uploaded_file(filename: str, authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
-    user_dir = UPLOADS_DIR / user.username
+    user_dir, input_dir, output_dir = get_user_upload_dirs(user.username)
     safe_name = sanitize_filename(filename)
-    target = user_dir / safe_name
+    matches = [p for p in user_dir.rglob(safe_name) if p.is_file()]
+    if not matches:
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    target = matches[0]
     return build_uploaded_file_preview(target)
 
 def upsert_module(module_data: dict):
@@ -1865,55 +1954,139 @@ def api_delete_task(task_id: str, authorization: str | None = Header(default=Non
         raise HTTPException(status_code=404, detail="任务不存在")
     return {"ok": True}
 
+import shutil
+import uuid
+from pathlib import Path
 
-@app.post("/api/tasks/run")
-def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header(default=None)):
-    get_current_user(authorization)
 
-    module = get_module(payload.module_id)
-    if not module:
-        raise HTTPException(status_code=404, detail="模块不存在")
-    if not module.get("enabled", True):
-        raise HTTPException(status_code=400, detail="模块已禁用")
+def is_output_field(field: dict) -> bool:
+    key = str(field.get("key", "")).lower()
+    label = str(field.get("label", "")).lower()
 
-    inputs = merge_admin_fixed_inputs(module, payload.inputs or {})
-    parallel_workers = clamp_parallel_workers(payload.parallel_workers)
+    output_keywords = [
+        "output",
+        "outpath",
+        "out_dir",
+        "output_dir",
+        "result",
+        "save",
+        "输出",
+        "结果",
+    ]
+
+    return any(k in key or k in label for k in output_keywords)
+
+
+def is_input_path_field(field: dict) -> bool:
+    if is_output_field(field):
+        return False
+
+    field_type = str(field.get("type", "")).lower()
+    key = str(field.get("key", "")).lower()
+    label = str(field.get("label", "")).lower()
+
+    if field_type not in {"file_path", "dir_path"}:
+        return False
+
+    input_keywords = [
+        "input",
+        "file",
+        "path",
+        "dir",
+        "folder",
+        "输入",
+        "文件",
+        "目录",
+    ]
+
+    return any(k in key or k in label for k in input_keywords)
+
+
+def copy_input_to_user_input_dir(value: str, input_dir: Path) -> str:
+    """
+    把用户选择的输入文件/文件夹复制到 uploads/用户名/输入文件夹 下。
+    返回复制后的新路径。
+    """
+    if not value:
+        return value
+
+    src = Path(str(value))
+    if not src.exists():
+        return value
+
+    # 如果已经在输入文件夹下面，就不重复复制
+    try:
+        src.resolve().relative_to(input_dir.resolve())
+        return str(src.resolve())
+    except ValueError:
+        pass
+
+    target = input_dir / src.name
+
+    if src.is_file():
+        if target.exists():
+            stem = target.stem
+            suffix = target.suffix
+            idx = 1
+            while True:
+                candidate = input_dir / f"{stem}_{idx}{suffix}"
+                if not candidate.exists():
+                    target = candidate
+                    break
+                idx += 1
+
+        shutil.copy2(src, target)
+        return str(target.resolve())
+
+    if src.is_dir():
+        if target.exists():
+            target = input_dir / f"{src.name}_{uuid.uuid4().hex[:8]}"
+
+        shutil.copytree(src, target)
+        return str(target.resolve())
+
+    return value
+
+
+def normalize_task_io_paths(module: dict, inputs: dict, username: str) -> tuple[dict, Path]:
+    """
+    运行任务前统一整理输入/输出路径：
+    1. 输入文件/文件夹复制到 uploads/用户名/输入文件夹
+    2. 输出字段自动指向 uploads/用户名/输出文件夹/job_xxx
+    """
+    user_dir, input_dir, output_dir = get_user_upload_dirs(username)
+
+    job_output_dir = output_dir / f"job_{uuid.uuid4().hex[:8]}"
+    job_output_dir.mkdir(parents=True, exist_ok=True)
+
+    new_inputs = dict(inputs)
 
     for field in module.get("inputs", []):
         key = field.get("key")
-        required = field.get("required", False)
-        if required and (key not in inputs or inputs.get(key) in ("", None)):
-            raise HTTPException(status_code=400, detail=f"缺少必填参数: {key}")
+        if not key:
+            continue
 
-    mode = str(normalize_parallel_config(module).get("mode") or "auto").strip() or "auto"
-    if parallel_workers > 1 and mode == "module_internal":
-        # 模块源码自己处理并行，平台只负责传参，不拆成多个进程。
-        inputs = dict(inputs)
-        inputs["parallel_workers"] = parallel_workers
-        inputs["_parallel_workers"] = parallel_workers
+        if is_output_field(field):
+            field_type = str(field.get("type", "")).lower()
 
-    jobs = prepare_parallel_jobs(module, inputs, parallel_workers)
-    if parallel_workers > 1 and len(jobs) > 1:
-        return task_manager.submit_parallel_module_task(
-            module_id=module["id"],
-            module_name=module.get("name", module["id"]),
-            jobs=jobs,
-            inputs={**inputs, "parallel_workers": parallel_workers},
-            max_workers=parallel_workers,
-        )
+            # 输出目录类型：直接给任务输出目录
+            if field_type == "dir_path":
+                new_inputs[key] = str(job_output_dir.resolve())
+            else:
+                # 输出文件类型：默认生成一个 tif 文件路径
+                new_inputs[key] = str((job_output_dir / f"{key}.tif").resolve())
 
-    command, working_dir, runtime_env = build_runtime_for_module(module, inputs)
+        elif is_input_path_field(field):
+            value = new_inputs.get(key)
+            if value:
+                new_inputs[key] = copy_input_to_user_input_dir(value, input_dir)
 
-    task = task_manager.submit_module_task(
-        module_id=module["id"],
-        module_name=module.get("name", module["id"]),
-        command=command,
-        inputs=inputs,
-        working_dir=working_dir,
-        env=runtime_env,
-    )
-    return task
+    # 额外给 config.json 里加一个统一输出目录，方便你的 exe 后续使用
+    new_inputs["_user_upload_dir"] = str(user_dir.resolve())
+    new_inputs["_user_input_dir"] = str(input_dir.resolve())
+    new_inputs["_user_output_dir"] = str(job_output_dir.resolve())
 
+    return new_inputs, job_output_dir
 
 # =========================
 # 本地文件对话框接口

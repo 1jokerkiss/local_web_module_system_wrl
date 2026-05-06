@@ -1942,37 +1942,99 @@ async function handleUploadManagedFile(e) {
       alert(e?.message || '重置密码失败');
     }
   }
-  function buildFileTree(files) {
-    const root = { name: 'uploads', type: 'dir', children: {}, files: [] };
+function buildFileTree(files, username = currentUser?.username || '当前用户') {
+  const root = { name: '文件管理', type: 'dir', children: {}, files: [] };
 
-    (files || []).forEach((file) => {
-      const rawPath = String(file.path || file.name || '');
-      const normalized = rawPath.replace(/\\/g, '/');
-      const parts = normalized.split('/').filter(Boolean);
-      const fileName = file.name || parts[parts.length - 1] || '未命名文件';
+  root.children[username] = {
+    name: username,
+    type: 'dir',
+    children: {
+      输入文件夹: {
+        name: '输入文件夹',
+        type: 'dir',
+        children: {},
+        files: [],
+      },
+      输出文件夹: {
+        name: '输出文件夹',
+        type: 'dir',
+        children: {},
+        files: [],
+      },
+    },
+    files: [],
+  };
 
-      let usefulParts = parts;
-      const uploadIndex = parts.findIndex((part) => part === 'uploads');
-      if (uploadIndex >= 0) usefulParts = parts.slice(uploadIndex + 1);
+  const userNode = root.children[username];
 
-      if (usefulParts.length <= 1) {
-        root.files.push({ ...file, name: fileName });
-        return;
+  function addFileToNode(baseNode, file, relativeParts) {
+    let node = baseNode;
+
+    const dirParts = relativeParts.slice(0, -1);
+    dirParts.forEach((part) => {
+      if (!node.children[part]) {
+        node.children[part] = {
+          name: part,
+          type: 'dir',
+          children: {},
+          files: [],
+        };
       }
-
-      const dirParts = usefulParts.slice(0, -1);
-      let node = root;
-      dirParts.forEach((part) => {
-        if (!node.children[part]) {
-          node.children[part] = { name: part, type: 'dir', children: {}, files: [] };
-        }
-        node = node.children[part];
-      });
-      node.files.push({ ...file, name: fileName });
+      node = node.children[part];
     });
 
-    return root;
+    node.files.push(file);
   }
+
+  (files || []).forEach((file) => {
+    const rawPath = String(file.path || file.name || '');
+    const normalized = rawPath.replace(/\\/g, '/');
+    const parts = normalized.split('/').filter(Boolean);
+    const fileName = file.name || parts[parts.length - 1] || '未命名文件';
+
+    let usefulParts = parts;
+
+    const uploadsIndex = parts.findIndex((part) => part === 'uploads');
+    if (uploadsIndex >= 0) {
+      usefulParts = parts.slice(uploadsIndex + 1);
+    }
+
+    if (usefulParts[0] === username) {
+      usefulParts = usefulParts.slice(1);
+    }
+
+    let targetFolder = '输入文件夹';
+
+    if (
+      usefulParts.includes('输出文件夹') ||
+      usefulParts.includes('outputs') ||
+      usefulParts.includes('output')
+    ) {
+      targetFolder = '输出文件夹';
+    }
+
+    if (
+      usefulParts.includes('输入文件夹') ||
+      usefulParts.includes('inputs') ||
+      usefulParts.includes('input')
+    ) {
+      targetFolder = '输入文件夹';
+    }
+
+    const folderIndex = usefulParts.findIndex((part) =>
+      ['输入文件夹', '输出文件夹', 'inputs', 'input', 'outputs', 'output'].includes(part)
+    );
+
+    const relativeParts =
+      folderIndex >= 0
+        ? usefulParts.slice(folderIndex + 1)
+        : [fileName];
+
+    addFileToNode(userNode.children[targetFolder], { ...file, name: fileName }, relativeParts);
+  });
+
+  return root;
+}
 
   function clearFilePreview() {
     setPreviewFile(null);
@@ -2096,7 +2158,7 @@ async function handleUploadManagedFile(e) {
   }
 
   function renderFileManagerPanel() {
-    const fileTree = buildFileTree(userFiles);
+    const fileTree = buildFileTree(userFiles, currentUser?.username);
 
     return (
       <div style={{ ...styles.card, padding: 14, minHeight: '100%', minWidth: 0, maxWidth: '100%', overflow: 'hidden', background: '#ffffff' }}>
@@ -2104,7 +2166,6 @@ async function handleUploadManagedFile(e) {
         <input
             ref={fileInputRef}
             type="file"
-            accept=".tif,.tiff,.nc,.nc4,.cdf,.hdf,.h5"
             accept=".tif,.tiff,.nc,.nc4,.cdf,.hdf,.h5"
             style={{ display: 'none' }}
             onChange={handleUploadManagedFile}
