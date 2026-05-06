@@ -4,9 +4,12 @@ import base64
 import io
 import json
 import os
+import re
+import shutil
 import subprocess
 import tempfile
 import zipfile
+import uuid
 from pathlib import Path
 from string import Formatter
 from typing import Any, Dict, List, Optional
@@ -1039,6 +1042,17 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
         inputs["parallel_workers"] = parallel_workers
         inputs["_parallel_workers"] = parallel_workers
 
+    # 旧系统进程池逻辑：模块输入字段只要显式配置 batch_role，就按文件匹配生成多个 job，
+    # 再由 TaskManager.submit_batch_group 用 ThreadPoolExecutor 控制并发。
+    if _is_batch_request(module, inputs):
+        batch_result = _run_batch_internal(module, inputs, parallel_workers)
+        parent_task = batch_result.get("parent_task") if isinstance(batch_result, dict) else None
+        if output_syncs and isinstance(parent_task, dict) and parent_task.get("id"):
+            start_output_sync_after_task(parent_task["id"], output_syncs)
+        if isinstance(parent_task, dict):
+            return parent_task
+        return batch_result
+
     jobs = prepare_parallel_jobs(module, inputs, parallel_workers)
 
     if parallel_workers > 1 and len(jobs) > 1:
@@ -1931,6 +1945,378 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
 
     raise HTTPException(status_code=400, detail=f"不支持的并行模式: {mode}")
 
+
+
+# =========================
+# 旧系统进程池批处理逻辑：batch_role 字段 -> 多个 job -> ThreadPoolExecutor 控制并发
+# =========================
+BATCH_FILE_EXTS = {".tif", ".tiff", ".img", ".hdf", ".h5", ".nc", ".nc4", ".dat", ".json"}
+
+
+def _strip_control_only_inputs(module: dict, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """去掉只给平台调度用的字段，避免写进 exe 的 config.json。"""
+    result = dict(inputs or {})
+    for field in module.get("inputs", []) or []:
+        if bool(field.get("control_only", False)):
+            key = field.get("key")
+            if key:
+                result.pop(key, None)
+    # 平台内部字段也不写入模块 config.json。
+    for key in list(result.keys()):
+        if str(key).startswith("_"):
+            result.pop(key, None)
+    return result
+
+
+def _validate_required_inputs(module: dict, inputs: Dict[str, Any], skip_control_only: bool = True):
+    for field in module.get("inputs", []) or []:
+        key = field.get("key")
+        if not key:
+            continue
+        if skip_control_only and bool(field.get("control_only", False)):
+            continue
+        if is_output_field(field):
+            continue
+        if field.get("required", False) and inputs.get(key) in ("", None):
+            raise HTTPException(status_code=400, detail=f"缺少必填参数: {key}")
+
+
+def _is_probably_batch_field(field: dict, value: Any) -> bool:
+    """只把显式配置 batch_role 的输入字段当作批处理输入。"""
+    if not value:
+        return False
+    if bool(field.get("control_only", False)):
+        return False
+    role = str(field.get("batch_role") or "").strip()
+    if not role or role.upper() == "OUTPUT_DIR":
+        return False
+    return True
+
+
+def _get_batch_input_fields(module: dict) -> List[dict]:
+    fields = []
+    for field in module.get("inputs", []) or []:
+        if bool(field.get("control_only", False)):
+            continue
+        role = str(field.get("batch_role") or "").strip()
+        if role and role.upper() != "OUTPUT_DIR":
+            fields.append(field)
+    return fields
+
+
+def _get_output_dir_field(module: dict) -> Optional[dict]:
+    for field in module.get("inputs", []) or []:
+        key = str(field.get("key", "")).lower()
+        label = str(field.get("label", ""))
+        field_type = field.get("type")
+        role = str(field.get("batch_role") or "").strip().upper()
+        if field_type not in {"dir_path", "file_path"}:
+            continue
+        if role == "OUTPUT_DIR":
+            return field
+        if key in {"output", "out", "output_dir", "output_path", "result_dir"}:
+            return field
+        if "输出" in label:
+            return field
+    return None
+
+
+def _list_data_files(dir_path: str, field: dict | None = None) -> List[Path]:
+    p = Path(str(dir_path))
+    if not p.exists() or not p.is_dir():
+        return []
+    field = field or {}
+    include_regex = str(field.get("batch_include_regex") or "").strip()
+    exclude_regex = str(field.get("batch_exclude_regex") or "").strip()
+    include_re = re.compile(include_regex, re.IGNORECASE) if include_regex else None
+    exclude_re = re.compile(exclude_regex, re.IGNORECASE) if exclude_regex else None
+    items: List[Path] = []
+    for child in sorted(p.iterdir(), key=lambda x: x.name.lower()):
+        if not child.is_file():
+            continue
+        name = child.name
+        if name.startswith("."):
+            continue
+        lower_name = name.lower()
+        if lower_name.endswith((".tmp", ".bak", ".log", ".txt", ".xml")):
+            continue
+        if child.suffix and child.suffix.lower() not in BATCH_FILE_EXTS:
+            continue
+        if include_re and not include_re.search(name):
+            continue
+        if exclude_re and exclude_re.search(name):
+            continue
+        items.append(child.resolve())
+    return items
+
+
+def _extract_datetime_keys(stem: str) -> List[str]:
+    keys: List[str] = []
+    m = re.search(r"(20\d{6})[_-]?(\d{6})", stem)
+    if m:
+        d = m.group(1)
+        t = m.group(2)
+        keys.append(f"{d}_{t}")
+        if t.endswith("00"):
+            keys.append(f"{d}_{t[:4]}")
+    m2 = re.search(r"(20\d{6})[_-]?(\d{4})", stem)
+    if m2:
+        keys.append(f"{m2.group(1)}_{m2.group(2)}")
+    return list(dict.fromkeys(keys))
+
+
+def _normalize_stem_token(stem: str, role: str, field_key: str) -> str:
+    s = stem.upper()
+    replacements = [
+        role.upper(), field_key.upper(),
+        "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08",
+        "SOLAR", "SUN", "OUTPUT", "OUT", "FLDK", "R10", "R20", "R05",
+        "TA", "CN", "AHI", "HS", "H09", "H08",
+    ]
+    for token in replacements:
+        s = re.sub(rf"(^|[_\-.]){re.escape(token)}(?=$|[_\-.])", "_", s)
+    s = re.sub(r"20\d{6}[_-]?\d{6}", "_", s)
+    s = re.sub(r"20\d{6}[_-]?\d{4}", "_", s)
+    s = re.sub(r"[^A-Z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+
+def _candidate_keys_for_file(path: Path, role: str, field_key: str) -> List[str]:
+    stem = path.stem
+    keys = _extract_datetime_keys(stem)
+    normalized = _normalize_stem_token(stem, role, field_key)
+    if normalized:
+        keys.append(normalized)
+    if not keys:
+        keys.append(stem.upper())
+    return list(dict.fromkeys(keys))
+
+
+def _build_role_index(files: List[Path], role: str, field_key: str) -> Dict[str, List[Path]]:
+    index: Dict[str, List[Path]] = {}
+    for f in files:
+        for key in _candidate_keys_for_file(f, role, field_key):
+            index.setdefault(key, []).append(f)
+    return index
+
+
+def _pick_match_for_slot(index: Dict[str, List[Path]], slot: str, used: set[str]) -> Optional[Path]:
+    for item in index.get(slot, []):
+        if str(item) not in used:
+            return item
+    return None
+
+
+def _is_batch_request(module: dict, effective_inputs: Dict[str, Any]) -> bool:
+    for field in module.get("inputs", []) or []:
+        key = field.get("key")
+        if not key:
+            continue
+        if _is_probably_batch_field(field, effective_inputs.get(key)):
+            return True
+    return False
+
+
+def _validate_batch_inputs(module: dict, effective_inputs: Dict[str, Any]) -> Dict[str, Any]:
+    batch_fields = _get_batch_input_fields(module)
+    if not batch_fields:
+        return {"batch_mode": False, "matched_jobs": [], "missing": [], "extras": []}
+
+    role_file_lists: Dict[str, List[Path]] = {}
+    role_indexes: Dict[str, Dict[str, List[Path]]] = {}
+    used_paths_by_role: Dict[str, set[str]] = {}
+
+    for field in batch_fields:
+        key = field["key"]
+        role = field.get("batch_role") or key
+        dir_value = effective_inputs.get(key, "")
+        files = _list_data_files(str(dir_value), field)
+        if not files:
+            raise HTTPException(status_code=400, detail=f"批量目录为空或不存在: {key} -> {dir_value}")
+        role_file_lists[role] = files
+        role_indexes[role] = _build_role_index(files, role, key)
+        used_paths_by_role[role] = set()
+
+    primary_role = max(role_file_lists.keys(), key=lambda r: len(role_file_lists[r]))
+    primary_field = next(f for f in batch_fields if (f.get("batch_role") or f["key"]) == primary_role)
+
+    matched_jobs = []
+    missing = []
+
+    for primary_file in role_file_lists[primary_role]:
+        slot_candidates = _candidate_keys_for_file(primary_file, primary_role, primary_field["key"])
+        slot = slot_candidates[0]
+        role_files: Dict[str, str] = {primary_role: str(primary_file)}
+        used_paths_by_role[primary_role].add(str(primary_file))
+        local_missing = []
+
+        for field in batch_fields:
+            role = field.get("batch_role") or field["key"]
+            if role == primary_role:
+                continue
+            files = role_file_lists[role]
+            if len(files) == 1:
+                role_files[role] = str(files[0])
+                used_paths_by_role[role].add(str(files[0]))
+                continue
+            matched_path = None
+            for candidate in slot_candidates:
+                matched_path = _pick_match_for_slot(role_indexes[role], candidate, used_paths_by_role[role])
+                if matched_path:
+                    break
+            if matched_path is None:
+                local_missing.append({"slot": slot, "role": role, "expected_from": str(primary_file)})
+            else:
+                role_files[role] = str(matched_path)
+                used_paths_by_role[role].add(str(matched_path))
+
+        if local_missing:
+            missing.extend(local_missing)
+            continue
+
+        output_dir = ""
+        output_field = _get_output_dir_field(module)
+        if output_field:
+            output_dir = str(effective_inputs.get(output_field["key"], "")).strip()
+
+        matched_jobs.append({"slot": slot, "primary_file": str(primary_file), "role_files": role_files, "output_dir": output_dir})
+
+    extras = []
+    for role, files in role_file_lists.items():
+        unused = [str(f) for f in files if str(f) not in used_paths_by_role[role]]
+        if unused:
+            extras.append({"role": role, "files": unused})
+
+    return {"batch_mode": True, "primary_role": primary_role, "matched_jobs": matched_jobs, "missing": missing, "extras": extras}
+
+
+def _resolve_admin_fixed_for_job(module: dict, job_inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """确保管理员固定输入/隐藏输入在每个子任务中都是有效路径。"""
+    resolved = dict(job_inputs)
+    for field in module.get("inputs", []) or []:
+        key = field.get("key")
+        if not key:
+            continue
+        visible = field.get("visible_to_user", True) is not False
+        admin_fixed = bool(field.get("admin_fixed", False)) or not visible or field.get("path_mode") == "relative_to_module"
+        if not admin_fixed:
+            continue
+        value = resolved.get(key)
+        if value in ("", None):
+            value = field.get("default")
+        if value in ("", None):
+            continue
+        value = resolve_input_value_for_module(module, field, value)
+        if field.get("type") in {"file_path", "dir_path"}:
+            p = Path(str(value))
+            if not p.exists():
+                raise HTTPException(status_code=400, detail=f"管理员固定输入文件不存在: {key} -> {p}")
+        resolved[key] = value
+    return resolved
+
+
+def _build_single_job_inputs_from_batch(module: dict, base_inputs: Dict[str, Any], role_files: Dict[str, str], slot: str, output_dir: str) -> Dict[str, Any]:
+    """把一组匹配文件转换成一个 exe 的 config 输入。"""
+    job_inputs = dict(base_inputs)
+
+    for field in module.get("inputs", []) or []:
+        key = field.get("key")
+        role = str(field.get("batch_role") or "").strip()
+        if key and role and role.upper() != "OUTPUT_DIR" and role in role_files:
+            job_inputs[key] = role_files[role]
+
+    output_field = _get_output_dir_field(module)
+    if output_field:
+        key = output_field["key"]
+        ext = output_field.get("output_ext") or ".tif"
+        if not str(ext).startswith("."):
+            ext = "." + str(ext)
+        safe_slot = re.sub(r"[^A-Za-z0-9_\-.]+", "_", slot)
+        out_value = output_dir or job_inputs.get(key) or str(RUNTIME_DIR / "outputs")
+        out_path = Path(str(out_value))
+        # 如果模块把输出字段定义成 file_path，或用户填的是具体文件名，则使用其父目录批量生成文件。
+        if output_field.get("type") == "file_path" or out_path.suffix:
+            out_dir = out_path.parent
+        else:
+            out_dir = out_path
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # 旧系统进程池逻辑：输出字段在单个 job 里改成最终输出文件路径。
+        job_inputs[key] = str((out_dir / f"{safe_slot}{ext}").resolve())
+
+    job_inputs = _resolve_admin_fixed_for_job(module, job_inputs)
+    job_inputs = _strip_control_only_inputs(module, job_inputs)
+
+    for field in _get_batch_input_fields(module):
+        key = field.get("key")
+        if not key or key not in job_inputs:
+            continue
+        value = Path(str(job_inputs[key]))
+        if value.exists() and value.is_dir():
+            raise HTTPException(status_code=400, detail=f"批处理字段没有被拆成单文件: {key} -> {job_inputs[key]}")
+
+    return job_inputs
+
+
+
+def _format_batch_validation_error(validation: Dict[str, Any]) -> str:
+    parts = ["批量输入不匹配，请检查各输入目录中的文件名时次是否能对应。"]
+    missing = validation.get("missing") or []
+    extras = validation.get("extras") or []
+
+    if missing:
+        parts.append("缺失匹配：")
+        for idx, item in enumerate(missing[:30], start=1):
+            if isinstance(item, dict):
+                parts.append(
+                    f"{idx}. slot={item.get('slot', '-')} role={item.get('role', '-')} expected_from={item.get('expected_from', '-')}"
+                )
+            else:
+                parts.append(f"{idx}. {item}")
+        if len(missing) > 30:
+            parts.append(f"... 还有 {len(missing) - 30} 项缺失匹配")
+
+    if extras:
+        parts.append("未使用文件：")
+        for idx, item in enumerate(extras[:20], start=1):
+            if isinstance(item, dict):
+                files = item.get("files") or []
+                preview = ", ".join(str(x) for x in files[:5])
+                if len(files) > 5:
+                    preview += f", ... 还有 {len(files) - 5} 个"
+                parts.append(f"{idx}. role={item.get('role', '-')} files={preview}")
+            else:
+                parts.append(f"{idx}. {item}")
+
+    return "\n".join(parts)
+
+
+def _run_batch_internal(module: dict, effective_inputs: Dict[str, Any], parallel_workers: int) -> Dict[str, Any]:
+    validation = _validate_batch_inputs(module, effective_inputs)
+    if not validation.get("batch_mode"):
+        raise HTTPException(status_code=400, detail="该模块没有配置批处理输入字段 batch_role")
+    if validation["missing"]:
+        raise HTTPException(status_code=400, detail=_format_batch_validation_error(validation))
+
+    matched_jobs = validation.get("matched_jobs") or []
+    if not matched_jobs:
+        raise HTTPException(status_code=400, detail="没有匹配到可运行的批处理 job，请检查输入目录和文件名")
+
+    jobs: List[Dict[str, Any]] = []
+    for item in matched_jobs:
+        job_inputs = _build_single_job_inputs_from_batch(module, effective_inputs, item["role_files"], item["slot"], item.get("output_dir") or "")
+        _validate_required_inputs(module, job_inputs, skip_control_only=True)
+        command, working_dir, runtime_env = build_runtime_for_module(module, job_inputs)
+        jobs.append({"command": command, "inputs": job_inputs, "working_dir": working_dir, "env": runtime_env})
+
+    parent_task = task_manager.submit_batch_group(
+        module_id=module["id"],
+        module_name=module.get("name", module["id"]),
+        jobs=jobs,
+        max_parallel=clamp_parallel_workers(parallel_workers),
+    )
+    return {"ok": True, "batch_mode": True, "parent_task": parent_task, "parent_task_id": parent_task.get("id") if isinstance(parent_task, dict) else None, "matched_count": len(jobs), "parallel_workers": clamp_parallel_workers(parallel_workers), "extras": validation["extras"]}
+
 # =========================
 # 任务接口
 # =========================
@@ -2200,6 +2586,16 @@ def normalize_task_io_paths(module: dict, inputs: dict, username: str) -> tuple[
                     new_inputs[key] = str((final_output_dir / f"{key}{suffix}").resolve())
 
         elif is_input_path_field(field):
+            # 管理员固定输入/隐藏输入通常是模块 resources 下的文件，不能复制成用户上传输入，
+            # 否则批处理 job 里容易出现资源路径丢失或旧路径被覆盖的问题。
+            visible = field.get("visible_to_user", True) is not False
+            admin_fixed = bool(field.get("admin_fixed", False)) or not visible
+            if admin_fixed or field.get("path_mode") == "relative_to_module":
+                value = new_inputs.get(key)
+                if value not in ("", None):
+                    new_inputs[key] = resolve_input_value_for_module(module, field, value)
+                continue
+
             value = new_inputs.get(key)
             if value:
                 field_dir = input_dir / get_field_dir_name(field)

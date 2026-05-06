@@ -229,6 +229,32 @@ function isFieldVisibleToUser(field) {
   return field?.visible_to_user !== false && field?.admin_fixed !== true;
 }
 
+function isParallelWorkerField(field) {
+  const key = normalize(field?.key);
+  const label = String(field?.label || '');
+  const text = `${key} ${label}`;
+  return (
+    key === 'parallel_workers' ||
+    key === '_parallel_workers' ||
+    key === 'workers' ||
+    key === 'worker_count' ||
+    key === 'process_count' ||
+    key === 'processes' ||
+    key === 'num_processes' ||
+    key === 'n_processes' ||
+    key === 'nproc' ||
+    (text.includes('进程数') && (text.includes('并行') || text.includes('并发'))) ||
+    text.includes('parallel worker') ||
+    text.includes('parallel_workers')
+  );
+}
+
+function clampParallelWorkersValue(value) {
+  const n = Number.parseInt(String(value ?? '1').trim(), 10);
+  if (!Number.isFinite(n)) return 1;
+  return Math.max(1, Math.min(n, 64));
+}
+
 function makeEmptyInputField() {
   return {
     key: '',
@@ -1193,7 +1219,7 @@ useEffect(() => {
     setRuntimeForms((prev) => {
       if (prev[m.id]) return prev;
       const init = { task_name: m.name, _parallel_workers: 1 };
-      (m.inputs || []).filter(isFieldVisibleToUser).forEach((f) => {
+      (m.inputs || []).filter((f) => isFieldVisibleToUser(f) && !isParallelWorkerField(f)).forEach((f) => {
         init[f.key] = f.default ?? '';
       });
       return { ...prev, [m.id]: init };
@@ -1587,7 +1613,7 @@ async function handleRegister() {
       const form = runtimeForms[module.id] || {};
       const inputs = { ...form };
       const title = form.task_name || module.name;
-      const parallelWorkers = Number(form._parallel_workers || 1);
+      const parallelWorkers = clampParallelWorkersValue(form._parallel_workers);
       delete inputs.task_name;
       delete inputs._parallel_workers;
 
@@ -2249,29 +2275,39 @@ function buildFileTree(files, username = currentUser?.username || '当前用户'
             <div style={{ fontWeight: 800, color: '#173353', marginBottom: 8 }}>
               并行进程数
             </div>
-            <select
+            <input
+              type="number"
+              min="1"
+              max="64"
+              step="1"
               value={form._parallel_workers || 1}
               onChange={(e) =>
                 setRuntimeForms((prev) => ({
                   ...prev,
                   [module.id]: {
                     ...prev[module.id],
-                    _parallel_workers: Number(e.target.value),
+                    _parallel_workers: e.target.value,
+                  },
+                }))
+              }
+              onBlur={(e) =>
+                setRuntimeForms((prev) => ({
+                  ...prev,
+                  [module.id]: {
+                    ...prev[module.id],
+                    _parallel_workers: clampParallelWorkersValue(e.target.value),
                   },
                 }))
               }
               style={styles.input}
-            >
-              {[1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32].map((n) => (
-                <option key={n} value={n}>{n}</option>
-              ))}
-            </select>
+              placeholder="例如 2"
+            />
             <div style={{ marginTop: 6, color: '#6a7f96', fontSize: 13, lineHeight: 1.6 }}>
               单文件模块：输入字段可填文件夹，平台按文件拆成多个进程；文件夹遍历模块：平台把输入文件夹拆成多个临时子文件夹并行运行。
             </div>
           </label>
 
-          {(module.inputs || []).filter(isFieldVisibleToUser).map((field) => (
+          {(module.inputs || []).filter((f) => isFieldVisibleToUser(f) && !isParallelWorkerField(f)).map((field) => (
             <label key={field.key}>
               <div style={{ fontWeight: 800, color: '#173353', marginBottom: 8 }}>
                 {field.label || field.key}

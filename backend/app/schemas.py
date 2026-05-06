@@ -9,7 +9,7 @@ ParallelMode = Literal["none", "auto", "single_file", "folder_chunks", "module_i
 class ModuleInputField(BaseModel):
     key: str
     label: str
-    type: Literal["text", "textarea", "number", "file_path", "dir_path", "password"] = "text"
+    type: Literal["text", "textarea", "number", "integer", "file_path", "dir_path", "password"] = "text"
     required: bool = True
     placeholder: str = ""
     default: str | int | float | None = None
@@ -19,6 +19,8 @@ class ModuleInputField(BaseModel):
     path_mode: Literal["absolute", "relative_to_module"] = "absolute"
     batch_role: str = ""
     match_mode: str = "none"
+    output_ext: str = ".tif"
+    control_only: bool = False
 
     model_config = ConfigDict(extra="allow")
 
@@ -70,7 +72,7 @@ class TaskInfo(BaseModel):
     id: str
     module_id: str
     module_name: str
-    kind: Literal["module", "workflow", "parallel"] = "module"
+    kind: Literal["module", "workflow", "parallel", "batch_parent"] = "module"
     status: Literal["queued", "running", "success", "failed", "cancelled"] = "queued"
     created_at: str | None = None
     started_at: str | None = None

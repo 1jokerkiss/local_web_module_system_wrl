@@ -1,5 +1,53 @@
 const API_BASE = '';
 
+
+function formatApiErrorDetail(detail, fallback) {
+  if (detail == null || detail === '') return fallback;
+  if (typeof detail === 'string') return detail;
+
+  if (typeof detail === 'object') {
+    const parts = [];
+    if (detail.message) parts.push(String(detail.message));
+
+    if (Array.isArray(detail.missing) && detail.missing.length) {
+      parts.push('缺失匹配：');
+      detail.missing.slice(0, 20).forEach((item, idx) => {
+        if (typeof item === 'object' && item) {
+          parts.push(
+            `${idx + 1}. slot=${item.slot || '-'} role=${item.role || '-'} expected_from=${item.expected_from || '-'}`
+          );
+        } else {
+          parts.push(`${idx + 1}. ${String(item)}`);
+        }
+      });
+      if (detail.missing.length > 20) parts.push(`... 还有 ${detail.missing.length - 20} 项`);
+    }
+
+    if (Array.isArray(detail.extras) && detail.extras.length) {
+      parts.push('未使用文件：');
+      detail.extras.slice(0, 10).forEach((item, idx) => {
+        if (typeof item === 'object' && item) {
+          const files = Array.isArray(item.files) ? item.files.slice(0, 5).join(', ') : '';
+          parts.push(`${idx + 1}. role=${item.role || '-'} files=${files}`);
+        } else {
+          parts.push(`${idx + 1}. ${String(item)}`);
+        }
+      });
+      if (detail.extras.length > 10) parts.push(`... 还有 ${detail.extras.length - 10} 项`);
+    }
+
+    if (parts.length) return parts.join('\n');
+
+    try {
+      return JSON.stringify(detail, null, 2);
+    } catch {
+      return String(detail);
+    }
+  }
+
+  return String(detail);
+}
+
 function getToken() {
   return localStorage.getItem('token') || '';
 }
@@ -40,7 +88,7 @@ async function requestBlob(url, options = {}) {
     let msg = `请求失败: ${resp.status}`;
     try {
       const data = await resp.json();
-      msg = data.detail || msg;
+      msg = formatApiErrorDetail(data.detail, msg);
     } catch {}
     throw new Error(msg);
   }
@@ -71,7 +119,7 @@ async function request(url, options = {}) {
     let msg = `请求失败: ${resp.status}`;
     try {
       const data = await resp.json();
-      msg = data.detail || msg;
+      msg = formatApiErrorDetail(data.detail, msg);
     } catch {}
     throw new Error(msg);
   }
