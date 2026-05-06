@@ -1952,6 +1952,32 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
 # =========================
 BATCH_FILE_EXTS = {".tif", ".tiff", ".img", ".hdf", ".h5", ".nc", ".nc4", ".dat", ".json"}
 
+SHARED_BATCH_MATCH_MODES = {
+    "first",
+    "shared",
+    "fixed",
+    "constant",
+    "single",
+    "reuse_first",
+    "all_jobs",
+}
+
+
+def _is_shared_batch_field(field: dict) -> bool:
+    """批处理字段是否作为所有 job 共用输入。
+
+    用途：
+    - 正常批处理：B01/B03/B06/SOLAR 都按 timeslot 匹配。
+    - 临时测试：如果某个字段暂时没有对应时次文件，可把该字段 match_mode 改成 first/shared，
+      平台会取该目录下第一个文件给所有 job 共用，不再按时次匹配。
+    """
+    mode = str(field.get("match_mode") or "").strip().lower()
+    if mode in SHARED_BATCH_MATCH_MODES:
+        return True
+    if field.get("shared_across_jobs") is True:
+        return True
+    return False
+
 
 def _strip_control_only_inputs(module: dict, inputs: Dict[str, Any]) -> Dict[str, Any]:
     """去掉只给平台调度用的字段，避免写进 exe 的 config.json。"""
@@ -2125,6 +2151,7 @@ def _validate_batch_inputs(module: dict, effective_inputs: Dict[str, Any]) -> Di
 
     role_file_lists: Dict[str, List[Path]] = {}
     role_indexes: Dict[str, Dict[str, List[Path]]] = {}
+    role_fields: Dict[str, dict] = {}
     used_paths_by_role: Dict[str, set[str]] = {}
 
     for field in batch_fields:
@@ -2136,9 +2163,18 @@ def _validate_batch_inputs(module: dict, effective_inputs: Dict[str, Any]) -> Di
             raise HTTPException(status_code=400, detail=f"批量目录为空或不存在: {key} -> {dir_value}")
         role_file_lists[role] = files
         role_indexes[role] = _build_role_index(files, role, key)
+        role_fields[role] = field
         used_paths_by_role[role] = set()
 
-    primary_role = max(role_file_lists.keys(), key=lambda r: len(role_file_lists[r]))
+    # 主时次字段不能选 first/shared 这种共用字段，否则会被 SOLAR 之类临时共用文件反过来驱动 job 数。
+    primary_candidates = [
+        role for role in role_file_lists.keys()
+        if not _is_shared_batch_field(role_fields.get(role, {}))
+    ]
+    if not primary_candidates:
+        primary_candidates = list(role_file_lists.keys())
+
+    primary_role = max(primary_candidates, key=lambda r: len(role_file_lists[r]))
     primary_field = next(f for f in batch_fields if (f.get("batch_role") or f["key"]) == primary_role)
 
     matched_jobs = []
@@ -2156,6 +2192,14 @@ def _validate_batch_inputs(module: dict, effective_inputs: Dict[str, Any]) -> Di
             if role == primary_role:
                 continue
             files = role_file_lists[role]
+
+            # match_mode=first/shared：该字段不按时次匹配，取目录下第一个文件给所有 job 共用。
+            # 适合临时测试没有对应时次 SOLAR 文件的情况；正式生产建议改回 timeslot。
+            if _is_shared_batch_field(field):
+                role_files[role] = str(files[0])
+                used_paths_by_role[role].add(str(files[0]))
+                continue
+
             if len(files) == 1:
                 role_files[role] = str(files[0])
                 used_paths_by_role[role].add(str(files[0]))
@@ -2260,7 +2304,7 @@ def _build_single_job_inputs_from_batch(module: dict, base_inputs: Dict[str, Any
 
 
 def _format_batch_validation_error(validation: Dict[str, Any]) -> str:
-    parts = ["批量输入不匹配，请检查各输入目录中的文件名时次是否能对应。"]
+    parts = ["批量输入不匹配，请检查各输入目录中的文件名时次是否能对应。", "如果某个字段是临时共用文件，可在模块输入字段 JSON 中把该字段 match_mode 改成 first 或 shared。"]
     missing = validation.get("missing") or []
     extras = validation.get("extras") or []
 
