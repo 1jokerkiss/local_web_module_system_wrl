@@ -2105,6 +2105,7 @@ async function handleUploadManagedFile(e) {
             ref={fileInputRef}
             type="file"
             accept=".tif,.tiff,.nc,.nc4,.cdf,.hdf,.h5"
+            accept=".tif,.tiff,.nc,.nc4,.cdf,.hdf,.h5"
             style={{ display: 'none' }}
             onChange={handleUploadManagedFile}
           />
