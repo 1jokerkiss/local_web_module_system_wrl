@@ -34,6 +34,10 @@ import {
   setAuthToken,
   clearAuthToken,
   getAuthToken,
+    listDataFiles,
+  previewDataFile,
+  revealDataFile,
+  deleteDataFile,
 } from './api';
 
 
@@ -1099,6 +1103,9 @@ export default function App() {
   const [tasks, setTasks] = useState([]);
   const [users, setUsers] = useState([]);
   const [toolbars, setToolbars] = useState(DEFAULT_TOOLBARS);
+  const [dataFiles, setDataFiles] = useState([]);
+  const [dataPreview, setDataPreview] = useState(null);
+  const [dataPreviewLoading, setDataPreviewLoading] = useState(false);
 
   const [activeTab, setActiveTab] = useState(() => getSavedActiveTab() || 'tool:cloud');
   const [activeModuleByTool, setActiveModuleByTool] = useState({});
@@ -1157,6 +1164,7 @@ export default function App() {
       arr.push({ key: 'user_mgmt', label: '用户管理' });
     }
     visibleToolbars.forEach((t) => arr.push({ key: `tool:${t.key}`, label: t.label }));
+    arr.push({ key: 'data_mgmt', label: '数据管理' });
     arr.push({ key: 'tasks', label: '任务列表' });
     return arr;
   }, [isAdmin, visibleToolbars]);
@@ -1170,11 +1178,14 @@ export default function App() {
         setCurrentUser(me);
         setActiveTab(getSavedActiveTab() || 'tool:cloud');
 
-        const [toolbarList, mods, taskList] = await Promise.all([
+        const [toolbarList, mods, taskList, dataList] = await Promise.all([
           getToolbars(),
           me.role === 'admin' ? getAdminModules() : getModules(),
           getTasks(),
+          listDataFiles(),
         ]);
+
+        setDataFiles(Array.isArray(dataList) ? dataList : []);
         setToolbars(Array.isArray(toolbarList) ? toolbarList : DEFAULT_TOOLBARS);
         setModules(Array.isArray(mods) ? mods : []);
         setTasks(Array.isArray(taskList) ? taskList : []);
@@ -1289,6 +1300,7 @@ useEffect(() => {
       try {
         const latestTasks = await getTasks();
         setTasks(Array.isArray(latestTasks) ? latestTasks : []);
+        await refreshDataFiles();
 
         for (const w of windows) {
           if (!w.taskId) continue;
@@ -1319,14 +1331,17 @@ useEffect(() => {
       setActiveTab('tool:cloud');
       saveActiveTab('tool:cloud');
 
-      const [toolbarList, mods, taskList] = await Promise.all([
+      const [toolbarList, mods, taskList, dataList] = await Promise.all([
         getToolbars(),
         data.user.role === 'admin' ? getAdminModules() : getModules(),
         getTasks(),
+        listDataFiles(),
       ]);
+
       setToolbars(Array.isArray(toolbarList) ? toolbarList : DEFAULT_TOOLBARS);
       setModules(Array.isArray(mods) ? mods : []);
       setTasks(Array.isArray(taskList) ? taskList : []);
+      setDataFiles(Array.isArray(dataList) ? dataList : []);
 
       if (data.user.role === 'admin') {
         const [userList, drop] = await Promise.all([getUsers(), listDropZips().catch(() => null)]);
@@ -1452,6 +1467,10 @@ async function handleRegister() {
     const list = await getTasks();
     setTasks(Array.isArray(list) ? list : []);
   }
+  async function refreshDataFiles() {
+    const list = await listDataFiles();
+    setDataFiles(Array.isArray(list) ? list : []);
+  }
 
   function addTaskWindow(task, title) {
     zRef.current += 1;
@@ -1500,6 +1519,8 @@ async function handleRegister() {
       setTasks((prev) => prev.filter((t) => t.id !== taskId));
       const latestTasks = await getTasks();
       setTasks(Array.isArray(latestTasks) ? latestTasks : []);
+      await refreshTasks();
+      await refreshDataFiles();
     } catch (e) {
       alert(e?.message || '删除失败');
     }
@@ -2219,7 +2240,143 @@ async function handleRegister() {
       </section>
     );
   }
+function renderDataManagementPage() {
+  async function handlePreview(file) {
+    try {
+      setDataPreviewLoading(true);
+      const data = await previewDataFile(file.id);
+      setDataPreview(data);
+      } catch (e) {
+      alert(e?.message || '预览失败');
+      } finally {
+        setDataPreviewLoading(false);
+      }
+  }
 
+  async function handleReveal(file) {
+    try {
+      await revealDataFile(file.id);
+    } catch (e) {
+      alert(e?.message || '打开文件所在位置失败');
+    }
+  }
+
+  async function handleDelete(file) {
+    if (!window.confirm(`确定删除文件：${file.name} 吗？`)) return;
+
+    try {
+      await deleteDataFile(file.id);
+      await refreshDataFiles();
+    } catch (e) {
+      alert(e?.message || '删除失败');
+    }
+  }
+
+  return (
+    <section style={{ ...styles.card, padding: 18, minHeight: 'calc(100vh - 98px)' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+        <div>
+          <div style={{ fontSize: 26, fontWeight: 900, color: '#12385f' }}>数据管理</div>
+          <div style={{ color: '#6a7f96', marginTop: 6 }}>
+            展示模块输出结果文件的信息；文件仍保留在原始输出路径，不会被移动。
+          </div>
+        </div>
+
+        <button style={styles.whiteBtn} onClick={refreshDataFiles}>
+          刷新
+        </button>
+      </div>
+
+      <div style={{ overflow: 'auto', background: '#fff', borderRadius: 12, border: '1px solid #e1eaf3' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 980 }}>
+          <thead>
+            <tr>
+              <th style={thStyle}>文件ID</th>
+              <th style={thStyle}>文件类型</th>
+              <th style={thStyle}>所属模块</th>
+              <th style={thStyle}>文件大小</th>
+              <th style={thStyle}>创建时间</th>
+              <th style={thStyle}>本地路径</th>
+              <th style={thStyle}>操作</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {dataFiles.length === 0 && (
+              <tr>
+                <td style={tdStyle} colSpan={7}>
+                  暂无输出结果文件。运行模块后，系统会自动登记输出路径下的文件。
+                </td>
+              </tr>
+            )}
+
+            {dataFiles.map((file) => (
+              <tr key={`${file.id}_${file.path}`}>
+                <td style={tdStyle}>{file.id}</td>
+                <td style={tdStyle}>{file.file_type}</td>
+                <td style={tdStyle}>{file.module_name || file.module_id}</td>
+                <td style={tdStyle}>{file.size_text || file.size}</td>
+                <td style={tdStyle}>{file.created_at || '-'}</td>
+                <td style={{ ...tdStyle, maxWidth: 420, wordBreak: 'break-all' }}>
+                  {file.path}
+                </td>
+                <td style={tdStyle}>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <button style={styles.whiteBtn} onClick={() => handlePreview(file)}>
+                      预览
+                    </button>
+                    <button style={styles.whiteBtn} onClick={() => handleReveal(file)}>
+                      打开位置
+                    </button>
+                    <button style={styles.redBtn} onClick={() => handleDelete(file)}>
+                      删除
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {dataPreview && (
+        <SimpleOverlay
+          title={`文件预览：${dataPreview.name || ''}`}
+          onClose={() => setDataPreview(null)}
+          width="min(1100px, 96vw)"
+        >
+          {dataPreviewLoading && <div>加载中...</div>}
+
+          {dataPreview.type === 'image' && dataPreview.data_url ? (
+            <div>
+              <div style={{ marginBottom: 12, color: '#6a7f96', wordBreak: 'break-all' }}>
+                {dataPreview.path}
+              </div>
+              <img
+                src={dataPreview.data_url}
+                alt={dataPreview.name}
+                style={{
+                  maxWidth: '100%',
+                  maxHeight: '75vh',
+                  borderRadius: 12,
+                  border: '1px solid #d8e3f0',
+                  background: '#fff',
+                }}
+              />
+            </div>
+          ) : (
+            <div style={{ lineHeight: 1.8 }}>
+              <div>{dataPreview.message || '该文件暂不支持在线预览'}</div>
+              <div style={{ color: '#6a7f96', wordBreak: 'break-all', marginTop: 8 }}>
+                {dataPreview.path}
+              </div>
+            </div>
+          )}
+        </SimpleOverlay>
+      )}
+    </section>
+  );
+}
   if (!currentUser) {
     return (
       <>
@@ -2469,6 +2626,7 @@ async function handleRegister() {
           </section>
         )}
         {activeTab.startsWith('tool:') && renderToolPage(activeTab.slice('tool:'.length))}
+        {activeTab === 'data_mgmt' && renderDataManagementPage()}
         {activeTab === 'tasks' && (
           <section style={{ ...styles.card, padding: 18, minHeight: 'calc(100vh - 98px)' }}>
             <div style={{ fontSize: 28, fontWeight: 900, color: '#0b2d51', marginBottom: 16 }}>任务列表</div>

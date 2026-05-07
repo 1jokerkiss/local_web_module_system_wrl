@@ -1,14 +1,12 @@
 from __future__ import annotations
-import shutil
+import sys
 import base64
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
 import zipfile
-import uuid
 from pathlib import Path
 from string import Formatter
 from typing import Any, Dict, List, Optional
@@ -45,6 +43,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 MODULES_FILE = DATA_DIR / "modules.json"
 TASKS_FILE = DATA_DIR / "tasks.json"
 TOOLBARS_FILE = DATA_DIR / "toolbars.json"
+DATA_FILES_FILE = DATA_DIR / "data_files.json"
 
 INSTALLED_MODULES_DIR = BASE_DIR / "installed_modules"
 INSTALLED_MODULES_DIR.mkdir(parents=True, exist_ok=True)
@@ -580,7 +579,6 @@ def _colorize_gray(gray):
 def _clean_cli_text(value: str) -> str:
     return (value or "").strip().replace("\r", " ").replace("\n", " ")
 
-
 def _find_gdal_command(command_name: str) -> str:
     """查找系统 GDAL 命令。Windows 下 gdalinfo 可用但 Python 没装 osgeo 时会走这里。"""
     candidate = shutil.which(command_name)
@@ -593,7 +591,6 @@ def _find_gdal_command(command_name: str) -> str:
             f"需要把 GDAL 命令行工具加入 PATH，或给后端 Python 安装 GDAL/osgeo。"
         ),
     )
-
 
 def _run_gdal_cli(args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
     try:
@@ -644,8 +641,6 @@ def _read_tif_meta_with_gdalinfo_cli(tif_path: Path) -> dict:
         return meta
     except Exception as exc:
         return {"gdalinfo_error": str(exc)}
-
-
 def _render_tif_with_gdal_cli(tif_path: Path, meta: dict[str, Any] | None = None) -> dict:
     """
     Python 环境没有 osgeo 时，调用系统 gdal_translate 把 GeoTIFF 转成 PNG。
@@ -756,6 +751,8 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
         inputs["parallel_workers"] = parallel_workers
         inputs["_parallel_workers"] = parallel_workers
 
+    output_paths = collect_output_paths_from_inputs(module, inputs)
+
     command, working_dir, runtime_env = build_runtime_for_module(module, inputs)
 
     task = task_manager.submit_module_task(
@@ -766,6 +763,9 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
         working_dir=working_dir,
         env=runtime_env,
     )
+
+    if output_paths:
+        start_data_file_scan_after_task(task["id"], module, output_paths)
 
     return task
 def upsert_module(module_data: dict):
@@ -849,7 +849,6 @@ def merge_admin_fixed_inputs(module: dict, inputs: Dict[str, Any]) -> Dict[str, 
         else:
             merged[key] = resolve_input_value_for_module(module, field, merged.get(key))
     return merged
-
 
 def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list[str], str, dict]:
     import os
@@ -992,7 +991,6 @@ def install_uploaded_zip(zip_path: Path, tool_type: str | None = None) -> dict:
         return module_data
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
-
 
 # =========================
 # 认证接口
@@ -1632,6 +1630,315 @@ def is_output_field(field: dict) -> bool:
     ]
 
     return any(k in key or k in label for k in output_keywords)
+def ensure_data_files_file():
+    if not DATA_FILES_FILE.exists():
+        DATA_FILES_FILE.write_text("[]", encoding="utf-8")
+
+
+def load_data_files() -> list[dict]:
+    ensure_data_files_file()
+    try:
+        data = json.loads(DATA_FILES_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_data_files(items: list[dict]):
+    DATA_FILES_FILE.write_text(
+        json.dumps(items, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def get_file_type(path: Path) -> str:
+    suffix = path.suffix.lower().lstrip(".")
+    return suffix or "unknown"
+
+
+def format_file_size(size: int) -> str:
+    size = int(size or 0)
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.2f} KB"
+    if size < 1024 * 1024 * 1024:
+        return f"{size / 1024 / 1024:.2f} MB"
+    return f"{size / 1024 / 1024 / 1024:.2f} GB"
+
+
+def collect_output_paths_from_inputs(module: dict, inputs: dict) -> list[Path]:
+    """
+    从模块输入参数里找出输出路径。
+    只记录路径，不移动文件。
+    """
+    paths: list[Path] = []
+
+    for field in module.get("inputs", []) or []:
+        key = field.get("key")
+        if not key:
+            continue
+
+        if not is_output_field(field):
+            continue
+
+        value = str(inputs.get(key) or "").strip()
+        if not value:
+            continue
+
+        paths.append(Path(value))
+
+    return paths
+
+
+def scan_output_files(output_paths: list[Path]) -> list[Path]:
+    """
+    扫描输出路径下的真实文件。
+    - 如果输出路径是文件：记录这个文件
+    - 如果输出路径是文件夹：递归记录文件夹下的文件
+    """
+    files: list[Path] = []
+    seen = set()
+
+    for raw_path in output_paths:
+        p = Path(raw_path)
+
+        if p.is_file():
+            rp = p.resolve()
+            if rp not in seen:
+                seen.add(rp)
+                files.append(rp)
+
+        elif p.is_dir():
+            for item in p.rglob("*"):
+                if item.is_file():
+                    rp = item.resolve()
+                    if rp not in seen:
+                        seen.add(rp)
+                        files.append(rp)
+
+    files.sort(key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True)
+    return files
+
+
+def upsert_data_files_from_outputs(
+    module: dict,
+    task_id: str,
+    output_paths: list[Path],
+):
+    """
+    把任务输出结果登记到 data_files.json。
+    只登记信息，不移动文件。
+    """
+    existing = load_data_files()
+    by_path = {str(item.get("path") or ""): item for item in existing}
+
+    files = scan_output_files(output_paths)
+
+    for file_path in files:
+        if not file_path.exists() or not file_path.is_file():
+            continue
+
+        stat = file_path.stat()
+        path_text = str(file_path.resolve())
+
+        old = by_path.get(path_text) or {}
+
+        by_path[path_text] = {
+            **old,
+            "path": path_text,
+            "name": file_path.name,
+            "file_type": get_file_type(file_path),
+            "module_id": module.get("id", ""),
+            "module_name": module.get("name") or module.get("id", ""),
+            "task_id": task_id,
+            "size": stat.st_size,
+            "size_text": format_file_size(stat.st_size),
+            "created_at": datetime.fromtimestamp(stat.st_ctime).isoformat(timespec="seconds"),
+            "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+        }
+
+    items = list(by_path.values())
+    items.sort(key=lambda x: x.get("modified_at", ""), reverse=True)
+
+    for idx, item in enumerate(items):
+        item["id"] = idx
+
+    save_data_files(items)
+    return items
+
+
+def start_data_file_scan_after_task(task_id: str, module: dict, output_paths: list[Path]):
+    """
+    任务结束后扫描输出路径，将结果登记到数据管理。
+    """
+    import threading
+    import time
+
+    terminal_statuses = {"success", "failed", "cancelled"}
+
+    def worker():
+        while True:
+            task = task_manager.get_task(task_id)
+            if not task:
+                return
+
+            status = task.get("status")
+            if status in terminal_statuses:
+                if status != "cancelled":
+                    try:
+                        upsert_data_files_from_outputs(
+                            module=module,
+                            task_id=task_id,
+                            output_paths=output_paths,
+                        )
+                        try:
+                            task_manager.append_log(task_id, "[DATA] 输出结果已登记到数据管理")
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        try:
+                            task_manager.append_log(task_id, f"[DATA-ERROR] 数据管理登记失败: {repr(exc)}")
+                        except Exception:
+                            pass
+                return
+
+            time.sleep(2)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+# =========================
+# 数据管理接口
+# =========================
+@app.get("/api/data/files")
+def api_list_data_files(authorization: str | None = Header(default=None)):
+    get_current_user(authorization)
+    items = load_data_files()
+
+    # 过滤掉已经不存在的文件
+    cleaned = []
+    for item in items:
+        path = Path(str(item.get("path") or ""))
+        if path.exists() and path.is_file():
+            try:
+                stat = path.stat()
+                item["size"] = stat.st_size
+                item["size_text"] = format_file_size(stat.st_size)
+                item["modified_at"] = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+            except Exception:
+                pass
+            cleaned.append(item)
+
+    cleaned.sort(key=lambda x: x.get("modified_at", ""), reverse=True)
+    for idx, item in enumerate(cleaned):
+        item["id"] = idx
+
+    save_data_files(cleaned)
+    return cleaned
+
+
+@app.post("/api/data/files/{file_id}/reveal")
+def api_reveal_data_file(file_id: int, authorization: str | None = Header(default=None)):
+    get_current_user(authorization)
+
+    items = load_data_files()
+    if file_id < 0 or file_id >= len(items):
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    path = Path(str(items[file_id].get("path") or ""))
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    folder = path.parent
+
+    try:
+        if os.name == "nt":
+            os.startfile(str(folder))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(folder)])
+        else:
+            subprocess.Popen(["xdg-open", str(folder)])
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"打开文件所在位置失败: {exc}")
+
+    return {"ok": True}
+
+
+@app.delete("/api/data/files/{file_id}")
+def api_delete_data_file(file_id: int, authorization: str | None = Header(default=None)):
+    get_current_user(authorization)
+
+    items = load_data_files()
+    if file_id < 0 or file_id >= len(items):
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    item = items[file_id]
+    path = Path(str(item.get("path") or ""))
+
+    if path.exists() and path.is_file():
+        try:
+            path.unlink()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"删除文件失败: {exc}")
+
+    items.pop(file_id)
+    for idx, row in enumerate(items):
+        row["id"] = idx
+
+    save_data_files(items)
+    return {"ok": True}
+
+
+@app.get("/api/data/files/{file_id}/preview")
+def api_preview_data_file(file_id: int, authorization: str | None = Header(default=None)):
+    get_current_user(authorization)
+
+    items = load_data_files()
+    if file_id < 0 or file_id >= len(items):
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    item = items[file_id]
+    path = Path(str(item.get("path") or ""))
+
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    suffix = path.suffix.lower()
+
+    if suffix in {".tif", ".tiff"}:
+        result = _render_tif_with_gdal_cli(path)
+        return {
+            "type": "image",
+            "name": path.name,
+            "path": str(path.resolve()),
+            "data_url": _png_data_url(result["png"]),
+            "meta": result.get("meta", {}),
+        }
+
+    if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}:
+        data = path.read_bytes()
+        mime = "image/png"
+        if suffix in {".jpg", ".jpeg"}:
+            mime = "image/jpeg"
+        elif suffix == ".gif":
+            mime = "image/gif"
+        elif suffix == ".webp":
+            mime = "image/webp"
+        encoded = base64.b64encode(data).decode("ascii")
+        return {
+            "type": "image",
+            "name": path.name,
+            "path": str(path.resolve()),
+            "data_url": f"data:{mime};base64,{encoded}",
+            "meta": {},
+        }
+
+    return {
+        "type": "file",
+        "name": path.name,
+        "path": str(path.resolve()),
+        "message": "该文件类型暂不支持在线预览",
+    }
 # =========================
 # 本地文件对话框接口
 # =========================

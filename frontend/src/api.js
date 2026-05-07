@@ -340,3 +340,23 @@ export async function getUserFilePreviewData(filename) {
 export async function getUserFilePreviewUrl(filename) {
   return getUserFilePreviewData(filename);
 }
+
+export async function listDataFiles() {
+  return request('/api/data/files');
+}
+
+export async function previewDataFile(fileId) {
+  return request(`/api/data/files/${encodeURIComponent(fileId)}/preview`);
+}
+
+export async function revealDataFile(fileId) {
+  return request(`/api/data/files/${encodeURIComponent(fileId)}/reveal`, {
+    method: 'POST',
+  });
+}
+
+export async function deleteDataFile(fileId) {
+  return request(`/api/data/files/${encodeURIComponent(fileId)}`, {
+    method: 'DELETE',
+  });
+}
