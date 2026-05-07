@@ -15,19 +15,41 @@
         "key": "file",
         "label": "NC文件目录",
         "type": "dir_path",
-        "required": true
+        "required": true,
+        "io_role": "input",
+        "data_role": "input",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "",
+        "match_mode": "none"
       },
       {
         "key": "cm_files",
         "label": "CM文件目录",
         "type": "dir_path",
-        "required": true
+        "required": true,
+        "io_role": "input",
+        "data_role": "input",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "",
+        "match_mode": "none"
       },
       {
         "key": "outpath",
         "label": "输出目录",
         "type": "dir_path",
-        "required": true
+        "required": true,
+        "io_role": "output",
+        "data_role": "output",
+        "output_ext": ".tif",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "",
+        "match_mode": "none"
       }
     ],
     "tags": [
@@ -40,11 +62,12 @@
     "tool_type": "cloud",
     "enabled": true,
     "parallel": {
-      "mode": "folder_chunks",
+      "mode": "module_internal",
       "input_key": "",
       "output_key": "",
-      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
-      "output_suffix": ".tif"
+      "file_patterns": "*.tif;*.tiff;*.nc;*.nc4;*.hdf;*.h5",
+      "output_suffix": ".tif",
+      "output_naming": "source_stem"
     }
   },
   {
@@ -71,7 +94,10 @@
         "admin_fixed": false,
         "path_mode": "absolute",
         "batch_role": "B01",
-        "match_mode": "timeslot"
+        "match_mode": "timeslot",
+        "io_role": "input",
+        "data_role": "input",
+        "file_patterns": "*.tif;*.tiff;*.nc;*.nc4;*.hdf;*.h5"
       },
       {
         "key": "B03_file",
@@ -85,7 +111,10 @@
         "admin_fixed": false,
         "path_mode": "absolute",
         "batch_role": "B03",
-        "match_mode": "timeslot"
+        "match_mode": "timeslot",
+        "io_role": "input",
+        "data_role": "input",
+        "file_patterns": "*.tif;*.tiff;*.nc;*.nc4;*.hdf;*.h5"
       },
       {
         "key": "B06_file",
@@ -99,7 +128,10 @@
         "admin_fixed": false,
         "path_mode": "absolute",
         "batch_role": "B06",
-        "match_mode": "timeslot"
+        "match_mode": "timeslot",
+        "io_role": "input",
+        "data_role": "input",
+        "file_patterns": "*.tif;*.tiff;*.nc;*.nc4;*.hdf;*.h5"
       },
       {
         "key": "SOLAR_file",
@@ -113,7 +145,10 @@
         "admin_fixed": false,
         "path_mode": "absolute",
         "batch_role": "SOLAR",
-        "match_mode": "first"
+        "match_mode": "first",
+        "io_role": "input",
+        "data_role": "input",
+        "file_patterns": "*.tif;*.tiff;*.nc;*.nc4;*.hdf;*.h5"
       },
       {
         "key": "GEO1_file",
@@ -127,7 +162,9 @@
         "admin_fixed": true,
         "path_mode": "relative_to_module",
         "batch_role": "",
-        "match_mode": "none"
+        "match_mode": "none",
+        "io_role": "input",
+        "data_role": "input"
       },
       {
         "key": "al_igbp",
@@ -141,7 +178,9 @@
         "admin_fixed": true,
         "path_mode": "relative_to_module",
         "batch_role": "",
-        "match_mode": "none"
+        "match_mode": "none",
+        "io_role": "input",
+        "data_role": "input"
       },
       {
         "key": "al_lut",
@@ -155,7 +194,9 @@
         "admin_fixed": true,
         "path_mode": "relative_to_module",
         "batch_role": "",
-        "match_mode": "none"
+        "match_mode": "none",
+        "io_role": "input",
+        "data_role": "input"
       },
       {
         "key": "al_dem",
@@ -169,7 +210,9 @@
         "admin_fixed": true,
         "path_mode": "relative_to_module",
         "batch_role": "",
-        "match_mode": "none"
+        "match_mode": "none",
+        "io_role": "input",
+        "data_role": "input"
       },
       {
         "key": "output",
@@ -184,7 +227,10 @@
         "path_mode": "absolute",
         "batch_role": "",
         "match_mode": "none",
-        "output_ext": ".tif"
+        "output_ext": ".tif",
+        "io_role": "output",
+        "data_role": "output",
+        "output_naming": "source_stem"
       },
       {
         "key": "parallel_workers",
@@ -199,7 +245,9 @@
         "path_mode": "absolute",
         "batch_role": "",
         "match_mode": "none",
-        "control_only": true
+        "control_only": true,
+        "io_role": "input",
+        "data_role": "input"
       }
     ],
     "tags": [
@@ -213,8 +261,9 @@
       "mode": "single_file",
       "input_key": "",
       "output_key": "",
-      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
-      "output_suffix": ".tif"
+      "file_patterns": "*.tif;*.tiff;*.nc;*.nc4;*.hdf;*.h5",
+      "output_suffix": ".tif",
+      "output_naming": "source_stem"
     },
     "enabled": true
   },
@@ -235,13 +284,28 @@
         "key": "file",
         "label": "输入文件目录",
         "type": "dir_path",
-        "required": true
+        "required": true,
+        "io_role": "input",
+        "data_role": "input",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "",
+        "match_mode": "none"
       },
       {
         "key": "cm_files",
         "label": "输出文件目录",
         "type": "dir_path",
-        "required": true
+        "required": true,
+        "io_role": "output",
+        "data_role": "output",
+        "output_ext": ".tif",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "",
+        "match_mode": "none"
       }
     ],
     "tags": [
@@ -253,11 +317,102 @@
     "enabled": true,
     "tool_type": "cloud",
     "parallel": {
+      "mode": "module_internal",
+      "input_key": "",
+      "output_key": "",
+      "file_patterns": "*.tif;*.tiff;*.nc;*.nc4;*.hdf;*.h5",
+      "output_suffix": ".tif",
+      "output_naming": "source_stem"
+    }
+  },
+  {
+    "id": "parasol_aod",
+    "name": "PARASOL AOD 反演",
+    "description": "PARASOL AOD 本地原生模块。用户选择 PARASOL 输入文件目录和输出目录，管理员固定配置 XML、LUT 和 IGBP 资源。",
+    "runtime": "native",
+    "entry": "ParasolAOD.exe",
+    "executable": "D:\\local_web_module_system_wrl\\backend\\installed_modules\\parasol_aod\\ParasolAOD.exe",
+    "working_dir": "D:\\local_web_module_system_wrl\\backend\\installed_modules\\parasol_aod",
+    "config_mode": "none",
+    "dependency_dirs": [
+      "deps"
+    ],
+    "command_template": [
+      "{executable}",
+      "{input_file}",
+      "{output_dir}",
+      "{config_xml}"
+    ],
+    "parallel": {
       "mode": "auto",
       "input_key": "",
       "output_key": "",
-      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
-      "output_suffix": ".tif"
-    }
+      "file_patterns": "*",
+      "output_suffix": ".tif",
+      "output_naming": "source_stem"
+    },
+    "tags": [
+      "parasol",
+      "aod",
+      "remote-sensing",
+      "native"
+    ],
+    "enabled": true,
+    "inputs": [
+      {
+        "key": "input_file",
+        "label": "PARASOL 输入文件目录",
+        "type": "dir_path",
+        "required": true,
+        "placeholder": "请选择 PARASOL Level-1 输入文件所在目录",
+        "default": "",
+        "help_text": "选择一个目录，平台会把目录中的输入文件拆成多个 job 并行运行。",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "parasol",
+        "match_mode": "each_file",
+        "io_role": "input",
+        "data_role": "input",
+        "file_patterns": "*",
+        "batch_allow_no_extension": true,
+        "batch_allow_all_files": true
+      },
+      {
+        "key": "output_dir",
+        "label": "输出目录",
+        "type": "dir_path",
+        "required": true,
+        "placeholder": "请选择输出目录",
+        "default": "",
+        "help_text": "程序会在该目录下生成输出文件。",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "",
+        "match_mode": "none",
+        "output_ext": ".tif",
+        "io_role": "output",
+        "data_role": "output",
+        "output_naming": "source_stem"
+      },
+      {
+        "key": "config_xml",
+        "label": "PARASOL 配置 XML",
+        "type": "file_path",
+        "required": true,
+        "placeholder": "",
+        "default": "resources/ConfigXMLFile.xml",
+        "help_text": "管理员固定输入，用户界面隐藏。XML 中配置 LUT 和 IGBP 文件路径。",
+        "visible_to_user": false,
+        "admin_fixed": true,
+        "path_mode": "relative_to_module",
+        "batch_role": "",
+        "match_mode": "none",
+        "io_role": "input",
+        "data_role": "input"
+      }
+    ],
+    "tool_type": "aerosol"
   }
 ]
