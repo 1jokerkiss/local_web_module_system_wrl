@@ -557,9 +557,10 @@ function LoginPage(props) {
     gridTemplateColumns: '1.05fr 0.95fr',
     borderRadius: 24,
     overflow: 'hidden',
-    boxShadow: '0 24px 80px rgba(0,0,0,0.28)',
-    background: 'rgba(255,255,255,0.08)',
-    border: '1px solid rgba(255,255,255,0.12)',
+    boxShadow: '0 28px 90px rgba(0,0,0,0.36)',
+    background: 'rgba(255,255,255,0.10)',
+    border: '1px solid rgba(255,255,255,0.20)',
+    backdropFilter: 'blur(6px)',
   };
 
   const innerFormCard = {
@@ -632,408 +633,413 @@ function LoginPage(props) {
   };
 
   return (
-    <div
-      style={{
-        minHeight: '100vh',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        background:
-          'radial-gradient(circle at 20% 20%, rgba(78,134,255,0.35), transparent 28%), radial-gradient(circle at 80% 30%, rgba(0,197,255,0.24), transparent 24%), linear-gradient(135deg, #0a2d57 0%, #0b2c50 35%, #0d3d69 70%, #0b3158 100%)',
-        padding: 20,
-      }}
-    >
-      <div style={outerCardStyle}>
-        {/* 左侧介绍区 */}
-        <div
+      <div
           style={{
-            padding: '48px 42px',
-            color: '#fff',
-            background: 'linear-gradient(180deg, rgba(3,18,38,0.78), rgba(8,32,60,0.72))',
+            minHeight: '100vh',
             display: 'flex',
-            flexDirection: 'column',
-            justifyContent: 'space-between',
-          }}
-        >
-          <div>
-            <div
-              style={{
-                display: 'inline-flex',
-                padding: '8px 14px',
-                borderRadius: 999,
-                background: 'rgba(255,255,255,0.10)',
-                fontSize: 14,
-                marginBottom: 28,
-              }}
-            >
-              遥感反演 · 本地运行平台
-            </div>
-
-            <h1 style={{ fontSize: 42, lineHeight: 1.25, margin: 0, fontWeight: 800 }}>
-              云和气溶胶反演系统
-            </h1>
-
-            <p
-              style={{
-                marginTop: 22,
-                fontSize: 18,
-                lineHeight: 1.9,
-                color: 'rgba(255,255,255,0.86)',
-              }}
-            >
-              面向遥感业务场景的本地模块化运行平台，支持云检测、
-              气溶胶反演、模块接入、任务并行调度与结果追踪。
-            </p>
-          </div>
-
-          <div
-            style={{
-              display: 'flex',
-              gap: 14,
-              flexWrap: 'wrap',
-              color: 'rgba(255,255,255,0.78)',
-              fontSize: 14,
-            }}
-          >
-            <span>H8</span>
-            <span>FY</span>
-            <span>AOD</span>
-            <span>Cloud Mask</span>
-            <span>Remote Sensing</span>
-          </div>
-        </div>
-
-        {/* 右侧登录区域 */}
-        <div
-          style={{
-            background: 'rgba(248,251,255,0.95)',
-            padding: '52px 42px',
-            display: 'flex',
-            flexDirection: 'column',
             alignItems: 'center',
             justifyContent: 'center',
+            backgroundImage:
+                'linear-gradient(135deg, rgba(5, 22, 48, 0.78), rgba(4, 38, 72, 0.58)), url("/images/login-bg.png")',
+            backgroundSize: 'cover',
+            backgroundPosition: 'center',
+            backgroundRepeat: 'no-repeat',
+            backgroundAttachment: 'fixed',
+            padding: 20,
           }}
-        >
-          <div style={{ width: '100%', maxWidth: 420 }}>
-            <div style={{ marginBottom: 18 }}>
-              <h2
-                style={{
-                  margin: 0,
-                  fontSize: 28,
-                  fontWeight: 800,
-                  color: '#10233f',
-                }}
-              >
-                欢迎进入系统
-              </h2>
-            </div>
-
-            <div style={innerFormCard}>
-              {authMode !== 'login' && (
-                <div style={{ marginBottom: 10 }}>
-                  <button style={linkBtn} onClick={() => setAuthMode('login')}>
-                    返回登录
-                  </button>
-                </div>
-              )}
-
+      >
+        <div style={outerCardStyle}>
+          {/* 左侧介绍区 */}
+          <div
+              style={{
+                padding: '48px 42px',
+                color: '#fff',
+                background: 'linear-gradient(180deg, rgba(3,18,38,0.78), rgba(8,32,60,0.72))',
+                display: 'flex',
+                flexDirection: 'column',
+                justifyContent: 'space-between',
+              }}
+          >
+            <div>
               <div
-                style={{
-                  textAlign: 'center',
-                  fontSize: 18,
-                  fontWeight: 800,
-                  color: '#111',
-                  marginBottom: 22,
-                }}
+                  style={{
+                    display: 'inline-flex',
+                    padding: '8px 14px',
+                    borderRadius: 999,
+                    background: 'rgba(255,255,255,0.10)',
+                    fontSize: 14,
+                    marginBottom: 28,
+                  }}
               >
-                {titleMap[authMode]}
+                遥感反演 · 本地运行平台
               </div>
 
-              {/* 登录 */}
-              {authMode === 'login' && (
-                <>
-                  <div style={fieldWrap}>
-                    <input
-                      value={loginForm.username}
-                      onChange={(e) =>
-                        setLoginForm({ ...loginForm, username: e.target.value })
-                      }
-                      placeholder="请输入用户名"
-                      style={fieldInput}
-                    />
-                    <span style={suffixText}>账号</span>
-                  </div>
+              <h1 style={{fontSize: 42, lineHeight: 1.25, margin: 0, fontWeight: 800}}>
+                云和气溶胶反演系统
+              </h1>
 
-                  <div style={{ ...fieldWrap, marginTop: 14 }}>
-                    <input
-                      type={showPassword ? 'text' : 'password'}
-                      value={loginForm.password}
-                      onChange={(e) =>
-                        setLoginForm({ ...loginForm, password: e.target.value })
-                      }
-                      placeholder="输入密码"
-                      style={fieldInput}
-                    />
-                    <button
-                      type="button"
-                      style={{ ...linkBtn, color: '#8fa0b4' }}
-                      onClick={() => setShowPassword((v) => !v)}
-                    >
-                      {showPassword ? '隐藏' : '显示'}
-                    </button>
-                  </div>
-
-                  <div
-                      style={{
-                        marginTop: 12,
-                        display: 'flex',
-                        justifyContent: 'flex-end',
-                        alignItems: 'center',
-                        fontSize: 14,
-                        color: '#5f7088',
-                      }}
-                    >
-                      <button
-                        type="button"
-                        style={linkBtn}
-                        onClick={() => setAuthMode('forgot')}
-                      >
-                        忘记密码
-                      </button>
-                    </div>
-
-                  <div
-                    style={{
-                      marginTop: 16,
-                      display: 'grid',
-                      gridTemplateColumns: '1fr 1fr',
-                      gap: 12,
-                    }}
-                  >
-                    <button
-                      type="button"
-                      style={loginType === 'user' ? roleBtnActive : roleBtn}
-                      onClick={() => setLoginType('user')}
-                    >
-                      用户
-                    </button>
-
-                    <button
-                      type="button"
-                      style={loginType === 'admin' ? roleBtnActive : roleBtn}
-                      onClick={() => setLoginType('admin')}
-                    >
-                      管理员
-                    </button>
-                  </div>
-
-                  <button
-                    style={{ ...widePrimaryBtn, marginTop: 20 }}
-                    onClick={handleLogin}
-                  >
-                    登 录
-                  </button>
-
-                  <div style={{ textAlign: 'center', marginTop: 14 }}>
-                    <button
-                      type="button"
-                      style={linkBtn}
-                      onClick={() => setAuthMode('register')}
-                    >
-                      注册新账号
-                    </button>
-                  </div>
-                </>
-              )}
-
-              {/* 注册 */}
-              {authMode === 'register' && (
-                <>
-                  <div style={{ display: 'grid', gap: 12 }}>
-                    <div style={fieldWrap}>
-                      <input
-                        value={registerForm.username}
-                        onChange={(e) =>
-                          setRegisterForm({ ...registerForm, username: e.target.value })
-                        }
-                        placeholder="请输入用户名"
-                        style={fieldInput}
-                      />
-                    </div>
-
-                    <div style={fieldWrap}>
-                      <input
-                        type={showRegisterPassword ? 'text' : 'password'}
-                        value={registerForm.password}
-                        onChange={(e) =>
-                          setRegisterForm({ ...registerForm, password: e.target.value })
-                        }
-                        placeholder="请输入密码"
-                        style={fieldInput}
-                      />
-                      <button
-                        type="button"
-                        style={{ ...linkBtn, color: '#8fa0b4' }}
-                        onClick={() => setShowRegisterPassword((v) => !v)}
-                      >
-                        {showRegisterPassword ? '隐藏' : '显示'}
-                      </button>
-                    </div>
-
-                    <div style={fieldWrap}>
-                      <input
-                        type={showRegisterConfirmPassword ? 'text' : 'password'}
-                        value={registerForm.confirm_password}
-                        onChange={(e) =>
-                          setRegisterForm({
-                            ...registerForm,
-                            confirm_password: e.target.value,
-                          })
-                        }
-                        placeholder="请输入确认密码"
-                        style={fieldInput}
-                      />
-                      <button
-                        type="button"
-                        style={{ ...linkBtn, color: '#8fa0b4' }}
-                        onClick={() => setShowRegisterConfirmPassword((v) => !v)}
-                      >
-                        {showRegisterConfirmPassword ? '隐藏' : '显示'}
-                      </button>
-                    </div>
-
-                    <div style={fieldWrap}>
-                      <input
-                        value={registerForm.security_question}
-                        onChange={(e) =>
-                          setRegisterForm({
-                            ...registerForm,
-                            security_question: e.target.value,
-                          })
-                        }
-                        placeholder="请输入安全问题"
-                        style={fieldInput}
-                      />
-                    </div>
-
-                    <div style={fieldWrap}>
-                      <input
-                        value={registerForm.security_answer}
-                        onChange={(e) =>
-                          setRegisterForm({
-                            ...registerForm,
-                            security_answer: e.target.value,
-                          })
-                        }
-                        placeholder="请输入安全答案"
-                        style={fieldInput}
-                      />
-                    </div>
-                  </div>
-
-                  <button
-                    style={{ ...widePrimaryBtn, marginTop: 20 }}
-                    onClick={handleRegister}
-                  >
-                    注 册
-                  </button>
-                </>
-              )}
-
-              {/* 找回密码 */}
-              {authMode === 'forgot' && (
-                <>
-                  <div style={{ display: 'grid', gap: 12 }}>
-                    <div style={fieldWrap}>
-                      <input
-                        value={forgotForm.username}
-                        onChange={(e) =>
-                          setForgotForm({ ...forgotForm, username: e.target.value })
-                        }
-                        placeholder="请输入用户名"
-                        style={fieldInput}
-                      />
-                    </div>
-
-                    <button
-                      style={{ ...styles.whiteBtn, width: '100%' }}
-                      onClick={handleForgotQuestion}
-                    >
-                      获取安全问题
-                    </button>
-
-                    <div style={fieldWrap}>
-                      <input
-                        value={forgotForm.question}
-                        readOnly
-                        placeholder="安全问题"
-                        style={fieldInput}
-                      />
-                    </div>
-
-                    <div style={fieldWrap}>
-                      <input
-                        value={forgotForm.answer}
-                        onChange={(e) =>
-                          setForgotForm({ ...forgotForm, answer: e.target.value })
-                        }
-                        placeholder="请输入安全答案"
-                        style={fieldInput}
-                      />
-                    </div>
-
-                    <div style={fieldWrap}>
-                      <input
-                        type={showForgotPassword ? 'text' : 'password'}
-                        value={forgotForm.new_password}
-                        onChange={(e) =>
-                          setForgotForm({
-                            ...forgotForm,
-                            new_password: e.target.value,
-                          })
-                        }
-                        placeholder="请输入新密码"
-                        style={fieldInput}
-                      />
-                      <button
-                        type="button"
-                        style={{ ...linkBtn, color: '#8fa0b4' }}
-                        onClick={() => setShowForgotPassword((v) => !v)}
-                      >
-                        {showForgotPassword ? '隐藏' : '显示'}
-                      </button>
-                    </div>
-                  </div>
-
-                  <button
-                    style={{ ...widePrimaryBtn, marginTop: 20 }}
-                    onClick={handleForgotReset}
-                  >
-                    重置密码
-                  </button>
-                </>
-              )}
-
-              {loginError && (
-                <div
+              <p
                   style={{
-                    marginTop: 16,
-                    padding: '10px 12px',
-                    borderRadius: 10,
-                    background: 'rgba(220,38,38,0.06)',
-                    color: '#d43838',
-                    fontSize: 13,
-                    lineHeight: 1.6,
+                    marginTop: 22,
+                    fontSize: 18,
+                    lineHeight: 1.9,
+                    color: 'rgba(255,255,255,0.86)',
                   }}
+              >
+                面向遥感业务场景的本地模块化运行平台，支持云检测、
+                气溶胶反演、模块接入、任务并行调度与结果追踪。
+              </p>
+            </div>
+
+            <div
+                style={{
+                  display: 'flex',
+                  gap: 14,
+                  flexWrap: 'wrap',
+                  color: 'rgba(255,255,255,0.78)',
+                  fontSize: 14,
+                }}
+            >
+              <span>H8</span>
+              <span>FY</span>
+              <span>AOD</span>
+              <span>Cloud Mask</span>
+              <span>Remote Sensing</span>
+            </div>
+          </div>
+
+          {/* 右侧登录区域 */}
+          <div
+              style={{
+                background: 'rgba(248,251,255,0.90)',
+                backdropFilter: 'blur(10px)',
+                padding: '52px 42px',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+          >
+            <div style={{width: '100%', maxWidth: 420}}>
+              <div style={{marginBottom: 18}}>
+                <h2
+                    style={{
+                      margin: 0,
+                      fontSize: 28,
+                      fontWeight: 800,
+                      color: '#10233f',
+                    }}
                 >
-                  {loginError}
+                  欢迎进入系统
+                </h2>
+              </div>
+
+              <div style={innerFormCard}>
+                {authMode !== 'login' && (
+                    <div style={{marginBottom: 10}}>
+                      <button style={linkBtn} onClick={() => setAuthMode('login')}>
+                        返回登录
+                      </button>
+                    </div>
+                )}
+
+                <div
+                    style={{
+                      textAlign: 'center',
+                      fontSize: 18,
+                      fontWeight: 800,
+                      color: '#111',
+                      marginBottom: 22,
+                    }}
+                >
+                  {titleMap[authMode]}
                 </div>
-              )}
+
+                {/* 登录 */}
+                {authMode === 'login' && (
+                    <>
+                      <div style={fieldWrap}>
+                        <input
+                            value={loginForm.username}
+                            onChange={(e) =>
+                                setLoginForm({...loginForm, username: e.target.value})
+                            }
+                            placeholder="请输入用户名"
+                            style={fieldInput}
+                        />
+                        <span style={suffixText}>账号</span>
+                      </div>
+
+                      <div style={{...fieldWrap, marginTop: 14}}>
+                        <input
+                            type={showPassword ? 'text' : 'password'}
+                            value={loginForm.password}
+                            onChange={(e) =>
+                                setLoginForm({...loginForm, password: e.target.value})
+                            }
+                            placeholder="输入密码"
+                            style={fieldInput}
+                        />
+                        <button
+                            type="button"
+                            style={{...linkBtn, color: '#8fa0b4'}}
+                            onClick={() => setShowPassword((v) => !v)}
+                        >
+                          {showPassword ? '隐藏' : '显示'}
+                        </button>
+                      </div>
+
+                      <div
+                          style={{
+                            marginTop: 12,
+                            display: 'flex',
+                            justifyContent: 'flex-end',
+                            alignItems: 'center',
+                            fontSize: 14,
+                            color: '#5f7088',
+                          }}
+                      >
+                        <button
+                            type="button"
+                            style={linkBtn}
+                            onClick={() => setAuthMode('forgot')}
+                        >
+                          忘记密码
+                        </button>
+                      </div>
+
+                      <div
+                          style={{
+                            marginTop: 16,
+                            display: 'grid',
+                            gridTemplateColumns: '1fr 1fr',
+                            gap: 12,
+                          }}
+                      >
+                        <button
+                            type="button"
+                            style={loginType === 'user' ? roleBtnActive : roleBtn}
+                            onClick={() => setLoginType('user')}
+                        >
+                          用户
+                        </button>
+
+                        <button
+                            type="button"
+                            style={loginType === 'admin' ? roleBtnActive : roleBtn}
+                            onClick={() => setLoginType('admin')}
+                        >
+                          管理员
+                        </button>
+                      </div>
+
+                      <button
+                          style={{...widePrimaryBtn, marginTop: 20}}
+                          onClick={handleLogin}
+                      >
+                        登 录
+                      </button>
+
+                      <div style={{textAlign: 'center', marginTop: 14}}>
+                        <button
+                            type="button"
+                            style={linkBtn}
+                            onClick={() => setAuthMode('register')}
+                        >
+                          注册新账号
+                        </button>
+                      </div>
+                    </>
+                )}
+
+                {/* 注册 */}
+                {authMode === 'register' && (
+                    <>
+                      <div style={{display: 'grid', gap: 12}}>
+                        <div style={fieldWrap}>
+                          <input
+                              value={registerForm.username}
+                              onChange={(e) =>
+                                  setRegisterForm({...registerForm, username: e.target.value})
+                              }
+                              placeholder="请输入用户名"
+                              style={fieldInput}
+                          />
+                        </div>
+
+                        <div style={fieldWrap}>
+                          <input
+                              type={showRegisterPassword ? 'text' : 'password'}
+                              value={registerForm.password}
+                              onChange={(e) =>
+                                  setRegisterForm({...registerForm, password: e.target.value})
+                              }
+                              placeholder="请输入密码"
+                              style={fieldInput}
+                          />
+                          <button
+                              type="button"
+                              style={{...linkBtn, color: '#8fa0b4'}}
+                              onClick={() => setShowRegisterPassword((v) => !v)}
+                          >
+                            {showRegisterPassword ? '隐藏' : '显示'}
+                          </button>
+                        </div>
+
+                        <div style={fieldWrap}>
+                          <input
+                              type={showRegisterConfirmPassword ? 'text' : 'password'}
+                              value={registerForm.confirm_password}
+                              onChange={(e) =>
+                                  setRegisterForm({
+                                    ...registerForm,
+                                    confirm_password: e.target.value,
+                                  })
+                              }
+                              placeholder="请输入确认密码"
+                              style={fieldInput}
+                          />
+                          <button
+                              type="button"
+                              style={{...linkBtn, color: '#8fa0b4'}}
+                              onClick={() => setShowRegisterConfirmPassword((v) => !v)}
+                          >
+                            {showRegisterConfirmPassword ? '隐藏' : '显示'}
+                          </button>
+                        </div>
+
+                        <div style={fieldWrap}>
+                          <input
+                              value={registerForm.security_question}
+                              onChange={(e) =>
+                                  setRegisterForm({
+                                    ...registerForm,
+                                    security_question: e.target.value,
+                                  })
+                              }
+                              placeholder="请输入安全问题"
+                              style={fieldInput}
+                          />
+                        </div>
+
+                        <div style={fieldWrap}>
+                          <input
+                              value={registerForm.security_answer}
+                              onChange={(e) =>
+                                  setRegisterForm({
+                                    ...registerForm,
+                                    security_answer: e.target.value,
+                                  })
+                              }
+                              placeholder="请输入安全答案"
+                              style={fieldInput}
+                          />
+                        </div>
+                      </div>
+
+                      <button
+                          style={{...widePrimaryBtn, marginTop: 20}}
+                          onClick={handleRegister}
+                      >
+                        注 册
+                      </button>
+                    </>
+                )}
+
+                {/* 找回密码 */}
+                {authMode === 'forgot' && (
+                    <>
+                      <div style={{display: 'grid', gap: 12}}>
+                        <div style={fieldWrap}>
+                          <input
+                              value={forgotForm.username}
+                              onChange={(e) =>
+                                  setForgotForm({...forgotForm, username: e.target.value})
+                              }
+                              placeholder="请输入用户名"
+                              style={fieldInput}
+                          />
+                        </div>
+
+                        <button
+                            style={{...styles.whiteBtn, width: '100%'}}
+                            onClick={handleForgotQuestion}
+                        >
+                          获取安全问题
+                        </button>
+
+                        <div style={fieldWrap}>
+                          <input
+                              value={forgotForm.question}
+                              readOnly
+                              placeholder="安全问题"
+                              style={fieldInput}
+                          />
+                        </div>
+
+                        <div style={fieldWrap}>
+                          <input
+                              value={forgotForm.answer}
+                              onChange={(e) =>
+                                  setForgotForm({...forgotForm, answer: e.target.value})
+                              }
+                              placeholder="请输入安全答案"
+                              style={fieldInput}
+                          />
+                        </div>
+
+                        <div style={fieldWrap}>
+                          <input
+                              type={showForgotPassword ? 'text' : 'password'}
+                              value={forgotForm.new_password}
+                              onChange={(e) =>
+                                  setForgotForm({
+                                    ...forgotForm,
+                                    new_password: e.target.value,
+                                  })
+                              }
+                              placeholder="请输入新密码"
+                              style={fieldInput}
+                          />
+                          <button
+                              type="button"
+                              style={{...linkBtn, color: '#8fa0b4'}}
+                              onClick={() => setShowForgotPassword((v) => !v)}
+                          >
+                            {showForgotPassword ? '隐藏' : '显示'}
+                          </button>
+                        </div>
+                      </div>
+
+                      <button
+                          style={{...widePrimaryBtn, marginTop: 20}}
+                          onClick={handleForgotReset}
+                      >
+                        重置密码
+                      </button>
+                    </>
+                )}
+
+                {loginError && (
+                    <div
+                        style={{
+                          marginTop: 16,
+                          padding: '10px 12px',
+                          borderRadius: 10,
+                          background: 'rgba(220,38,38,0.06)',
+                          color: '#d43838',
+                          fontSize: 13,
+                          lineHeight: 1.6,
+                        }}
+                    >
+                      {loginError}
+                    </div>
+                )}
+              </div>
             </div>
           </div>
         </div>
       </div>
-    </div>
   );
 }
 

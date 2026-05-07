@@ -754,8 +754,8 @@
     "module_id": "cloud_type",
     "module_name": "云类型反演",
     "kind": "module",
-    "status": "running",
-    "return_code": null,
+    "status": "success",
+    "return_code": 0,
     "pid": 21712,
     "command": [
       "D:\\NEPU\\实验室\\项目\\气溶胶\\local_web\\backend\\installed_modules\\cth\\CM_CTH.exe",
@@ -792,11 +792,17 @@
       "  \"outpath\": \"D:/NEPU/实验室/项目/气溶胶/h8model_weiles/NC_1\"",
       "}",
       "[INFO] 进程已启动，PID = 21712",
-      "[STDERR] PyInstaller\\loader\\pyimod02_importers.py:450: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81."
+      "[STDERR] PyInstaller\\loader\\pyimod02_importers.py:450: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.",
+      "[STDERR]   0%|          | 0/1 [00:00<?, ?it/s]",
+      "[STDERR] 100%|��������������������| 1/1 [01:35<00:00, 95.81s/it]",
+      "[STDERR] 100%|��������������������| 1/1 [01:35<00:00, 95.82s/it]",
+      "[STDOUT] 95.81169819831848",
+      "[INFO] 进程结束，return_code = 0",
+      "[DATA] 输出结果已登记到数据管理"
     ],
     "created_at": "2026-05-07T10:21:53",
     "started_at": "2026-05-07T10:21:53",
-    "ended_at": null,
+    "ended_at": "2026-05-07T10:23:36",
     "children": []
   }
 ]
