@@ -650,16 +650,21 @@ function LoginPage(props) {
       >
         <div style={outerCardStyle}>
           {/* 左侧介绍区 */}
-          <div
+            <div
               style={{
+                position: 'relative',
                 padding: '48px 42px',
                 color: '#fff',
-                background: 'linear-gradient(180deg, rgba(3,18,38,0.78), rgba(8,32,60,0.72))',
                 display: 'flex',
                 flexDirection: 'column',
                 justifyContent: 'space-between',
+                backgroundImage:
+                  'linear-gradient(180deg, rgba(4, 18, 42, 0.35), rgba(4, 18, 42, 0.68)), url("/images/login-left-hero.png")',
+                backgroundSize: 'cover',
+                backgroundPosition: 'center bottom',
+                backgroundRepeat: 'no-repeat',
               }}
-          >
+            >
             <div>
               <div
                   style={{
