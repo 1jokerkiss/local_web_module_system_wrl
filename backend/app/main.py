@@ -2,6 +2,7 @@ from __future__ import annotations
 import sys
 import base64
 import json
+import io
 import os
 import shutil
 import subprocess
@@ -691,6 +692,223 @@ def _render_tif_with_gdal_cli(tif_path: Path, meta: dict[str, Any] | None = None
 def _png_data_url(png_bytes: bytes) -> str:
     encoded = base64.b64encode(png_bytes).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+
+def _resize_preview_image(image, max_size: int = 1600):
+    """
+    限制预览图最大边长，避免大 tif 直接撑爆浏览器。
+    """
+    try:
+        image.thumbnail((max_size, max_size))
+    except Exception:
+        pass
+    return image
+
+
+def _array_to_preview_png(array, meta: dict | None = None) -> dict:
+    """
+    把二维/三维数组转成 PNG bytes。
+    不依赖 gdal_translate。
+    """
+    import numpy as np
+    from PIL import Image
+
+    meta = dict(meta or {})
+
+    arr = np.asarray(array)
+    arr = np.squeeze(arr)
+
+    if arr.ndim == 0:
+        raise ValueError("数组没有可预览的二维数据")
+
+    # 如果是多波段，尽量转成 H,W,C
+    if arr.ndim == 3:
+        # 常见遥感格式：bands, height, width
+        if arr.shape[0] <= 8 and arr.shape[1] > 8 and arr.shape[2] > 8:
+            if arr.shape[0] >= 3:
+                bands = [
+                    _normalize_to_uint8(arr[0], nodata=None, prefer_nonzero=True),
+                    _normalize_to_uint8(arr[1], nodata=None, prefer_nonzero=True),
+                    _normalize_to_uint8(arr[2], nodata=None, prefer_nonzero=True),
+                ]
+                rgb = np.dstack(bands)
+                image = Image.fromarray(rgb, mode="RGB")
+                meta["render_mode"] = "python_array_bands_first_rgb"
+            else:
+                gray = _normalize_to_uint8(arr[0], nodata=None, prefer_nonzero=True)
+                image = _colorize_gray(gray)
+                meta["render_mode"] = "python_array_bands_first_single"
+        # 常见图片格式：height, width, channels
+        elif arr.shape[-1] in {3, 4}:
+            if arr.shape[-1] == 4:
+                arr = arr[:, :, :3]
+            bands = [
+                _normalize_to_uint8(arr[:, :, 0], nodata=None, prefer_nonzero=True),
+                _normalize_to_uint8(arr[:, :, 1], nodata=None, prefer_nonzero=True),
+                _normalize_to_uint8(arr[:, :, 2], nodata=None, prefer_nonzero=True),
+            ]
+            rgb = np.dstack(bands)
+            image = Image.fromarray(rgb, mode="RGB")
+            meta["render_mode"] = "python_array_channels_last_rgb"
+        else:
+            # 兜底：取第一个切片
+            gray = _normalize_to_uint8(arr[0], nodata=None, prefer_nonzero=True)
+            image = _colorize_gray(gray)
+            meta["render_mode"] = "python_array_first_slice"
+    elif arr.ndim == 2:
+        gray = _normalize_to_uint8(arr, nodata=None, prefer_nonzero=True)
+        image = _colorize_gray(gray)
+        meta.update(_array_preview_stats(arr, nodata=None))
+        meta["render_mode"] = "python_array_single_band"
+    else:
+        raise ValueError(f"暂不支持 {arr.ndim} 维数组预览")
+
+    image = _resize_preview_image(image)
+
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    meta["preview_engine"] = meta.get("preview_engine") or "python_array"
+    meta["preview_width"], meta["preview_height"] = image.size
+    return {"png": buf.getvalue(), "meta": meta}
+
+
+def render_tif_to_preview_result(tif_path: Path) -> dict:
+    """
+    后台 tif 预览：
+    1. 优先用 Python osgeo.gdal；
+    2. 没有 osgeo 时，尝试 tifffile；
+    3. 再尝试 Pillow；
+    4. 最后才尝试系统 gdal_translate。
+    """
+    if not tif_path.exists() or not tif_path.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    if tif_path.suffix.lower() not in {".tif", ".tiff"}:
+        raise HTTPException(status_code=400, detail="只支持预览 tif/tiff 文件")
+
+    meta: dict[str, Any] = {
+        "name": tif_path.name,
+        "size": tif_path.stat().st_size,
+        "suffix": tif_path.suffix.lower(),
+    }
+
+    # 方案一：Python osgeo.gdal
+    try:
+        import numpy as np
+        from osgeo import gdal
+
+        ds = gdal.Open(str(tif_path))
+        if ds is None:
+            raise RuntimeError("GDAL 无法打开该 tif")
+
+        width = int(ds.RasterXSize)
+        height = int(ds.RasterYSize)
+        band_count = int(ds.RasterCount or 1)
+
+        max_size = 1600
+        scale = min(1.0, max_size / max(width, height)) if max(width, height) else 1.0
+        out_w = max(1, int(width * scale))
+        out_h = max(1, int(height * scale))
+
+        meta.update({
+            "width": width,
+            "height": height,
+            "bands": band_count,
+            "preview_engine": "python_osgeo_gdal",
+        })
+
+        if band_count >= 3:
+            bands = []
+            for band_index in (1, 2, 3):
+                band = ds.GetRasterBand(band_index)
+                nodata = band.GetNoDataValue()
+                arr = band.ReadAsArray(buf_xsize=out_w, buf_ysize=out_h)
+                bands.append(_normalize_to_uint8(arr, nodata=nodata, prefer_nonzero=True))
+
+            rgb = np.dstack(bands)
+
+            from PIL import Image
+            image = Image.fromarray(rgb, mode="RGB")
+            meta["render_mode"] = "python_osgeo_rgb"
+        else:
+            band = ds.GetRasterBand(1)
+            nodata = band.GetNoDataValue()
+            arr = band.ReadAsArray(buf_xsize=out_w, buf_ysize=out_h)
+
+            from PIL import Image
+            gray = _normalize_to_uint8(arr, nodata=nodata, prefer_nonzero=True)
+            image = _colorize_gray(gray)
+            meta.update(_array_preview_stats(arr, nodata=nodata))
+            meta["render_mode"] = "python_osgeo_single_band"
+
+        image = _resize_preview_image(image)
+
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        meta["preview_width"], meta["preview_height"] = image.size
+        return {"png": buf.getvalue(), "meta": meta}
+
+    except Exception as gdal_exc:
+        meta["python_osgeo_error"] = str(gdal_exc)
+
+    # 方案二：tifffile
+    try:
+        import tifffile
+
+        arr = tifffile.imread(str(tif_path))
+        meta["preview_engine"] = "python_tifffile"
+        try:
+            meta["array_shape"] = list(arr.shape)
+        except Exception:
+            pass
+
+        return _array_to_preview_png(arr, meta)
+
+    except Exception as tifffile_exc:
+        meta["tifffile_error"] = str(tifffile_exc)
+
+    # 方案三：Pillow
+    try:
+        import numpy as np
+        from PIL import Image
+
+        image = Image.open(tif_path)
+
+        try:
+            arr = np.asarray(image)
+            meta["preview_engine"] = "python_pillow_array"
+            meta["pillow_mode"] = image.mode
+            return _array_to_preview_png(arr, meta)
+        except Exception:
+            image = Image.open(tif_path)
+            image = _resize_preview_image(image)
+            if image.mode not in {"L", "RGB", "RGBA"}:
+                image = image.convert("RGB")
+
+            buf = io.BytesIO()
+            image.save(buf, format="PNG")
+
+            meta["preview_engine"] = "python_pillow"
+            meta["pillow_mode"] = image.mode
+            meta["preview_width"], meta["preview_height"] = image.size
+            return {"png": buf.getvalue(), "meta": meta}
+
+    except Exception as pillow_exc:
+        meta["pillow_error"] = str(pillow_exc)
+
+    # 方案四：最后才尝试 gdal_translate
+    try:
+        return _render_tif_with_gdal_cli(tif_path, meta)
+    except Exception as cli_exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "tif 后台预览失败：Python osgeo、tifffile、Pillow、gdal_translate 都无法生成预览。"
+                f" osgeo错误: {meta.get('python_osgeo_error')};"
+                f" tifffile错误: {meta.get('tifffile_error')};"
+                f" Pillow错误: {meta.get('pillow_error')};"
+                f" GDAL命令错误: {cli_exc}"
+            ),
+        )
 @app.post("/api/tasks/run")
 def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header(default=None)):
     get_current_user(authorization)
@@ -1906,7 +2124,7 @@ def api_preview_data_file(file_id: int, authorization: str | None = Header(defau
     suffix = path.suffix.lower()
 
     if suffix in {".tif", ".tiff"}:
-        result = _render_tif_with_gdal_cli(path)
+        result = render_tif_to_preview_result(path)
         return {
             "type": "image",
             "name": path.name,
