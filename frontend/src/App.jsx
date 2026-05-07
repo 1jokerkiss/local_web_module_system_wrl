@@ -1075,6 +1075,11 @@ const labelStyle = {
   fontWeight: 700,
   color: '#173353',
 };
+const TASK_TRAY_WIDTH = 280;
+const TASK_TRAY_RIGHT = 12;
+const TASK_TRAY_BOTTOM = 12;
+const TASK_TRAY_RESERVED_RIGHT = TASK_TRAY_WIDTH + TASK_TRAY_RIGHT + 28;
+const TASK_TRAY_RESERVED_BOTTOM = 150;
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
@@ -1138,6 +1143,17 @@ export default function App() {
   const pollTimerRef = useRef(null);
 
   const isAdmin = currentUser?.role === 'admin';
+  const taskTrayVisible = windows.length > 0;
+
+  const taskTrayReserveStyle = taskTrayVisible
+    ? {
+        paddingRight: TASK_TRAY_RESERVED_RIGHT,
+        paddingBottom: TASK_TRAY_RESERVED_BOTTOM,
+        boxSizing: 'border-box',
+      }
+    : {
+        boxSizing: 'border-box',
+      };
 
   const visibleToolbars = useMemo(() => uniqToolbars(toolbars, modules), [toolbars, modules]);
 
@@ -2273,8 +2289,15 @@ function renderDataManagementPage() {
   }
 
   return (
-    <section style={{ ...styles.card, padding: 18, minHeight: 'calc(100vh - 98px)' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+    <section
+      style={{
+        ...styles.card,
+        padding: 18,
+        minHeight: 'calc(100vh - 98px)',
+        ...taskTrayReserveStyle,
+      }}
+    >
+      <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
         <div>
           <div style={{ fontSize: 26, fontWeight: 900, color: '#12385f' }}>数据管理</div>
           <div style={{ color: '#6a7f96', marginTop: 6 }}>
@@ -2628,7 +2651,14 @@ function renderDataManagementPage() {
         {activeTab.startsWith('tool:') && renderToolPage(activeTab.slice('tool:'.length))}
         {activeTab === 'data_mgmt' && renderDataManagementPage()}
         {activeTab === 'tasks' && (
-          <section style={{ ...styles.card, padding: 18, minHeight: 'calc(100vh - 98px)' }}>
+            <section
+              style={{
+                ...styles.card,
+                padding: 18,
+                minHeight: 'calc(100vh - 98px)',
+                ...taskTrayReserveStyle,
+              }}
+            >
             <div style={{ fontSize: 28, fontWeight: 900, color: '#0b2d51', marginBottom: 16 }}>任务列表</div>
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', background: '#fff' }}>
@@ -2723,12 +2753,15 @@ function renderDataManagementPage() {
         <div
           style={{
             position: 'fixed',
-            right: 12,
-            bottom: 12,
-            width: 280,
+            right: TASK_TRAY_RIGHT,
+            bottom: TASK_TRAY_BOTTOM,
+            width: TASK_TRAY_WIDTH,
+            maxHeight: 'calc(100vh - 120px)',
+            overflow: 'auto',
             ...styles.card,
             padding: 14,
             zIndex: 5000,
+            boxSizing: 'border-box',
           }}
         >
           <div style={{ fontWeight: 900, fontSize: 18, color: '#123a64', marginBottom: 10 }}>任务托盘</div>
