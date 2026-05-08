@@ -1516,14 +1516,58 @@ useEffect(() => {
         await refreshDataFiles();
 
         for (const w of windows) {
-          if (!w.taskId) continue;
-          try {
-            const detail = await getTask(w.taskId);
-            setWindows((prev) =>
-              prev.map((x) => (x.id === w.id ? { ...x, task: detail } : x))
-            );
-          } catch {}
-        }
+            if (!w.taskId) continue;
+
+            try {
+              const detail = await getTask(w.taskId);
+
+              const oldStatus = w.task?.status;
+              const newStatus = detail?.status;
+
+              const justFinished =
+                isActiveTaskStatus(oldStatus) && isTerminalTaskStatus(newStatus);
+
+              const shouldPopupFinishedWindow = justFinished && w.minimized;
+
+              if (shouldPopupFinishedWindow) {
+                setTaskTrayMinimized(false);
+              }
+
+              setWindows((prev) =>
+                prev.map((x) => {
+                  if (x.id !== w.id) return x;
+
+                  if (shouldPopupFinishedWindow) {
+                    zRef.current += 1;
+                    const { left, top } = getCenteredTaskWindowPosition(0);
+
+                    return {
+                      ...x,
+                      task: detail,
+                      minimized: false,
+                      left,
+                      top,
+                      zIndex: zRef.current,
+                    };
+                  }
+
+                  if (justFinished) {
+                    zRef.current += 1;
+                    return {
+                      ...x,
+                      task: detail,
+                      zIndex: zRef.current,
+                    };
+                  }
+
+                  return {
+                    ...x,
+                    task: detail,
+                  };
+                })
+              );
+            } catch {}
+          }
       } catch {}
     }, 3000);
 
@@ -1690,7 +1734,15 @@ async function handleRegister() {
     const list = await listDataFiles();
     setDataFiles(Array.isArray(list) ? list : []);
   }
+function getCenteredTaskWindowPosition(offset = 0) {
+  const popupWidth = 420;
+  const popupHeight = 520;
 
+  return {
+    left: Math.max(16, (window.innerWidth - popupWidth) / 2 + offset),
+    top: Math.max(90, (window.innerHeight - popupHeight) / 2 + offset),
+  };
+}
 function addTaskWindow(task, title) {
   zRef.current += 1;
   setWindows((prev) => {

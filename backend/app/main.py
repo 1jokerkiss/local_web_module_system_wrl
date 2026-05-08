@@ -960,9 +960,19 @@ def render_tif_to_preview_result(tif_path: Path) -> dict:
                 f" GDAL命令错误: {cli_exc}"
             ),
         )
+def get_username_from_user(user) -> str:
+    """
+    兼容 get_current_user() 返回 dict 或对象两种情况。
+    """
+    if isinstance(user, dict):
+        return str(user.get("username") or "")
+    return str(getattr(user, "username", "") or "")
 @app.post("/api/tasks/run")
 def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header(default=None)):
-    get_current_user(authorization)
+    user = get_current_user(authorization)
+    username = get_username_from_user(user)
+    if not username:
+        raise HTTPException(status_code=401, detail="未登录")
 
     module = get_module(payload.module_id)
     if not module:
@@ -1017,6 +1027,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
             module_name=module.get("name", module["id"]),
             jobs=jobs,
             max_parallel=parallel_workers,
+            owner_username=username,
         )
         if output_paths:
             start_data_file_scan_after_task(task["id"], module, output_paths)
@@ -1039,6 +1050,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
         inputs=inputs,
         working_dir=working_dir,
         env=runtime_env,
+        owner_username=username,
     )
 
     if output_paths:
@@ -2401,29 +2413,43 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
         raise HTTPException(status_code=400, detail="没有生成任何批处理 job，请检查输入目录和 batch_role 配置")
 
     return jobs, output_paths
+def task_belongs_to_user(task: dict, user) -> bool:
+    if not task:
+        return False
 
+    owner = str(task.get("owner_username") or "")
+    username = get_username_from_user(user)
+
+    return bool(owner) and owner == username
+
+
+def require_own_task(task_id: str, user) -> dict:
+    task = task_manager.get_task(task_id)
+    if not task or not task_belongs_to_user(task, user):
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return task
 
 # =========================
 # 任务接口
 # =========================
 @app.get("/api/tasks")
 def api_list_tasks(authorization: str | None = Header(default=None)):
-    get_current_user(authorization)
-    return task_manager.list_tasks()
+    user = get_current_user(authorization)
+    username = get_username_from_user(user)
+    return task_manager.list_tasks(owner_username=username)
 
 
 @app.get("/api/tasks/{task_id}")
 def api_get_task(task_id: str, authorization: str | None = Header(default=None)):
-    get_current_user(authorization)
-    task = task_manager.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    return task
+    user = get_current_user(authorization)
+    return require_own_task(task_id, user)
 
 
 @app.post("/api/tasks/{task_id}/cancel")
 def api_cancel_task(task_id: str, authorization: str | None = Header(default=None)):
-    get_current_user(authorization)
+    user = get_current_user(authorization)
+    require_own_task(task_id, user)
+
     ok = task_manager.cancel_task(task_id)
     if not ok:
         raise HTTPException(status_code=404, detail="任务不存在或已结束")
@@ -2432,7 +2458,9 @@ def api_cancel_task(task_id: str, authorization: str | None = Header(default=Non
 
 @app.delete("/api/tasks/{task_id}")
 def api_delete_task(task_id: str, authorization: str | None = Header(default=None)):
-    get_current_user(authorization)
+    user = get_current_user(authorization)
+    require_own_task(task_id, user)
+
     ok = task_manager.delete_task(task_id)
     if not ok:
         raise HTTPException(status_code=404, detail="任务不存在")

@@ -9,13 +9,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
-
 TERMINAL_STATUSES = {"success", "failed", "cancelled"}
-
 
 class TaskManager:
     def __init__(self, tasks_file: str | Path):
@@ -57,9 +54,17 @@ class TaskManager:
                 encoding="utf-8",
             )
 
-    def list_tasks(self) -> List[Dict[str, Any]]:
+    def list_tasks(self, owner_username: str | None = None) -> List[Dict[str, Any]]:
         with self.lock:
             items = list(self.tasks.values())
+
+        if owner_username:
+            owner_username = str(owner_username)
+            items = [
+                item for item in items
+                if str(item.get("owner_username") or "") == owner_username
+            ]
+
         items.sort(key=lambda x: x.get("started_at") or x.get("created_at") or "", reverse=True)
         return items
 
@@ -96,6 +101,7 @@ class TaskManager:
             "started_at": None,
             "ended_at": None,
             "children": [],
+            "owner_username": "",
         }
         if extra:
             task.update(extra)
@@ -124,13 +130,14 @@ class TaskManager:
         self._save_tasks()
 
     def submit_module_task(
-        self,
-        module_id: str,
-        module_name: str,
-        command: List[str],
-        inputs: Dict[str, Any],
-        working_dir: str | None = None,
-        env: Dict[str, str] | None = None,
+            self,
+            module_id: str,
+            module_name: str,
+            command: List[str],
+            inputs: Dict[str, Any],
+            working_dir: str | None = None,
+            env: Dict[str, str] | None = None,
+            owner_username: str = "",
     ) -> Dict[str, Any]:
         task = self.create_task(
             module_id=module_id,
@@ -138,6 +145,7 @@ class TaskManager:
             command=command,
             inputs=inputs,
             kind="module",
+            extra={"owner_username": str(owner_username or "")},
         )
 
         thread = threading.Thread(
@@ -149,12 +157,13 @@ class TaskManager:
         return task
 
     def submit_parallel_module_task(
-        self,
-        module_id: str,
-        module_name: str,
-        jobs: List[Dict[str, Any]],
-        inputs: Dict[str, Any],
-        max_workers: int = 2,
+            self,
+            module_id: str,
+            module_name: str,
+            jobs: List[Dict[str, Any]],
+            inputs: Dict[str, Any],
+            max_workers: int = 2,
+            owner_username: str = "",
     ) -> Dict[str, Any]:
         max_workers = max(1, int(max_workers or 1))
         parent = self.create_task(
@@ -168,6 +177,7 @@ class TaskManager:
                 "parallel_done": 0,
                 "parallel_failed": 0,
                 "max_workers": max_workers,
+                "owner_username": str(owner_username or ""),
             },
         )
 
@@ -180,11 +190,12 @@ class TaskManager:
         return parent
 
     def submit_batch_group(
-        self,
-        module_id: str,
-        module_name: str,
-        jobs: List[Dict[str, Any]],
-        max_parallel: int,
+            self,
+            module_id: str,
+            module_name: str,
+            jobs: List[Dict[str, Any]],
+            max_parallel: int,
+            owner_username: str = "",
     ) -> Dict[str, Any]:
         """Submit a batch parent task using the old tested ThreadPoolExecutor process-pool style.
 
@@ -204,6 +215,7 @@ class TaskManager:
                 "parallel_done": 0,
                 "parallel_failed": 0,
                 "max_workers": max_parallel,
+                "owner_username": str(owner_username or ""),
             },
         )
 
@@ -217,7 +229,11 @@ class TaskManager:
                 command=job["command"],
                 inputs=job["inputs"],
                 kind="module",
-                extra={"parent_id": parent["id"], "job_index": idx},
+                extra={
+                    "parent_id": parent["id"],
+                    "job_index": idx,
+                    "owner_username": str(owner_username or ""),
+                },
                 auto_save=False,
             )
             child_ids.append(child["id"])
@@ -528,13 +544,21 @@ class TaskManager:
                     return
                 idx, spec = item
                 label = spec.get("label") or f"子任务 {idx + 1}"
+                parent_task = self.get_task(parent_id) or {}
+                owner_username = str(parent_task.get("owner_username") or "")
+
                 child = self.create_task(
                     module_id=spec.get("module_id", ""),
                     module_name=spec.get("module_name", label),
                     command=spec.get("command") or [],
                     inputs=spec.get("inputs") or {},
                     kind="module",
-                    extra={"parent_id": parent_id, "worker_no": worker_no, "job_index": idx + 1},
+                    extra={
+                        "parent_id": parent_id,
+                        "worker_no": worker_no,
+                        "job_index": idx + 1,
+                        "owner_username": owner_username,
+                    },
                 )
                 with self.lock:
                     parent = self.tasks.get(parent_id)
