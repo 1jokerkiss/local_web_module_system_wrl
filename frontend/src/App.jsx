@@ -543,31 +543,53 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
   );
 }
 
-
-function TaskTrayFloatingWindow({ count, children }) {
+function TaskTrayFloatingWindow({ count, children, minimized, onToggleMinimize }) {
   const trayWidth = 300;
   const trayHeight = 360;
-  const [pos, setPos] = useState(() => ({
-    left: Math.max(16, window.innerWidth - trayWidth - 24),
-    top: Math.max(84, window.innerHeight - trayHeight - 24),
-  }));
+  const trayMargin = 20;
+
+  const [dragged, setDragged] = useState(false);
+  const [pos, setPos] = useState({ left: 0, top: 0 });
+  const trayRef = useRef(null);
   const dragRef = useRef(null);
 
+  // 每次从“图标状态”展开时，重新回到右下角
+  useEffect(() => {
+    if (!minimized) {
+      setDragged(false);
+    }
+  }, [minimized]);
+
   function onMouseDown(e) {
+    if (e.button !== 0) return;
+
+    const rect = trayRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    setDragged(true);
+
     dragRef.current = {
       x: e.clientX,
       y: e.clientY,
-      left: pos.left,
-      top: pos.top,
+      left: rect.left,
+      top: rect.top,
     };
 
     function onMoveDoc(ev) {
       if (!dragRef.current) return;
+
       const dx = ev.clientX - dragRef.current.x;
       const dy = ev.clientY - dragRef.current.y;
+
       setPos({
-        left: Math.max(8, Math.min(window.innerWidth - trayWidth - 8, dragRef.current.left + dx)),
-        top: Math.max(8, Math.min(window.innerHeight - 80, dragRef.current.top + dy)),
+        left: Math.max(
+          8,
+          Math.min(window.innerWidth - trayWidth - 8, dragRef.current.left + dx)
+        ),
+        top: Math.max(
+          8,
+          Math.min(window.innerHeight - 80, dragRef.current.top + dy)
+        ),
       });
     }
 
@@ -581,12 +603,54 @@ function TaskTrayFloatingWindow({ count, children }) {
     document.addEventListener('mouseup', onUpDoc);
   }
 
+  // 最小化后只显示右下角图标
+  if (minimized) {
+    return (
+      <button
+        onClick={onToggleMinimize}
+        title="展开任务托盘"
+        style={{
+          position: 'fixed',
+          right: 16,
+          bottom: 16,
+          width: 54,
+          height: 54,
+          borderRadius: 16,
+          border: '1px solid rgba(255,255,255,0.45)',
+          background: 'linear-gradient(135deg,#0d4f92 0%,#1565c0 55%,#2c8ae8 100%)',
+          color: '#fff',
+          fontSize: 22,
+          fontWeight: 900,
+          cursor: 'pointer',
+          zIndex: 6600,
+          boxShadow: '0 16px 36px rgba(5,25,55,0.26)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
+      >
+        ≡
+      </button>
+    );
+  }
+
   return (
     <div
+      ref={trayRef}
       style={{
         position: 'fixed',
-        left: pos.left,
-        top: pos.top,
+
+        // 没拖动过：强制右下角
+        ...(dragged
+          ? {
+              left: pos.left,
+              top: pos.top,
+            }
+          : {
+              right: trayMargin,
+              bottom: trayMargin,
+            }),
+
         width: trayWidth,
         maxHeight: 'min(430px, calc(100vh - 90px))',
         zIndex: 6500,
@@ -611,7 +675,31 @@ function TaskTrayFloatingWindow({ count, children }) {
         }}
       >
         <div style={{ fontWeight: 900, fontSize: 16 }}>任务托盘</div>
-        <div style={{ fontSize: 12, opacity: 0.92 }}>{count} 个</div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ fontSize: 12, opacity: 0.92 }}>{count} 个</div>
+          <button
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleMinimize();
+            }}
+            title="最小化任务托盘"
+            style={{
+              border: '1px solid rgba(255,255,255,0.35)',
+              background: 'rgba(255,255,255,0.12)',
+              color: '#fff',
+              borderRadius: 6,
+              padding: '2px 10px',
+              cursor: 'pointer',
+              fontSize: 16,
+              fontWeight: 800,
+              lineHeight: 1,
+            }}
+          >
+            –
+          </button>
+        </div>
       </div>
 
       <div
@@ -1252,15 +1340,15 @@ export default function App() {
   const [showDropHint, setShowDropHint] = useState(false);
 
   const [windows, setWindows] = useState([]);
+  const [taskTrayMinimized, setTaskTrayMinimized] = useState(false);
   const zRef = useRef(2000);
   const pollTimerRef = useRef(null);
 
   const isAdmin = currentUser?.role === 'admin';
-  const taskTrayVisible = windows.length > 0;
+  const minimizedTaskCount = windows.filter((w) => w.minimized).length;
 
   const taskTrayReserveStyle = {
     boxSizing: 'border-box',
-    paddingRight: taskTrayVisible ? TASK_TRAY_RESERVED_RIGHT : 0,
   };
 
   const visibleToolbars = useMemo(() => uniqToolbars(toolbars, modules), [toolbars, modules]);
@@ -1400,6 +1488,7 @@ useEffect(() => {
       return;
     }
 
+
     const hasRunningTask =
       tasks.some((t) => t.status === 'queued' || t.status === 'running') ||
       windows.some((w) => {
@@ -1445,6 +1534,12 @@ useEffect(() => {
       }
     };
   }, [currentUser, tasks, windows]);
+  useEffect(() => {
+    const minimizedCount = windows.filter((w) => w.minimized).length;
+    if (minimizedCount === 0) {
+      setTaskTrayMinimized(false);
+    }
+  }, [windows]);
 
   async function handleLogin() {
     try {
@@ -1596,29 +1691,31 @@ async function handleRegister() {
     setDataFiles(Array.isArray(list) ? list : []);
   }
 
-  function addTaskWindow(task, title) {
-    zRef.current += 1;
-    setWindows((prev) => {
-      const offset = (prev.length % 4) * 24;
-      const popupWidth = 420;
-      const left = Math.max(16, window.innerWidth - popupWidth - 28 - offset);
-      const top = Math.max(86, window.innerHeight - 520 - 28 - offset);
+function addTaskWindow(task, title) {
+  zRef.current += 1;
+  setWindows((prev) => {
+    const offset = (prev.length % 4) * 24;
+    const popupWidth = 420;
+    const popupHeight = 520;
 
-      return [
-        ...prev,
-        {
-          id: `w_${task.id}`,
-          taskId: task.id,
-          task,
-          title,
-          minimized: false,
-          left,
-          top,
-          zIndex: zRef.current,
-        },
-      ];
-    });
-  }
+    const left = Math.max(16, (window.innerWidth - popupWidth) / 2 + offset);
+    const top = Math.max(90, (window.innerHeight - popupHeight) / 2 + offset);
+
+    return [
+      ...prev,
+      {
+        id: `w_${task.id}`,
+        taskId: task.id,
+        task,
+        title,
+        minimized: false,
+        left,
+        top,
+        zIndex: zRef.current,
+      },
+    ];
+  });
+}
 
   function bringFront(id) {
     zRef.current += 1;
@@ -2571,13 +2668,13 @@ function renderDataManagementPage() {
                     </td>
                     <td style={tdStyle}>
                       <div style={{ display: 'flex', gap: 6, flexWrap: 'nowrap', alignItems: 'center' }}>
-                        <button style={taskTableActionBtnStyle} onClick={() => handlePreview(file)}>
+                        <button style={tableActionBtnStyle} onClick={() => handlePreview(file)}>
                           预览
                         </button>
-                        <button style={taskTableActionBtnStyle} onClick={() => handleReveal(file)}>
+                        <button style={tableActionBtnStyle} onClick={() => handleReveal(file)}>
                           打开位置
                         </button>
-                        <button style={tableDangerBtnStyle} onClick={() => handleDelete(file)}>
+                        <button style={taskTableDangerBtnStyle} onClick={() => handleDelete(file)}>
                           删除
                         </button>
                       </div>
@@ -2712,7 +2809,7 @@ function renderTaskManagementPage() {
 
                       {(task.status === 'running' || task.status === 'queued') && (
                         <button
-                          style={tableDangerBtnStyle}
+                          style={taskTableDangerBtnStyle}
                           onClick={async () => {
                             try {
                               await cancelTask(task.id);
@@ -2726,7 +2823,7 @@ function renderTaskManagementPage() {
                         </button>
                       )}
 
-                      <button style={tableDangerBtnStyle} onClick={() => handleDeleteTask(task.id)}>
+                      <button style={taskTableDangerBtnStyle} onClick={() => handleDeleteTask(task.id)}>
                         删除
                       </button>
                     </div>
@@ -3005,9 +3102,10 @@ function renderTaskManagementPage() {
         <TaskWindow
           key={w.id}
           win={w}
-          onMin={(id) =>
-            setWindows((prev) => prev.map((x) => (x.id === id ? { ...x, minimized: true } : x)))
-          }
+          onMin={(id) => {
+            setWindows((prev) => prev.map((x) => (x.id === id ? { ...x, minimized: true } : x)));
+            setTaskTrayMinimized(false);
+          }}
           onClose={(id) => setWindows((prev) => prev.filter((x) => x.id !== id))}
           onFront={bringFront}
           onMove={moveWindow}
@@ -3017,10 +3115,14 @@ function renderTaskManagementPage() {
 
       
       {windows.some((w) => w.minimized) && (
-        <TaskTrayFloatingWindow count={windows.filter((w) => w.minimized).length}>
-          {renderTaskTrayPanel()}
-        </TaskTrayFloatingWindow>
-      )}
+          <TaskTrayFloatingWindow
+            count={windows.filter((w) => w.minimized).length}
+            minimized={taskTrayMinimized}
+            onToggleMinimize={() => setTaskTrayMinimized((prev) => !prev)}
+          >
+            {renderTaskTrayPanel()}
+          </TaskTrayFloatingWindow>
+        )}
 
 {inputEditorOpen && (
         <SimpleOverlay
