@@ -1,0 +1,33 @@
+﻿# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+
+# Frontend dependencies/build
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+build/
+
+# Backend runtime/cache
+backend/runtime/
+backend/uploads/
+backend/logs/
+*.log
+*.tmp
+
+# Runtime data
+backend/data/tasks.json
+backend/data/data_files.json
+
+# Generated structure file
+project_structure.txt
+
+# Installed/runtime module packages
+backend/installed_modules/
+module_drop/
