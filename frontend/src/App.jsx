@@ -335,12 +335,12 @@ function statusBadge(status) {
       style={{
         display: 'inline-flex',
         alignItems: 'center',
-        padding: '6px 12px',
+        padding: '7px 13px',
         borderRadius: 999,
         background: bg,
         color,
         fontWeight: 800,
-        fontSize: 13,
+        fontSize: 14,
       }}
     >
       {status}
@@ -1188,10 +1188,10 @@ const labelStyle = {
   fontWeight: 700,
   color: '#173353',
 };
-const TASK_TRAY_WIDTH = 280;
+const TASK_TRAY_WIDTH = 300;
 const TASK_TRAY_RIGHT = 12;
 const TASK_TRAY_BOTTOM = 12;
-const TASK_TRAY_RESERVED_RIGHT = TASK_TRAY_WIDTH + TASK_TRAY_RIGHT + 28;
+const TASK_TRAY_RESERVED_RIGHT = TASK_TRAY_WIDTH + TASK_TRAY_RIGHT + 24;
 const TASK_TRAY_RESERVED_BOTTOM = 150;
 
 export default function App() {
@@ -1260,6 +1260,7 @@ export default function App() {
 
   const taskTrayReserveStyle = {
     boxSizing: 'border-box',
+    paddingRight: taskTrayVisible ? TASK_TRAY_RESERVED_RIGHT : 0,
   };
 
   const visibleToolbars = useMemo(() => uniqToolbars(toolbars, modules), [toolbars, modules]);
@@ -2570,10 +2571,10 @@ function renderDataManagementPage() {
                     </td>
                     <td style={tdStyle}>
                       <div style={{ display: 'flex', gap: 6, flexWrap: 'nowrap', alignItems: 'center' }}>
-                        <button style={tableActionBtnStyle} onClick={() => handlePreview(file)}>
+                        <button style={taskTableActionBtnStyle} onClick={() => handlePreview(file)}>
                           预览
                         </button>
-                        <button style={tableActionBtnStyle} onClick={() => handleReveal(file)}>
+                        <button style={taskTableActionBtnStyle} onClick={() => handleReveal(file)}>
                           打开位置
                         </button>
                         <button style={tableDangerBtnStyle} onClick={() => handleDelete(file)}>
@@ -2657,39 +2658,46 @@ function renderTaskManagementPage() {
           border: '1px solid #dfe8f2',
           boxShadow: '0 8px 22px rgba(15, 45, 80, 0.05)',
         }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 980, tableLayout: 'fixed' }}>
+          <table
+            style={{
+              width: '100%',
+              borderCollapse: 'collapse',
+              minWidth: 900,
+              tableLayout: 'fixed',
+            }}
+          >
             <thead>
-              <tr>
-                <th style={{ ...thStyle, width: 120 }}>任务ID</th>
-                <th style={thStyle}>模块</th>
-                <th style={{ ...thStyle, width: 110 }}>类型</th>
-                <th style={{ ...thStyle, width: 110 }}>状态</th>
-                <th style={{ ...thStyle, width: 155 }}>开始时间</th>
-                <th style={{ ...thStyle, width: 155 }}>结束时间</th>
-                <th style={{ ...thStyle, width: 160 }}>操作</th>
-              </tr>
+            <tr>
+              <th style={{...taskThStyle, width: 130}}>任务ID</th>
+              <th style={{...taskThStyle, width: 190}}>模块</th>
+              <th style={{...taskThStyle, width: 90}}>类型</th>
+              <th style={{...taskThStyle, width: 115}}>状态</th>
+              <th style={{...taskThStyle, width: 165}}>开始时间</th>
+              <th style={{...taskThStyle, width: 165}}>结束时间</th>
+              <th style={{...taskThStyle, width: 150}}>操作</th>
+            </tr>
             </thead>
 
             <tbody>
-              {tasks.map((task, index) => (
+            {tasks.map((task, index) => (
                 <tr
-                  key={task.id}
-                  style={{
-                    background: index % 2 === 0 ? '#f8fbff' : '#ffffff',
-                  }}
+                    key={task.id}
+                    style={{
+                      background: index % 2 === 0 ? '#f8fbff' : '#ffffff',
+                    }}
                 >
-                  <td style={tdEllipsisStyle} title={task.id}>{task.id}</td>
-                  <td style={tdEllipsisStyle} title={task.module_name || '-'}>
+                  <td style={taskTdEllipsisStyle} title={task.id}>{task.id}</td>
+                  <td style={taskTdEllipsisStyle} title={task.module_name || '-'}>
                     {task.module_name}
                   </td>
-                  <td style={tdStyle}>{task.kind}</td>
-                  <td style={tdStyle}>{statusBadge(task.status)}</td>
-                  <td style={tdStyle}>{task.started_at || '-'}</td>
-                  <td style={tdStyle}>{task.ended_at || '-'}</td>
-                  <td style={tdStyle}>
-                    <div style={{ display: 'flex', gap: 6, flexWrap: 'nowrap', alignItems: 'center' }}>
+                  <td style={taskTdStyle}>{task.kind}</td>
+                  <td style={taskTdStyle}>{statusBadge(task.status)}</td>
+                  <td style={taskTdStyle}>{task.started_at || '-'}</td>
+                  <td style={taskTdStyle}>{task.ended_at || '-'}</td>
+                  <td style={taskTdStyle}>
+                    <div style={{display: 'flex', gap: 6, flexWrap: 'nowrap', alignItems: 'center' }}>
                       <button
-                        style={tableActionBtnStyle}
+                        style={taskTableActionBtnStyle}
                         onClick={async () => {
                           try {
                             const detail = await getTask(task.id);
@@ -2728,7 +2736,7 @@ function renderTaskManagementPage() {
 
               {tasks.length === 0 && (
                 <tr>
-                  <td colSpan={7} style={{ ...tdStyle, padding: 30, textAlign: 'center', color: '#6c8098' }}>
+                  <td colSpan={7} style={{...taskTdStyle, padding: 30, textAlign: 'center', color: '#6c8098'}}>
                     暂无任务
                   </td>
                 </tr>
@@ -2737,18 +2745,6 @@ function renderTaskManagementPage() {
           </table>
         </div>
       </div>
-
-      <div
-        style={{
-          ...styles.card,
-          padding: 14,
-          minHeight: '100%',
-          minWidth: 0,
-          maxWidth: '100%',
-          overflow: 'hidden',
-          background: '#ffffff',
-        }}
-      />
     </section>
   );
 }
@@ -3226,4 +3222,40 @@ const tableDangerBtnStyle = {
   borderRadius: 8,
   minWidth: 0,
   whiteSpace: 'nowrap',
+};
+const taskThStyle = {
+  ...thStyle,
+  padding: '12px 12px',
+  fontSize: 14,
+  fontWeight: 800,
+  color: '#24486d',
+};
+
+const taskTdStyle = {
+  ...tdStyle,
+  padding: '12px 12px',
+  fontSize: 14,
+  lineHeight: 1.55,
+  color: '#16385c',
+};
+
+const taskTdEllipsisStyle = {
+  ...taskTdStyle,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+};
+
+const taskTableActionBtnStyle = {
+  ...tableActionBtnStyle,
+  padding: '7px 12px',
+  fontSize: 13,
+  borderRadius: 8,
+};
+
+const taskTableDangerBtnStyle = {
+  ...tableDangerBtnStyle,
+  padding: '7px 12px',
+  fontSize: 13,
+  borderRadius: 8,
 };
