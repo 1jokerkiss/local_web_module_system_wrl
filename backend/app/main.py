@@ -967,6 +967,114 @@ def get_username_from_user(user) -> str:
     if isinstance(user, dict):
         return str(user.get("username") or "")
     return str(getattr(user, "username", "") or "")
+OUTPUT_ROLE_VALUES = {"output", "out", "result", "结果", "输出"}
+
+
+def data_file_belongs_to_user(item: dict, username: str) -> bool:
+    """
+    判断 data_files.json 中的一条文件记录是否属于当前用户。
+    旧数据没有 owner_username 时默认不显示，避免串用户。
+    """
+    owner = str(item.get("owner_username") or "").strip()
+    return bool(owner) and owner == str(username)
+
+
+def load_visible_data_files_for_user(username: str) -> tuple[list[dict], list[dict]]:
+    """
+    返回：
+    1. all_items：清理过不存在文件后的全量 data_files
+    2. visible_items：当前用户可见的文件列表
+
+    注意：visible_items 的 id 是给前端用的用户内序号；
+    _source_index 是它在 all_items 里的真实位置，给 preview/delete/reveal 用。
+    """
+    all_items = load_data_files()
+    kept_items: list[dict] = []
+    visible_items: list[dict] = []
+
+    for item in all_items:
+        if not isinstance(item, dict):
+            continue
+
+        role = str(item.get("io_role") or item.get("data_role") or "output").strip().lower()
+        if role not in OUTPUT_ROLE_VALUES:
+            continue
+
+        path = Path(str(item.get("path") or ""))
+        if not path.exists() or not path.is_file():
+            continue
+
+        row = dict(item)
+
+        try:
+            stat = path.stat()
+            row["size"] = stat.st_size
+            row["size_text"] = format_file_size(stat.st_size)
+            row["file_name"] = row.get("file_name") or row.get("name") or path.name
+            row["name"] = row.get("name") or path.name
+            row["io_role"] = "output"
+            row["data_role"] = "output"
+            row["modified_at"] = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+        except Exception:
+            pass
+
+        source_index = len(kept_items)
+        kept_items.append(row)
+
+        if data_file_belongs_to_user(row, username):
+            visible_row = dict(row)
+            visible_row["_source_index"] = source_index
+            visible_items.append(visible_row)
+
+    # 全量记录用全局 id 保存
+    for idx, item in enumerate(kept_items):
+        item["id"] = idx
+
+    kept_items.sort(key=lambda x: x.get("modified_at", ""), reverse=True)
+
+    # 排序后重新计算 source_index
+    source_by_key = {}
+    for idx, item in enumerate(kept_items):
+        item["id"] = idx
+        key = f"{item.get('owner_username', '')}::{item.get('path', '')}"
+        source_by_key[key] = idx
+
+    visible_items = []
+    for item in kept_items:
+        if not data_file_belongs_to_user(item, username):
+            continue
+
+        row = dict(item)
+        key = f"{row.get('owner_username', '')}::{row.get('path', '')}"
+        row["_source_index"] = source_by_key.get(key, -1)
+        visible_items.append(row)
+
+    # 前端看到的是当前用户自己的 0,1,2...
+    for idx, item in enumerate(visible_items):
+        item["id"] = idx
+
+    save_data_files(kept_items)
+    return kept_items, visible_items
+
+
+def get_user_data_file_by_visible_id(file_id: int, username: str) -> tuple[list[dict], int, dict]:
+    all_items, visible_items = load_visible_data_files_for_user(username)
+
+    if file_id < 0 or file_id >= len(visible_items):
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    visible_item = visible_items[file_id]
+    source_index = int(visible_item.get("_source_index", -1))
+
+    if source_index < 0 or source_index >= len(all_items):
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    item = all_items[source_index]
+
+    if not data_file_belongs_to_user(item, username):
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    return all_items, source_index, item
 @app.post("/api/tasks/run")
 def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
@@ -1030,7 +1138,13 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
             owner_username=username,
         )
         if output_paths:
-            start_data_file_scan_after_task(task["id"], module, output_paths)
+            start_data_file_scan_after_task(
+                task["id"],
+                module,
+                output_paths,
+                owner_username=username,
+            )
+        return task
         return task
 
     # 非批处理模块：如果模块内部自己处理并行，则把并行数传给模块。
@@ -1054,7 +1168,12 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
     )
 
     if output_paths:
-        start_data_file_scan_after_task(task["id"], module, output_paths)
+        start_data_file_scan_after_task(
+            task["id"],
+            module,
+            output_paths,
+            owner_username=username,
+        )
 
     return task
 def upsert_module(module_data: dict):
@@ -2609,13 +2728,22 @@ def upsert_data_files_from_outputs(
     module: dict,
     task_id: str,
     output_paths: list[Path],
+    owner_username: str = "",
 ):
     """
     把任务输出结果登记到 data_files.json。
     只登记信息，不移动文件。
     """
     existing = load_data_files()
-    by_path = {str(item.get("path") or ""): item for item in existing}
+    by_key = {}
+
+    for item in load_data_files():
+        if not isinstance(item, dict):
+            continue
+        path_text = str(item.get("path") or "")
+        owner = str(item.get("owner_username") or "")
+        key = f"{owner}::{path_text}"
+        by_key[key] = item
 
     files = scan_output_files(output_paths)
 
@@ -2626,9 +2754,10 @@ def upsert_data_files_from_outputs(
         stat = file_path.stat()
         path_text = str(file_path.resolve())
 
-        old = by_path.get(path_text) or {}
+        record_key = f"{owner_username}::{path_text}"
+        old = by_key.get(record_key) or {}
 
-        by_path[path_text] = {
+        by_key[record_key] = {
             **old,
             "path": path_text,
             "name": file_path.name,
@@ -2640,13 +2769,14 @@ def upsert_data_files_from_outputs(
             "module_id": module.get("id", ""),
             "module_name": module.get("name") or module.get("id", ""),
             "task_id": task_id,
+            "owner_username": str(owner_username or ""),
             "size": stat.st_size,
             "size_text": format_file_size(stat.st_size),
             "created_at": datetime.fromtimestamp(stat.st_ctime).isoformat(timespec="seconds"),
             "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
         }
 
-    items = list(by_path.values())
+    items = list(by_key.values())
     items.sort(key=lambda x: x.get("modified_at", ""), reverse=True)
 
     for idx, item in enumerate(items):
@@ -2656,7 +2786,12 @@ def upsert_data_files_from_outputs(
     return items
 
 
-def start_data_file_scan_after_task(task_id: str, module: dict, output_paths: list[Path]):
+def start_data_file_scan_after_task(
+    task_id: str,
+    module: dict,
+    output_paths: list[Path],
+    owner_username: str = "",
+):
     """
     任务结束后扫描输出路径，将结果登记到数据管理。
     """
@@ -2675,10 +2810,13 @@ def start_data_file_scan_after_task(task_id: str, module: dict, output_paths: li
             if status in terminal_statuses:
                 if status == "success":
                     try:
+                        task_owner = owner_username or str(task.get("owner_username") or "")
+
                         upsert_data_files_from_outputs(
                             module=module,
                             task_id=task_id,
                             output_paths=output_paths,
+                            owner_username=task_owner,
                         )
                         try:
                             task_manager.append_log(task_id, "[DATA] 输出结果已登记到数据管理")
@@ -2705,48 +2843,29 @@ def start_data_file_scan_after_task(task_id: str, module: dict, output_paths: li
 # =========================
 @app.get("/api/data/files")
 def api_list_data_files(authorization: str | None = Header(default=None)):
-    get_current_user(authorization)
-    items = load_data_files()
+    user = get_current_user(authorization)
+    username = get_username_from_user(user)
+    if not username:
+        raise HTTPException(status_code=401, detail="未登录")
 
-    # 数据管理只显示输出文件；旧数据没有 io_role/data_role 时按 output 兼容处理。
-    cleaned = []
-    for item in items:
-        role = str(item.get("io_role") or item.get("data_role") or "output").strip().lower()
-        if role not in {"output", "out", "result", "结果", "输出"}:
-            continue
+    _, visible_items = load_visible_data_files_for_user(username)
 
-        path = Path(str(item.get("path") or ""))
-        if path.exists() and path.is_file():
-            try:
-                stat = path.stat()
-                item["size"] = stat.st_size
-                item["size_text"] = format_file_size(stat.st_size)
-                item["file_name"] = item.get("file_name") or item.get("name") or path.name
-                item["name"] = item.get("name") or path.name
-                item["io_role"] = "output"
-                item["data_role"] = "output"
-                item["modified_at"] = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
-            except Exception:
-                pass
-            cleaned.append(item)
+    for item in visible_items:
+        item.pop("_source_index", None)
 
-    cleaned.sort(key=lambda x: x.get("modified_at", ""), reverse=True)
-    for idx, item in enumerate(cleaned):
-        item["id"] = idx
-
-    save_data_files(cleaned)
-    return cleaned
+    return visible_items
 
 
 @app.post("/api/data/files/{file_id}/reveal")
 def api_reveal_data_file(file_id: int, authorization: str | None = Header(default=None)):
-    get_current_user(authorization)
+    user = get_current_user(authorization)
+    username = get_username_from_user(user)
+    if not username:
+        raise HTTPException(status_code=401, detail="未登录")
 
-    items = load_data_files()
-    if file_id < 0 or file_id >= len(items):
-        raise HTTPException(status_code=404, detail="文件不存在")
+    _, _, item = get_user_data_file_by_visible_id(file_id, username)
 
-    path = Path(str(items[file_id].get("path") or ""))
+    path = Path(str(item.get("path") or ""))
     if not path.exists():
         raise HTTPException(status_code=404, detail="文件不存在")
 
@@ -2764,16 +2883,15 @@ def api_reveal_data_file(file_id: int, authorization: str | None = Header(defaul
 
     return {"ok": True}
 
-
 @app.delete("/api/data/files/{file_id}")
 def api_delete_data_file(file_id: int, authorization: str | None = Header(default=None)):
-    get_current_user(authorization)
+    user = get_current_user(authorization)
+    username = get_username_from_user(user)
+    if not username:
+        raise HTTPException(status_code=401, detail="未登录")
 
-    items = load_data_files()
-    if file_id < 0 or file_id >= len(items):
-        raise HTTPException(status_code=404, detail="文件不存在")
+    items, source_index, item = get_user_data_file_by_visible_id(file_id, username)
 
-    item = items[file_id]
     path = Path(str(item.get("path") or ""))
 
     if path.exists() and path.is_file():
@@ -2782,7 +2900,8 @@ def api_delete_data_file(file_id: int, authorization: str | None = Header(defaul
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"删除文件失败: {exc}")
 
-    items.pop(file_id)
+    items.pop(source_index)
+
     for idx, row in enumerate(items):
         row["id"] = idx
 
@@ -2792,13 +2911,13 @@ def api_delete_data_file(file_id: int, authorization: str | None = Header(defaul
 
 @app.get("/api/data/files/{file_id}/preview")
 def api_preview_data_file(file_id: int, authorization: str | None = Header(default=None)):
-    get_current_user(authorization)
+    user = get_current_user(authorization)
+    username = get_username_from_user(user)
+    if not username:
+        raise HTTPException(status_code=401, detail="未登录")
 
-    items = load_data_files()
-    if file_id < 0 or file_id >= len(items):
-        raise HTTPException(status_code=404, detail="文件不存在")
+    _, _, item = get_user_data_file_by_visible_id(file_id, username)
 
-    item = items[file_id]
     path = Path(str(item.get("path") or ""))
 
     if not path.exists() or not path.is_file():
