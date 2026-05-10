@@ -360,3 +360,19 @@ export async function deleteDataFile(fileId) {
     method: 'DELETE',
   });
 }
+export async function uploadPythonModule(file, options) {
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('module_id', options.module_id || '');
+  fd.append('module_name', options.module_name || '');
+  fd.append('entry_file', options.entry_file || 'main.py');
+
+  if (options.tool_type) {
+    fd.append('tool_type', options.tool_type);
+  }
+
+  return request('/api/admin/modules/upload-python', {
+    method: 'POST',
+    body: fd,
+  });
+}

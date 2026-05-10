@@ -23,6 +23,7 @@ import {
   saveModule,
   deleteModule as deleteModuleApi,
   uploadModuleZip,
+  uploadPythonModule,
   listDropZips,
   installLocalDropModules,
   getTask,
@@ -1327,6 +1328,15 @@ export default function App() {
   const [uploadToolType, setUploadToolType] = useState('');
   const [dropInfo, setDropInfo] = useState({ drop_dir: '', items: [] });
   const [uploadMsg, setUploadMsg] = useState('');
+  const [moduleMgmtAction, setModuleMgmtAction] = useState('module_upload');
+  const [pythonUploadOpen, setPythonUploadOpen] = useState(false);
+
+
+  const [pythonZipFile, setPythonZipFile] = useState(null);
+  const [pythonModuleId, setPythonModuleId] = useState('');
+  const [pythonModuleName, setPythonModuleName] = useState('');
+  const [pythonEntryFile, setPythonEntryFile] = useState('main.py');
+  const [pythonUploadMsg, setPythonUploadMsg] = useState('');
   const [newToolbarForm, setNewToolbarForm] = useState({ key: '', label: '' });
   const [editingToolbarKey, setEditingToolbarKey] = useState('');
   const [toolbarEditForm, setToolbarEditForm] = useState({ key: '', label: '' });
@@ -1971,7 +1981,83 @@ function addTaskWindow(task, title) {
       setUploadMsg(e?.message || '上传失败');
     }
   }
+  async function uploadPythonZip() {
+  if (!pythonZipFile) {
+    setPythonUploadMsg('请选择 Python 源码 zip 包');
+    return;
+  }
 
+  if (!uploadToolType) {
+    alert('请先选择模块所属工具栏');
+    return;
+  }
+
+  if (!pythonModuleId.trim()) {
+    alert('请输入模块 ID');
+    return;
+  }
+
+  if (!pythonModuleName.trim()) {
+    alert('请输入模块名称');
+    return;
+  }
+
+  setPythonUploadMsg('正在上传并自动打包 Python 源码，请稍等...');
+
+  try {
+    await uploadPythonModule(pythonZipFile, {
+      module_id: pythonModuleId.trim(),
+      module_name: pythonModuleName.trim(),
+      entry_file: pythonEntryFile.trim() || 'main.py',
+      tool_type: uploadToolType,
+    });
+
+    setPythonZipFile(null);
+    setPythonModuleId('');
+    setPythonModuleName('');
+    setPythonEntryFile('main.py');
+    setPythonUploadMsg('');
+
+    await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
+
+    setPythonUploadOpen(false);
+    alert('Python 源码打包并安装成功');
+  } catch (e) {
+    setPythonUploadMsg(e?.message || 'Python 源码上传或打包失败');
+  }
+}
+function renderModuleMgmtButton(key, title, desc, onClick) {
+  const active = moduleMgmtAction === key;
+
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        setModuleMgmtAction(key);
+        onClick?.();
+      }}
+      style={{
+        width: '100%',
+        textAlign: 'left',
+        border: active ? '2px solid #2d7cf6' : '1px solid #d7e3f1',
+        background: active
+          ? 'linear-gradient(135deg, rgba(45,124,246,0.12), rgba(45,124,246,0.04))'
+          : '#fff',
+        borderRadius: 14,
+        padding: '18px 18px',
+        cursor: 'pointer',
+        boxShadow: active ? '0 10px 22px rgba(45,124,246,0.12)' : 'none',
+      }}
+    >
+      <div style={{ fontSize: 18, fontWeight: 900, color: '#12385f', marginBottom: 8 }}>
+        {title}
+      </div>
+      <div style={{ fontSize: 13, lineHeight: 1.6, color: '#6a7f96' }}>
+        {desc}
+      </div>
+    </button>
+  );
+}
   async function installFromDrop(filename = '') {
     if (!uploadToolType) {
       alert('请先添加或选择一个工具栏');
@@ -2678,21 +2764,22 @@ function renderDataManagementPage() {
             <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 1160, tableLayout: 'fixed' }}>
               <thead>
                 <tr>
-                  <th style={{ ...thStyle, width: 58 }}>文件ID</th>
-                  <th style={{ ...thStyle, width: 250 }}>文件名</th>
-                  <th style={{ ...thStyle, width: 78 }}>类型</th>
-                  <th style={{ ...thStyle, width: 150 }}>所属模块</th>
-                  <th style={{ ...thStyle, width: 88 }}>大小</th>
-                  <th style={{ ...thStyle, width: 145 }}>创建时间</th>
+                  <th style={{...thStyle, width: 58}}>文件ID</th>
+                  {isAdmin && <th style={{...thStyle, width: 110}}>用户ID</th>}
+                  <th style={{...thStyle, width: 250}}>文件名</th>
+                  <th style={{...thStyle, width: 78}}>类型</th>
+                  <th style={{...thStyle, width: 150}}>所属模块</th>
+                  <th style={{...thStyle, width: 88}}>大小</th>
+                  <th style={{...thStyle, width: 145}}>创建时间</th>
                   <th style={thStyle}>本地路径</th>
-                  <th style={{ ...thStyle, width: 210 }}>操作</th>
+                  <th style={{...thStyle, width: 210}}>操作</th>
                 </tr>
               </thead>
 
               <tbody>
                 {dataFiles.length === 0 && (
                   <tr>
-                    <td style={tdStyle} colSpan={8}>
+                    <td style={tdStyle} colSpan={isAdmin ? 9 : 8}>
                       暂无输出结果文件。运行模块后，系统会自动登记输出路径下的文件。
                     </td>
                   </tr>
@@ -2706,6 +2793,13 @@ function renderDataManagementPage() {
                     }}
                   >
                     <td style={tdStyle}>{file.id}</td>
+
+                    {isAdmin && (
+                        <td style={tdEllipsisStyle} title={file.owner_username || '-'}>
+                          {file.owner_username || '-'}
+                        </td>
+                    )}
+
                     <td style={tdEllipsisStyle} title={file.file_name || file.name || '-'}>
                       {file.file_name || file.name || '-'}
                     </td>
@@ -2818,6 +2912,7 @@ function renderTaskManagementPage() {
             <thead>
             <tr>
               <th style={{...taskThStyle, width: 130}}>任务ID</th>
+              {isAdmin && <th style={{...taskThStyle, width: 110}}>用户ID</th>}
               <th style={{...taskThStyle, width: 190}}>模块</th>
               <th style={{...taskThStyle, width: 90}}>类型</th>
               <th style={{...taskThStyle, width: 115}}>状态</th>
@@ -2836,6 +2931,13 @@ function renderTaskManagementPage() {
                     }}
                 >
                   <td style={taskTdEllipsisStyle} title={task.id}>{task.id}</td>
+
+                  {isAdmin && (
+                      <td style={taskTdEllipsisStyle} title={task.owner_username || '-'}>
+                        {task.owner_username || '-'}
+                      </td>
+                  )}
+
                   <td style={taskTdEllipsisStyle} title={task.module_name || '-'}>
                     {task.module_name}
                   </td>
@@ -2885,7 +2987,7 @@ function renderTaskManagementPage() {
 
               {tasks.length === 0 && (
                 <tr>
-                  <td colSpan={7} style={{...taskTdStyle, padding: 30, textAlign: 'center', color: '#6c8098'}}>
+                  <td colSpan={isAdmin ? 8 : 7} style={{...taskTdStyle, padding: 30, textAlign: 'center', color: '#6c8098'}}>
                     暂无任务
                   </td>
                 </tr>
@@ -2971,114 +3073,201 @@ function renderTaskManagementPage() {
       <div style={{ padding: 12 }}>
         {activeTab === 'module_mgmt' && isAdmin && (
           <section style={{ ...styles.card, padding: 16, minHeight: 'calc(100vh - 98px)' }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '380px 1fr', gap: 16 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '380px minmax(0, 1fr)', gap: 16 }}>
               <div style={{ ...styles.card, padding: 16 }}>
-                <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
-                  模块上传 / 本地投放
+                <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 16 }}>
+                  模块管理功能
                 </div>
 
-                <div style={{ display: 'grid', gap: 10, marginBottom: 14 }}>
-                  <label>
-                    <div style={labelStyle}>模块所属工具栏</div>
-                    <select value={uploadToolType} onChange={(e) => setUploadToolType(e.target.value)} style={styles.input}>
-                      {renderToolbarOptions()}
-                    </select>
-                  </label>
+                <div style={{ display: 'grid', gap: 12 }}>
+                  {renderModuleMgmtButton(
+                    'python_upload',
+                    'Python 源代码打包上传',
+                    '上传 Python 源码 zip 包，系统自动打包为 exe 并注册为模块。',
+                    () => setPythonUploadOpen(true)
+                  )}
 
-                  <label>
-                    <div style={labelStyle}>可选：上传模块 zip</div>
-                    <input type="file" accept=".zip" onChange={(e) => setZipFile(e.target.files?.[0] || null)} />
-                  </label>
+                  {renderModuleMgmtButton(
+                    'module_upload',
+                    '模块上传/投放',
+                    '上传已有 exe 模块 zip，或扫描本地 module_drop 目录安装。'
+                  )}
+
+                  {renderModuleMgmtButton(
+                    'installed_modules',
+                    '已安装模块',
+                    '查看当前已经安装到系统中的模块，并进行编辑或删除。'
+                  )}
+
+                  {renderModuleMgmtButton(
+                    'toolbars',
+                    '工具栏',
+                    '管理云反演、气溶胶反演等顶部工具栏分类。'
+                  )}
                 </div>
-
-                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                  <button style={styles.blueBtn} onClick={uploadZip}>上传并安装</button>
-                  <button style={styles.blueBtn} onClick={() => installFromDrop()}>扫描本地目录安装</button>
-                  <button style={styles.whiteBtn} onClick={refreshDropZipList}>刷新目录</button>
-                  <button style={styles.whiteBtn} onClick={() => setShowDropHint(true)}>本地模块目录说明</button>
-                </div>
-
-                {uploadMsg && <div style={{ marginTop: 12, color: '#4f6682' }}>{uploadMsg}</div>}
-                {dropInfo.drop_dir && (
-                  <div style={{ marginTop: 12, color: '#6a7f96', fontSize: 13, wordBreak: 'break-all' }}>
-                    本地投放目录：{dropInfo.drop_dir}
-                  </div>
-                )}
-
-                {dropInfo.items?.length > 0 && (
-                  <div style={{ marginTop: 12, display: 'grid', gap: 8 }}>
-                    <div style={{ fontWeight: 800, color: '#12385f' }}>目录中待安装 zip</div>
-                    {dropInfo.items.map((item) => (
-                      <div key={item.path} style={{ border: '1px solid #e1eaf3', background: '#fff', borderRadius: 10, padding: 10 }}>
-                        <div style={{ fontWeight: 700, wordBreak: 'break-all' }}>{item.name}</div>
-                        <button style={{ ...styles.whiteBtn, marginTop: 8 }} onClick={() => installFromDrop(item.name)}>
-                          安装这个 zip
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                <div style={{ marginTop: 20, fontSize: 20, fontWeight: 900, color: '#12385f' }}>
-                  已安装模块
-                </div>
-                {renderInstalledModulesTree()}
-
-                <div style={{ marginTop: 20, fontSize: 18, fontWeight: 900, color: '#12385f', marginBottom: 10 }}>
-                  工具栏列表
-                </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8, marginBottom: 10 }}>
-                  <input
-                    placeholder="新增工具栏名称"
-                    value={newToolbarForm.label}
-                    onChange={(e) => setNewToolbarForm({ ...newToolbarForm, label: e.target.value })}
-                    style={{ ...styles.input, minHeight: 38, fontSize: 13 }}
-                  />
-                  <input
-                    placeholder="标识，可选"
-                    value={newToolbarForm.key}
-                    onChange={(e) => setNewToolbarForm({ ...newToolbarForm, key: e.target.value })}
-                    style={{ ...styles.input, minHeight: 38, fontSize: 13 }}
-                  />
-                  <button style={{ ...styles.blueBtn, padding: '8px 12px', fontSize: 13 }} onClick={handleAddToolbar}>添加</button>
-                </div>
-                {renderToolbarAdminList()}
               </div>
 
-              <div style={{ ...styles.card, padding: 16 }}>
-                <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
-                  {editingModuleId ? `编辑模块：${editingModuleId}` : '手工新增 / 更新模块'}
-                </div>
+              <div style={{ display: 'grid', gap: 16, minWidth: 0 }}>
+                {moduleMgmtAction === 'python_upload' && (
+                  <div style={{ ...styles.card, padding: 18 }}>
+                    <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 10 }}>
+                      Python 源代码打包上传
+                    </div>
+                    <div style={{ color: '#6a7f96', lineHeight: 1.8, marginBottom: 14 }}>
+                      点击下方按钮打开上传弹窗，填写模块 ID、模块名称、入口文件并选择 Python 源码 zip。
+                    </div>
+                    <button style={styles.blueBtn} onClick={() => setPythonUploadOpen(true)}>
+                      打开上传弹窗
+                    </button>
+                  </div>
+                )}
 
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                  <select value={moduleForm.tool_type} onChange={(e) => setModuleForm({ ...moduleForm, tool_type: e.target.value })} style={styles.input}>
-                    {renderToolbarOptions()}
-                  </select>
-                  <input placeholder="ID" value={moduleForm.id} onChange={(e) => setModuleForm({ ...moduleForm, id: e.target.value })} style={styles.input} />
-                  <input placeholder="名称" value={moduleForm.name} onChange={(e) => setModuleForm({ ...moduleForm, name: e.target.value })} style={styles.input} />
-                  <input placeholder="可执行文件" value={moduleForm.executable} onChange={(e) => setModuleForm({ ...moduleForm, executable: e.target.value })} style={styles.input} />
-                  <input placeholder="工作目录" value={moduleForm.working_dir} onChange={(e) => setModuleForm({ ...moduleForm, working_dir: e.target.value })} style={styles.input} />
-                  <input placeholder="标签，英文逗号分隔" value={moduleForm.tags_text} onChange={(e) => setModuleForm({ ...moduleForm, tags_text: e.target.value })} style={styles.input} />
+                {moduleMgmtAction === 'module_upload' && (
+                  <div style={{ ...styles.card, padding: 18 }}>
+                    <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
+                      模块上传 / 本地投放
+                    </div>
 
-                  <textarea placeholder="描述" value={moduleForm.description} onChange={(e) => setModuleForm({ ...moduleForm, description: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 80 }} />
-                  <textarea placeholder="命令模板(JSON数组)" value={moduleForm.command_template_text} onChange={(e) => setModuleForm({ ...moduleForm, command_template_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2' }} />
-                  <textarea placeholder="输入字段(JSON数组)：包含输入/输出路径、是否用户可见、管理员预填 resources 等" value={moduleForm.inputs_text} onChange={(e) => setModuleForm({ ...moduleForm, inputs_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 180 }} />
-                  <textarea placeholder="并行配置(JSON对象)，保存在 module.json 的 parallel 字段" value={moduleForm.parallel_json_text} onChange={(e) => setModuleForm({ ...moduleForm, parallel_json_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 110 }} />
-                </div>
+                    <div style={{ display: 'grid', gap: 12 }}>
+                      <div>
+                        <div style={labelStyle}>模块所属工具栏</div>
+                        <select
+                          value={uploadToolType}
+                          onChange={(e) => setUploadToolType(e.target.value)}
+                          style={styles.input}
+                        >
+                          {renderToolbarOptions()}
+                        </select>
+                      </div>
 
-                <div style={{ display: 'flex', gap: 10, marginTop: 14, flexWrap: 'wrap' }}>
-                  <button style={styles.blueBtn} onClick={saveCurrentModule}>保存模块</button>
-                  <button style={styles.whiteBtn} onClick={openInputEditor}>编辑输入文件</button>
-                  <button
-                    style={styles.whiteBtn}
-                    onClick={() => {
-                      setEditingModuleId('');
-                      setModuleForm(emptyModuleForm);
-                    }}
-                  >
-                    新建空白
-                  </button>
-                </div>
+                      <div>
+                        <div style={labelStyle}>可选：上传模块 zip</div>
+                        <input
+                          style={styles.input}
+                          type="file"
+                          accept=".zip"
+                          onChange={(e) => setZipFile(e.target.files?.[0] || null)}
+                        />
+                      </div>
+
+                      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                        <button style={styles.blueBtn} onClick={uploadZip}>上传并安装</button>
+                        <button style={styles.blueBtn} onClick={() => installFromDrop()}>扫描本地目录安装</button>
+                        <button style={styles.whiteBtn} onClick={refreshDropZipList}>刷新目录</button>
+                        <button style={styles.whiteBtn} onClick={() => setShowDropHint(true)}>本地模块目录说明</button>
+                      </div>
+
+                      {uploadMsg && <div style={{ color: '#4f6682' }}>{uploadMsg}</div>}
+
+                      {dropInfo.drop_dir && (
+                        <div style={{ color: '#6a7f96', fontSize: 13, wordBreak: 'break-all' }}>
+                          本地投放目录：{dropInfo.drop_dir}
+                        </div>
+                      )}
+
+                      {dropInfo.items?.length > 0 && (
+                        <div style={{ display: 'grid', gap: 8 }}>
+                          <div style={{ fontWeight: 800, color: '#12385f' }}>目录中待安装 zip</div>
+                          {dropInfo.items.map((item) => (
+                            <div
+                              key={item.path}
+                              style={{ border: '1px solid #e1eaf3', background: '#fff', borderRadius: 10, padding: 10 }}
+                            >
+                              <div style={{ fontWeight: 700, wordBreak: 'break-all' }}>{item.name}</div>
+                              <button
+                                style={{ ...styles.whiteBtn, marginTop: 8 }}
+                                onClick={() => installFromDrop(item.name)}
+                              >
+                                安装这个 zip
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {moduleMgmtAction === 'installed_modules' && (
+                  <>
+                    <div style={{ ...styles.card, padding: 18 }}>
+                      <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
+                        已安装模块
+                      </div>
+                      {renderInstalledModulesTree()}
+                    </div>
+
+                    <div style={{ ...styles.card, padding: 16 }}>
+                      <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
+                        {editingModuleId ? `编辑模块：${editingModuleId}` : '手工新增 / 更新模块'}
+                      </div>
+
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                        <select
+                          value={moduleForm.tool_type}
+                          onChange={(e) => setModuleForm({ ...moduleForm, tool_type: e.target.value })}
+                          style={styles.input}
+                        >
+                          {renderToolbarOptions()}
+                        </select>
+                        <input
+                          placeholder="ID"
+                          value={moduleForm.id}
+                          onChange={(e) => setModuleForm({ ...moduleForm, id: e.target.value })}
+                          style={styles.input}
+                        />
+                        <input placeholder="名称" value={moduleForm.name} onChange={(e) => setModuleForm({ ...moduleForm, name: e.target.value })} style={styles.input} />
+                        <input placeholder="可执行文件" value={moduleForm.executable} onChange={(e) => setModuleForm({ ...moduleForm, executable: e.target.value })} style={styles.input} />
+                        <input placeholder="工作目录" value={moduleForm.working_dir} onChange={(e) => setModuleForm({ ...moduleForm, working_dir: e.target.value })} style={styles.input} />
+                        <input placeholder="标签，英文逗号分隔" value={moduleForm.tags_text} onChange={(e) => setModuleForm({ ...moduleForm, tags_text: e.target.value })} style={styles.input} />
+                        <textarea placeholder="描述" value={moduleForm.description} onChange={(e) => setModuleForm({ ...moduleForm, description: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 80 }} />
+                        <textarea placeholder="命令模板(JSON数组)" value={moduleForm.command_template_text} onChange={(e) => setModuleForm({ ...moduleForm, command_template_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2' }} />
+                        <textarea placeholder="输入字段(JSON数组)：包含输入/输出路径、是否用户可见、管理员预填 resources 等" value={moduleForm.inputs_text} onChange={(e) => setModuleForm({ ...moduleForm, inputs_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 180 }} />
+                        <textarea placeholder="并行配置(JSON对象)，保存在 module.json 的 parallel 字段" value={moduleForm.parallel_json_text} onChange={(e) => setModuleForm({ ...moduleForm, parallel_json_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 110 }} />
+                      </div>
+
+                      <div style={{ display: 'flex', gap: 10, marginTop: 14, flexWrap: 'wrap' }}>
+                        <button style={styles.blueBtn} onClick={saveCurrentModule}>保存模块</button>
+                        <button style={styles.whiteBtn} onClick={openInputEditor}>编辑输入文件</button>
+                        <button
+                          style={styles.whiteBtn}
+                          onClick={() => {
+                            setEditingModuleId('');
+                            setModuleForm(emptyModuleForm);
+                          }}
+                        >
+                          新建空白
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                {moduleMgmtAction === 'toolbars' && (
+                  <div style={{ ...styles.card, padding: 18 }}>
+                    <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
+                      工具栏列表
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8, marginBottom: 10 }}>
+                      <input
+                        placeholder="新增工具栏名称"
+                        value={newToolbarForm.label}
+                        onChange={(e) => setNewToolbarForm({ ...newToolbarForm, label: e.target.value })}
+                        style={{ ...styles.input, minHeight: 38, fontSize: 13 }}
+                      />
+                      <input
+                        placeholder="标识，可选"
+                        value={newToolbarForm.key}
+                        onChange={(e) => setNewToolbarForm({ ...newToolbarForm, key: e.target.value })}
+                        style={{ ...styles.input, minHeight: 38, fontSize: 13 }}
+                      />
+                      <button style={{ ...styles.blueBtn, padding: '8px 12px', fontSize: 13 }} onClick={handleAddToolbar}>
+                        添加
+                      </button>
+                    </div>
+                    {renderToolbarAdminList()}
+                  </div>
+                )}
               </div>
             </div>
           </section>
@@ -3176,6 +3365,110 @@ function renderTaskManagementPage() {
           </TaskTrayFloatingWindow>
         )}
 
+{pythonUploadOpen && (
+  <SimpleOverlay
+    title="Python 源代码打包上传"
+    onClose={() => {
+      setPythonUploadOpen(false);
+      setPythonUploadMsg('');
+    }}
+    width="min(760px, 96vw)"
+  >
+    <div style={{ display: 'grid', gap: 14 }}>
+      <div style={{ color: '#6a7f96', lineHeight: 1.8 }}>
+        上传 Python 源码 zip 包，后端会使用 PyInstaller 自动打包为 exe，
+        并注册为系统可运行模块。zip 包内建议包含 main.py、requirements.txt 和 module.json。
+      </div>
+
+      <div>
+        <div style={labelStyle}>模块所属工具栏</div>
+        <select
+          value={uploadToolType}
+          onChange={(e) => setUploadToolType(e.target.value)}
+          style={styles.input}
+        >
+          {renderToolbarOptions()}
+        </select>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+        <div>
+          <div style={labelStyle}>模块 ID</div>
+          <input
+            style={styles.input}
+            value={pythonModuleId}
+            onChange={(e) => setPythonModuleId(e.target.value)}
+            placeholder="例如：python_cloud_demo"
+          />
+        </div>
+
+        <div>
+          <div style={labelStyle}>模块名称</div>
+          <input
+            style={styles.input}
+            value={pythonModuleName}
+            onChange={(e) => setPythonModuleName(e.target.value)}
+            placeholder="例如：Python 云检测模块"
+          />
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+        <div>
+          <div style={labelStyle}>入口文件</div>
+          <input
+            style={styles.input}
+            value={pythonEntryFile}
+            onChange={(e) => setPythonEntryFile(e.target.value)}
+            placeholder="main.py"
+          />
+        </div>
+
+        <div>
+          <div style={labelStyle}>Python 源码 zip</div>
+          <input
+            style={styles.input}
+            type="file"
+            accept=".zip"
+            onChange={(e) => setPythonZipFile(e.target.files?.[0] || null)}
+          />
+        </div>
+      </div>
+
+      {pythonUploadMsg && (
+        <div
+          style={{
+            whiteSpace: 'pre-wrap',
+            color:
+              pythonUploadMsg.includes('失败') ||
+              pythonUploadMsg.includes('错误')
+                ? '#bb2c2c'
+                : '#4f6682',
+            lineHeight: 1.7,
+          }}
+        >
+          {pythonUploadMsg}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 8 }}>
+        <button
+          style={styles.whiteBtn}
+          onClick={() => {
+            setPythonUploadOpen(false);
+            setPythonUploadMsg('');
+          }}
+        >
+          取消
+        </button>
+
+        <button style={styles.blueBtn} onClick={uploadPythonZip}>
+          上传并自动打包
+        </button>
+      </div>
+    </div>
+  </SimpleOverlay>
+)}
 {inputEditorOpen && (
         <SimpleOverlay
           title="编辑输入文件"

@@ -967,6 +967,17 @@ def get_username_from_user(user) -> str:
     if isinstance(user, dict):
         return str(user.get("username") or "")
     return str(getattr(user, "username", "") or "")
+def get_role_from_user(user) -> str:
+    """
+    兼容 get_current_user() 返回 dict 或对象两种情况。
+    """
+    if isinstance(user, dict):
+        return str(user.get("role") or "")
+    return str(getattr(user, "role", "") or "")
+
+
+def is_admin_user(user) -> bool:
+    return get_role_from_user(user) == "admin"
 OUTPUT_ROLE_VALUES = {"output", "out", "result", "结果", "输出"}
 
 
@@ -979,7 +990,10 @@ def data_file_belongs_to_user(item: dict, username: str) -> bool:
     return bool(owner) and owner == str(username)
 
 
-def load_visible_data_files_for_user(username: str) -> tuple[list[dict], list[dict]]:
+def load_visible_data_files_for_user(
+    username: str,
+    include_all: bool = False,
+) -> tuple[list[dict], list[dict]]:
     """
     返回：
     1. all_items：清理过不存在文件后的全量 data_files
@@ -1021,7 +1035,7 @@ def load_visible_data_files_for_user(username: str) -> tuple[list[dict], list[di
         source_index = len(kept_items)
         kept_items.append(row)
 
-        if data_file_belongs_to_user(row, username):
+        if include_all or data_file_belongs_to_user(row, username):
             visible_row = dict(row)
             visible_row["_source_index"] = source_index
             visible_items.append(visible_row)
@@ -1041,7 +1055,7 @@ def load_visible_data_files_for_user(username: str) -> tuple[list[dict], list[di
 
     visible_items = []
     for item in kept_items:
-        if not data_file_belongs_to_user(item, username):
+        if not include_all and not data_file_belongs_to_user(item, username):
             continue
 
         row = dict(item)
@@ -1057,8 +1071,15 @@ def load_visible_data_files_for_user(username: str) -> tuple[list[dict], list[di
     return kept_items, visible_items
 
 
-def get_user_data_file_by_visible_id(file_id: int, username: str) -> tuple[list[dict], int, dict]:
-    all_items, visible_items = load_visible_data_files_for_user(username)
+def get_user_data_file_by_visible_id(
+    file_id: int,
+    username: str,
+    include_all: bool = False,
+) -> tuple[list[dict], int, dict]:
+    all_items, visible_items = load_visible_data_files_for_user(
+        username,
+        include_all=include_all,
+    )
 
     if file_id < 0 or file_id >= len(visible_items):
         raise HTTPException(status_code=404, detail="文件不存在")
@@ -1071,7 +1092,7 @@ def get_user_data_file_by_visible_id(file_id: int, username: str) -> tuple[list[
 
     item = all_items[source_index]
 
-    if not data_file_belongs_to_user(item, username):
+    if not include_all and not data_file_belongs_to_user(item, username):
         raise HTTPException(status_code=404, detail="文件不存在")
 
     return all_items, source_index, item
@@ -1378,7 +1399,108 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
 
     # 强制 cwd 为模块目录
     return command, str(module_dir), runtime_env
+def build_python_source_to_exe(
+    source_zip: Path,
+    module_id: str,
+    entry_file: str = "main.py",
+) -> tuple[Path, Path]:
+    """
+    把用户上传的 Python 源码 zip 打包成 exe。
 
+    返回：
+    - module_root: 解压后的源码目录
+    - exe_path: 生成的 exe 路径
+    """
+    temp_dir = Path(tempfile.mkdtemp(prefix="python_module_"))
+
+    try:
+        source_dir = temp_dir / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(source_zip, "r") as zf:
+            zf.extractall(source_dir)
+
+        entry_path = source_dir / entry_file
+        if not entry_path.exists():
+            candidates = list(source_dir.rglob(entry_file))
+            if candidates:
+                entry_path = candidates[0]
+
+        if not entry_path.exists():
+            raise HTTPException(
+                status_code=400,
+                detail=f"未找到 Python 入口文件：{entry_file}",
+            )
+
+        requirements_path = source_dir / "requirements.txt"
+
+        # 可选：如果源码包里有 requirements.txt，先安装依赖
+        if requirements_path.exists():
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "-r",
+                    str(requirements_path),
+                ],
+                cwd=str(source_dir),
+                check=True,
+            )
+
+        dist_dir = temp_dir / "dist"
+        build_dir = temp_dir / "build"
+        spec_dir = temp_dir / "spec"
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "PyInstaller",
+            "--noconfirm",
+            "--clean",
+            "--onefile",
+            "--name",
+            module_id,
+            "--distpath",
+            str(dist_dir),
+            "--workpath",
+            str(build_dir),
+            "--specpath",
+            str(spec_dir),
+            str(entry_path),
+        ]
+
+        result = subprocess.run(
+            cmd,
+            cwd=str(source_dir),
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Python 代码打包失败：\n"
+                    + (result.stderr or result.stdout or "未知错误")
+                ),
+            )
+
+        exe_path = dist_dir / f"{module_id}.exe"
+        if not exe_path.exists():
+            raise HTTPException(
+                status_code=400,
+                detail="打包完成但未找到生成的 exe 文件",
+            )
+
+        return source_dir, exe_path
+
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"安装 Python 依赖失败：{e}",
+        )
 def install_uploaded_zip(zip_path: Path, tool_type: str | None = None) -> dict:
     temp_dir = Path(tempfile.mkdtemp(prefix="module_zip_"))
     try:
@@ -1440,6 +1562,7 @@ def install_uploaded_zip(zip_path: Path, tool_type: str | None = None) -> dict:
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
 # ========================
 # 认证接口
 # =========================
@@ -1469,7 +1592,104 @@ def api_register(payload: RegisterRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+"""新增 /api/admin/modules/upload-python
 
+这个接口负责：
+
+接收 Python 源码 zip；
+使用 PyInstaller 打包 exe；
+放入 backend/installed_modules/{module_id}/；
+自动生成或读取 module.json；
+写入 modules.json。"""
+@app.post("/api/admin/modules/upload-python")
+def api_upload_python_module(
+    file: UploadFile = File(...),
+    module_id: str = Form(...),
+    module_name: str = Form(...),
+    entry_file: str = Form("main.py"),
+    tool_type: str | None = Form(default=None),
+    authorization: str | None = Header(default=None),
+):
+    user = get_current_user(authorization)
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="只有管理员可以上传模块")
+
+    safe_module_id = sanitize_filename(module_id).strip()
+    if not safe_module_id:
+        raise HTTPException(status_code=400, detail="模块 ID 不能为空")
+
+    if not file.filename or not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="请上传 Python 源码 zip 包")
+
+    upload_tmp = Path(tempfile.mkdtemp(prefix="python_upload_"))
+
+    try:
+        zip_path = upload_tmp / sanitize_filename(file.filename)
+
+        with zip_path.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+        source_dir, exe_path = build_python_source_to_exe(
+            source_zip=zip_path,
+            module_id=safe_module_id,
+            entry_file=entry_file,
+        )
+
+        target_dir = INSTALLED_MODULES_DIR / safe_module_id
+        if target_dir.exists():
+            shutil.rmtree(target_dir)
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # 复制源码，方便后续查看和维护
+        source_target_dir = target_dir / "source"
+        shutil.copytree(source_dir, source_target_dir, dirs_exist_ok=True)
+
+        # 复制 exe
+        final_exe_path = target_dir / f"{safe_module_id}.exe"
+        shutil.copy2(exe_path, final_exe_path)
+
+        # 如果源码包里有 module.json，优先读取
+        module_json_candidates = list(source_dir.rglob("module.json"))
+        if module_json_candidates:
+            module_data = json.loads(module_json_candidates[0].read_text(encoding="utf-8"))
+        else:
+            module_data = {
+                "id": safe_module_id,
+                "name": module_name,
+                "description": "Python 源码自动打包生成的模块",
+                "enabled": True,
+                "config_mode": "config_json",
+                "command_template": ["{executable}", "{config_json}"],
+                "inputs": [],
+            }
+
+        selected_tool_type = (
+            normalize_tool_key(tool_type or module_data.get("tool_type") or "")
+            or guess_module_tool_type(module_data)
+        )
+
+        module_data["id"] = safe_module_id
+        module_data["name"] = module_name or module_data.get("name") or safe_module_id
+        module_data["tool_type"] = selected_tool_type
+        module_data["enabled"] = module_data.get("enabled", True)
+
+        ensure_toolbar_exists(selected_tool_type)
+
+        # 关键：保存项目相对路径，不保存 D:/... 绝对路径
+        module_data["executable"] = to_project_relative_path(final_exe_path)
+        module_data["working_dir"] = to_project_relative_path(target_dir)
+
+        upsert_module(module_data)
+
+        return {
+            "ok": True,
+            "message": "Python 模块打包并安装成功",
+            "module": module_data,
+        }
+
+    finally:
+        shutil.rmtree(upload_tmp, ignore_errors=True)
 @app.get("/api/auth/forgot-password/question")
 def api_forgot_password_question(username: str):
     try:
@@ -2536,6 +2756,10 @@ def task_belongs_to_user(task: dict, user) -> bool:
     if not task:
         return False
 
+    # 管理员可以查看、取消、删除所有用户的任务
+    if is_admin_user(user):
+        return True
+
     owner = str(task.get("owner_username") or "")
     username = get_username_from_user(user)
 
@@ -2554,7 +2778,15 @@ def require_own_task(task_id: str, user) -> dict:
 @app.get("/api/tasks")
 def api_list_tasks(authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
+
+    # 管理员查看全部任务
+    if is_admin_user(user):
+        return task_manager.list_tasks()
+
     username = get_username_from_user(user)
+    if not username:
+        raise HTTPException(status_code=401, detail="未登录")
+
     return task_manager.list_tasks(owner_username=username)
 
 
@@ -2848,7 +3080,12 @@ def api_list_data_files(authorization: str | None = Header(default=None)):
     if not username:
         raise HTTPException(status_code=401, detail="未登录")
 
-    _, visible_items = load_visible_data_files_for_user(username)
+    include_all = is_admin_user(user)
+
+    _, visible_items = load_visible_data_files_for_user(
+        username,
+        include_all=include_all,
+    )
 
     for item in visible_items:
         item.pop("_source_index", None)
@@ -2863,7 +3100,11 @@ def api_reveal_data_file(file_id: int, authorization: str | None = Header(defaul
     if not username:
         raise HTTPException(status_code=401, detail="未登录")
 
-    _, _, item = get_user_data_file_by_visible_id(file_id, username)
+    _, _, item = get_user_data_file_by_visible_id(
+        file_id,
+        username,
+        include_all=is_admin_user(user),
+    )
 
     path = Path(str(item.get("path") or ""))
     if not path.exists():
@@ -2890,7 +3131,11 @@ def api_delete_data_file(file_id: int, authorization: str | None = Header(defaul
     if not username:
         raise HTTPException(status_code=401, detail="未登录")
 
-    items, source_index, item = get_user_data_file_by_visible_id(file_id, username)
+    items, source_index, item = get_user_data_file_by_visible_id(
+        file_id,
+        username,
+        include_all=is_admin_user(user),
+    )
 
     path = Path(str(item.get("path") or ""))
 
@@ -2916,7 +3161,11 @@ def api_preview_data_file(file_id: int, authorization: str | None = Header(defau
     if not username:
         raise HTTPException(status_code=401, detail="未登录")
 
-    _, _, item = get_user_data_file_by_visible_id(file_id, username)
+    _, _, item = get_user_data_file_by_visible_id(
+        file_id,
+        username,
+        include_all=is_admin_user(user),
+    )
 
     path = Path(str(item.get("path") or ""))
 
