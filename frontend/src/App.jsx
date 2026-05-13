@@ -24,6 +24,7 @@ import {
   saveModule,
   deleteModule as deleteModuleApi,
     uploadModuleFolder,
+  validateCppModuleFolder,
   uploadPythonFolderModule,
   parseModuleParamJson,
   parsePythonModuleConfig,
@@ -1400,7 +1401,9 @@ export default function App() {
   const [uploadToolType, setUploadToolType] = useState('');
   const [dropInfo, setDropInfo] = useState({ drop_dir: '', items: [] });
   const [uploadMsg, setUploadMsg] = useState('');
-  const [moduleMgmtAction, setModuleMgmtAction] = useState('module_upload');
+  const [cppValidation, setCppValidation] = useState(null);
+  const [cppValidationLoading, setCppValidationLoading] = useState(false);
+  const [moduleMgmtAction, setModuleMgmtAction] = useState('cpp_upload');
   const [pythonSourceDir, setPythonSourceDir] = useState('');
   const [pythonParamJsonPath, setPythonParamJsonPath] = useState('');
   const [pythonModuleId, setPythonModuleId] = useState('');
@@ -1764,11 +1767,13 @@ async function handleRegister() {
   async function browseModuleFolder() {
   try {
     const result = await chooseLocalDir({
-      title: '选择模块文件夹',
+      title: '选择 C++ 模块文件夹',
     });
 
     if (result?.path) {
       setModuleFolderPath(result.path);
+      setCppValidation(null);
+      await validateCppModuleFolderPath(result.path, { silent: false });
     }
   } catch (e) {
     setUploadMsg(e?.message || '选择模块文件夹失败');
@@ -1798,9 +1803,53 @@ async function browsePythonModuleConfigJson() {
     setPythonUploadMsg(e?.message || '解析 Python 模块配置 JSON 失败');
   }
 }
+async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options = {}) {
+  const path = String(pathValue || '').trim();
+  if (!path) {
+    setUploadMsg('请选择 C++ 模块文件夹');
+    setCppValidation(null);
+    return null;
+  }
+
+  if (!uploadToolType) {
+    alert('请先选择模块所属工具栏');
+    return null;
+  }
+
+  setCppValidationLoading(true);
+  if (!options.silent) setUploadMsg('正在检查 C++ 模块规范...');
+
+  try {
+    const data = await validateCppModuleFolder({
+      folder_path: path,
+      tool_type: uploadToolType,
+      auto_collect_dependencies: true,
+    });
+    setCppValidation(data);
+
+    const errorCount = Array.isArray(data?.errors) ? data.errors.length : 0;
+    const warningCount = Array.isArray(data?.warnings) ? data.warnings.length : 0;
+    const missingCount = Array.isArray(data?.missing_files) ? data.missing_files.length : 0;
+
+    if (data?.can_install) {
+      setUploadMsg(`C++ 模块检查通过：错误 0 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。可以安装。`);
+    } else {
+      setUploadMsg(`C++ 模块检查未通过：错误 ${errorCount} 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。请先按提示修改。`);
+    }
+
+    return data;
+  } catch (e) {
+    setCppValidation(null);
+    setUploadMsg(e?.message || 'C++ 模块检查失败');
+    return null;
+  } finally {
+    setCppValidationLoading(false);
+  }
+}
+
 async function installModuleFolder() {
   if (!moduleFolderPath.trim()) {
-    setUploadMsg('请选择模块文件夹');
+    setUploadMsg('请选择 C++ 模块文件夹');
     return;
   }
 
@@ -1809,20 +1858,29 @@ async function installModuleFolder() {
     return;
   }
 
-  setUploadMsg('正在安装模块文件夹...');
+  const validation = await validateCppModuleFolderPath(moduleFolderPath, { silent: true });
+  if (!validation?.can_install) {
+    setUploadMsg('C++ 模块没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
+    return;
+  }
+
+  setUploadMsg('正在安装 C++ 模块文件夹，并尝试自动收集运行时 DLL 依赖...');
 
   try {
     await uploadModuleFolder({
       folder_path: moduleFolderPath.trim(),
       tool_type: uploadToolType,
+      runtime: 'cpp_native',
+      auto_collect_dependencies: true,
     });
 
     setModuleFolderPath('');
-    setUploadMsg('模块文件夹安装成功');
+    setCppValidation(null);
+    setUploadMsg('C++ 模块文件夹安装成功');
 
     await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
   } catch (e) {
-    setUploadMsg(e?.message || '模块文件夹安装失败');
+    setUploadMsg(e?.message || 'C++ 模块文件夹安装失败');
   }
 }
 
@@ -2111,6 +2169,99 @@ function addTaskWindow(task, title) {
     }
   }
 
+
+function renderValidationItems(title, items, color = '#4f6682') {
+  if (!Array.isArray(items) || items.length === 0) return null;
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontWeight: 900, color, marginBottom: 6 }}>{title}：{items.length} 项</div>
+      <div style={{ display: 'grid', gap: 6 }}>
+        {items.map((item, idx) => (
+          <div
+            key={`${title}_${idx}`}
+            style={{
+              border: '1px solid #d7e3f0',
+              background: '#fff',
+              borderRadius: 10,
+              padding: '8px 10px',
+              fontSize: 13,
+              lineHeight: 1.65,
+              color: '#37536f',
+            }}
+          >
+            {typeof item === 'object' && item ? (
+              <>
+                <div><strong>{item.field || item.path || `第 ${idx + 1} 项`}</strong></div>
+                <div>{item.message || item.reason || ''}</div>
+                {item.suggestion && <div style={{ color: '#64748b' }}>建议：{item.suggestion}</div>}
+              </>
+            ) : (
+              <div>{String(item)}</div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function renderCppValidationReport() {
+  if (!cppValidation) return null;
+  const dep = cppValidation.dependency_report || {};
+  const canInstall = !!cppValidation.can_install;
+
+  return (
+    <div
+      style={{
+        border: '1px solid #d7e3f0',
+        borderRadius: 14,
+        background: canInstall ? 'rgba(34,197,94,0.06)' : 'rgba(239,68,68,0.06)',
+        padding: 14,
+        color: '#173353',
+        lineHeight: 1.75,
+      }}
+    >
+      <div style={{ fontWeight: 900, color: canInstall ? '#1f7f36' : '#b42318', marginBottom: 6 }}>
+        {canInstall ? 'C++ 模块检查通过，可以安装' : 'C++ 模块检查未通过，请先修改'}
+      </div>
+      <div style={{ fontSize: 13, color: '#4f6682', wordBreak: 'break-all' }}>
+        module.json：{cppValidation.module_json_path || '-'}
+      </div>
+      <div style={{ fontSize: 13, color: '#4f6682', wordBreak: 'break-all' }}>
+        模块根目录：{cppValidation.module_root || '-'}
+      </div>
+
+      {cppValidation.module && (
+        <div style={{ marginTop: 8, fontSize: 13 }}>
+          <strong>识别模块：</strong>
+          {cppValidation.module.name || '-'}（{cppValidation.module.id || '-'}）
+        </div>
+      )}
+
+      {renderValidationItems('错误', cppValidation.errors, '#b42318')}
+      {renderValidationItems('缺少文件/文件夹', cppValidation.missing_files, '#b45309')}
+      {renderValidationItems('警告', cppValidation.warnings, '#815b00')}
+      {renderValidationItems('修改建议', cppValidation.suggestions, '#235ed8')}
+
+      <div style={{ marginTop: 12, borderTop: '1px solid #d7e3f0', paddingTop: 10 }}>
+        <div style={{ fontWeight: 900, color: '#12385f', marginBottom: 6 }}>运行时依赖检查</div>
+        <div style={{ fontSize: 13, color: '#4f6682' }}>
+          分析器：{dep.analyzer || '未识别'}；目标目录：{dep.target_dir || 'deps/auto'}
+        </div>
+        {dep.message && <div style={{ fontSize: 13, color: '#4f6682' }}>{dep.message}</div>}
+        {Array.isArray(dep.copied) && dep.copied.length > 0 && (
+          <div style={{ fontSize: 13, color: '#1f7f36' }}>可自动复制：{dep.copied.join(', ')}</div>
+        )}
+        {Array.isArray(dep.missing_imports) && dep.missing_imports.length > 0 && (
+          <div style={{ fontSize: 13, color: '#b45309' }}>
+            未找到 DLL：{dep.missing_imports.join(', ')}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function renderModuleMgmtButton(key, title, desc, onClick) {
   const active = moduleMgmtAction === key;
 
@@ -2156,7 +2307,25 @@ function renderModuleMgmtButton(key, title, desc, onClick) {
       setUploadMsg('本地目录安装完成：成功 ' + okCount + ' 个，失败 ' + failCount + ' 个');
       await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
       if (failCount) {
-        alert((data.failed || []).map((x) => `${x.name}: ${x.error}`).join('\n'));
+        const formatFailure = (item) => {
+          const err = item?.error;
+          if (err && typeof err === 'object') {
+            const parts = [];
+            if (err.message) parts.push(err.message);
+            if (Array.isArray(err.errors) && err.errors.length) {
+              parts.push('错误：' + err.errors.map((e) => `${e.field || '-'}：${e.message || ''}${e.suggestion ? `；建议：${e.suggestion}` : ''}`).join('；'));
+            }
+            if (Array.isArray(err.missing_files) && err.missing_files.length) {
+              parts.push('缺少：' + err.missing_files.map((e) => `${e.path || '-'}${e.reason ? `：${e.reason}` : ''}`).join('；'));
+            }
+            if (Array.isArray(err.warnings) && err.warnings.length) {
+              parts.push('警告：' + err.warnings.map((e) => `${e.field || '-'}：${e.message || ''}`).join('；'));
+            }
+            return `${item.name}: ${parts.join('\n') || JSON.stringify(err, null, 2)}`;
+          }
+          return `${item.name}: ${String(err || '未知错误')}`;
+        };
+        alert((data.failed || []).map(formatFailure).join('\n\n'));
       }
     } catch (e) {
       setUploadMsg(e?.message || '本地目录安装失败');
@@ -3221,9 +3390,9 @@ function renderTaskManagementPage() {
                   )}
 
                   {renderModuleMgmtButton(
-                    'module_upload',
-                    '模块上传/投放',
-                    '选择包含 module.json 的模块文件夹，直接安装到系统中。'
+                    'cpp_upload',
+                    'C++ 源代码环境上传',
+                    '选择包含 module.json、exe、源码、resources 和 deps 的 C++ 原生模块文件夹，先检查规范再安装。'
                   )}
                   {renderModuleMgmtButton(
                     'installed_modules',
@@ -3243,12 +3412,12 @@ function renderTaskManagementPage() {
                 {moduleMgmtAction === 'python_upload' && (
                   <div style={{ ...styles.card, padding: 22 }}>
                     <div style={{ fontSize: 24, fontWeight: 900, color: '#12385f', marginBottom: 10 }}>
-                      Python 模块配置 JSON 上传
+                      Python 源代码环境上传
                     </div>
 
                     <div style={{ color: '#6a7f96', lineHeight: 1.8, marginBottom: 18 }}>
-                      选择一个 Python 模块配置 JSON。系统会从该 JSON 中读取模块 ID、模块名称、
-                      所属工具栏、入口文件、源码文件夹和参数 JSON，然后自动识别参数并创建独立 Python 环境。
+                      选择一个 Python 模块配置 JSON。该 JSON 用来指向 Python 源码文件夹、入口文件和参数 JSON，
+                      系统会自动识别参数、创建独立 Python 环境，并注册成可运行模块。
                     </div>
 
                     <div style={{ display: 'grid', gap: 16, maxWidth: 960 }}>
@@ -3363,15 +3532,32 @@ function renderTaskManagementPage() {
                   </div>
                 )}
 
-                {moduleMgmtAction === 'module_upload' && (
+                {moduleMgmtAction === 'cpp_upload' && (
                     <div style={{ ...styles.card, padding: 18 }}>
                       <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
-                        模块文件夹安装
+                        C++ 源代码环境上传
                       </div>
 
                       <div style={{ color: '#6a7f96', lineHeight: 1.8, marginBottom: 14 }}>
-                        请选择一个已经准备好的模块文件夹。该文件夹内需要包含 module.json，
-                        并且 module.json 中配置 executable、working_dir、inputs 等信息。
+                        请选择一个已经准备好的 C++ 原生模块文件夹。推荐目录结构为：module.json、编译后的 exe、src/include 源码目录、resources 固定资源目录、deps 运行时 DLL 依赖目录。
+                        系统会先检查 module.json 是否规范、固定资源是否缺失、exe 是否存在，并尝试识别运行时 DLL 依赖。
+                      </div>
+
+                      <div
+                        style={{
+                          border: '1px solid #d7e3f0',
+                          background: 'rgba(45,124,246,0.05)',
+                          borderRadius: 12,
+                          padding: 12,
+                          color: '#37536f',
+                          lineHeight: 1.8,
+                          marginBottom: 14,
+                        }}
+                      >
+                        <div style={{ fontWeight: 900, color: '#12385f', marginBottom: 6 }}>依赖说明</div>
+                        <div>deps 主要放 <strong>运行时 DLL 依赖</strong>，也就是 exe 启动时还需要但没有打进 exe 的动态库。</div>
+                        <div>C++ 源码编译时需要的头文件、静态库、CMake/vcpkg 配置建议放在 source_dir、build_dependency_dirs 或 src/include/lib 中；它们用于重新编译，不等同于运行时 deps。</div>
+                        <div>自动收集只能尽力识别 exe 导入表中的 DLL；如果程序用 LoadLibrary 动态加载 DLL，仍建议手动放到 deps 并在 module.json 的 dependency_dirs 中声明。</div>
                       </div>
 
                       <div style={{ display: 'grid', gap: 12 }}>
@@ -3379,7 +3565,10 @@ function renderTaskManagementPage() {
                           <div style={labelStyle}>模块所属工具栏</div>
                           <select
                             value={uploadToolType}
-                            onChange={(e) => setUploadToolType(e.target.value)}
+                            onChange={(e) => {
+                              setUploadToolType(e.target.value);
+                              setCppValidation(null);
+                            }}
                             style={styles.input}
                           >
                             {renderToolbarOptions()}
@@ -3387,23 +3576,34 @@ function renderTaskManagementPage() {
                         </div>
 
                         <div>
-                          <div style={labelStyle}>模块文件夹</div>
+                          <div style={labelStyle}>C++ 模块文件夹</div>
                           <div style={{ display: 'flex', gap: 10 }}>
                             <input
                               style={{ ...styles.input, flex: 1 }}
                               value={moduleFolderPath}
-                              onChange={(e) => setModuleFolderPath(e.target.value)}
-                              placeholder="请选择或粘贴包含 module.json 的模块文件夹路径"
+                              onChange={(e) => {
+                                setModuleFolderPath(e.target.value);
+                                setCppValidation(null);
+                              }}
+                              placeholder="请选择或粘贴包含 module.json 的 C++ 模块文件夹路径"
                             />
                             <button style={styles.whiteBtn} onClick={browseModuleFolder}>
-                              浏览
+                              浏览并检查
                             </button>
                           </div>
                         </div>
 
                         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                          <button style={styles.blueBtn} onClick={installModuleFolder}>
-                            安装模块文件夹
+                          <button
+                            style={styles.whiteBtn}
+                            onClick={() => validateCppModuleFolderPath(moduleFolderPath)}
+                            disabled={cppValidationLoading}
+                          >
+                            {cppValidationLoading ? '检查中...' : '检查模块规范'}
+                          </button>
+
+                          <button style={styles.blueBtn} onClick={installModuleFolder} disabled={cppValidationLoading}>
+                            安装 C++ 模块文件夹
                           </button>
 
                           <button
@@ -3411,25 +3611,80 @@ function renderTaskManagementPage() {
                             onClick={() => {
                               setModuleFolderPath('');
                               setUploadMsg('');
+                              setCppValidation(null);
                             }}
                           >
                             清空
                           </button>
 
                           <button style={styles.whiteBtn} onClick={refreshDropZipList}>
-                            刷新目录
+                            刷新投放目录
+                          </button>
+
+                          <button style={styles.whiteBtn} onClick={() => installFromDrop('')}>
+                            扫描本地目录安装
                           </button>
 
                           <button style={styles.whiteBtn} onClick={() => setShowDropHint(true)}>
-                            本地模块目录说明
+                            C++ 本地模块目录说明
                           </button>
                         </div>
 
-                        {uploadMsg && <div style={{ color: '#4f6682' }}>{uploadMsg}</div>}
+                        {uploadMsg && (
+                          <div
+                            style={{
+                              color: uploadMsg.includes('失败') || uploadMsg.includes('未通过') || uploadMsg.includes('阻止') ? '#bb2c2c' : '#4f6682',
+                              whiteSpace: 'pre-wrap',
+                              lineHeight: 1.7,
+                            }}
+                          >
+                            {uploadMsg}
+                          </div>
+                        )}
+
+                        {renderCppValidationReport()}
 
                         {dropInfo.drop_dir && (
                           <div style={{ color: '#6a7f96', fontSize: 13, wordBreak: 'break-all' }}>
                             本地投放目录：{dropInfo.drop_dir}
+                          </div>
+                        )}
+
+                        {Array.isArray(dropInfo.items) && dropInfo.items.length > 0 && (
+                          <div
+                            style={{
+                              border: '1px solid #d7e3f0',
+                              borderRadius: 12,
+                              background: '#fff',
+                              padding: 12,
+                            }}
+                          >
+                            <div style={{ fontWeight: 900, color: '#12385f', marginBottom: 8 }}>
+                              待投放 C++ 模块 zip：{dropInfo.items.length} 个
+                            </div>
+                            <div style={{ display: 'grid', gap: 8 }}>
+                              {dropInfo.items.map((item) => (
+                                <div
+                                  key={item.name}
+                                  style={{
+                                    display: 'grid',
+                                    gridTemplateColumns: 'minmax(0,1fr) auto',
+                                    gap: 10,
+                                    alignItems: 'center',
+                                    borderTop: '1px solid #edf2f7',
+                                    paddingTop: 8,
+                                  }}
+                                >
+                                  <div style={{ minWidth: 0 }}>
+                                    <div style={{ fontWeight: 800, color: '#173353', wordBreak: 'break-all' }}>{item.name}</div>
+                                    <div style={{ fontSize: 12, color: '#6a7f96', wordBreak: 'break-all' }}>{item.path}</div>
+                                  </div>
+                                  <button style={styles.whiteBtn} onClick={() => installFromDrop(item.name)}>
+                                    安装这个 zip
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
                           </div>
                         )}
                       </div>
@@ -3747,21 +4002,23 @@ function renderTaskManagementPage() {
 
       {showDropHint && (
         <SimpleOverlay
-          title="本地模块目录投放说明"
+          title="C++ 本地模块目录投放说明"
           onClose={() => setShowDropHint(false)}
           width="min(820px, 96vw)"
         >
           <div style={{ lineHeight: 1.9, color: '#173353' }}>
-            <p>你这个系统是本地服务器 + 本地浏览器模式，可以支持“把压缩包放到指定目录就相当于添加模块”的方式。</p>
+            <p>这里用于 C++ / 本地原生模块投放。zip 内部需要包含 module.json、编译好的 exe、固定资源 resources、运行时依赖 deps，以及可选的 src/include 源码目录。</p>
             <p>
               当前后端会自动创建并扫描本地投放目录：
               <code>{dropInfo.drop_dir || '项目根目录/module_drop'}</code>
             </p>
             <ol>
-              <li>管理员先在“模块所属工具栏”里选择云反演、气溶胶反演或自定义工具类型</li>
-              <li>把模块 zip 直接放进这个目录，不需要在网页里选择文件</li>
-              <li>点击“扫描本地目录安装”，后端会安装 zip，并把安装成功的 zip 移到 module_drop/installed</li>
+              <li>管理员先在“模块所属工具栏”里选择云反演、气溶胶反演或自定义工具类型。</li>
+              <li>把 C++ 模块 zip 直接放进这个目录，不需要在网页里选择文件。</li>
+              <li>点击“扫描本地目录安装”，后端会先校验 module.json 和缺失文件，再安装通过的 zip。</li>
+              <li>系统会尝试从 exe 导入表识别 DLL，并把可找到的非系统 DLL 复制到 deps/auto。</li>
             </ol>
+            <p>注意：deps 是运行时依赖，不是源码编译依赖。源码编译需要的头文件、静态库、CMake/vcpkg 配置请放到 src/include/lib，或在 module.json 中声明 source_dir、build_dependency_dirs。</p>
           </div>
         </SimpleOverlay>
       )}
