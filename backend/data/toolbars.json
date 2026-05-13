@@ -2,11 +2,11 @@
   {
     "key": "cloud",
     "label": "云反演",
-    "system": true
+    "system": false
   },
   {
     "key": "aerosol",
     "label": "气溶胶反演",
-    "system": true
+    "system": false
   }
 ]

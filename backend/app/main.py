@@ -1,4 +1,6 @@
 from __future__ import annotations
+import stat
+import time
 import sys
 import base64
 import json
@@ -1261,12 +1263,12 @@ def _is_path_inside(child: Path, parent: Path) -> bool:
     except ValueError:
         return False
 
-
 def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
     """
     只允许删除指定安全目录下的文件或文件夹。
+    Windows 下目录删除使用 safe_rmtree，避免只读文件或短暂占用直接失败。
     """
-    path = path.resolve()
+    path = Path(path).resolve()
 
     if not path.exists():
         return {
@@ -1280,30 +1282,90 @@ def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
             detail=f"拒绝删除非模块目录路径: {path}",
         )
 
-    try:
-        if path.is_dir():
-            shutil.rmtree(path, ignore_errors=False)
+    if path.is_dir():
+        safe_rmtree(path)
+    else:
+        last_error = None
+
+        for _ in range(5):
+            try:
+                os.chmod(path, stat.S_IWRITE)
+                path.unlink()
+                break
+            except FileNotFoundError:
+                break
+            except PermissionError as exc:
+                last_error = exc
+                time.sleep(0.4)
+            except OSError as exc:
+                last_error = exc
+                time.sleep(0.4)
         else:
-            path.unlink()
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"删除模块本地文件失败: {path}\n"
+                    f"原因: {last_error}\n"
+                    "请关闭正在使用该文件的程序或停止相关任务后重试。"
+                ),
+            )
 
-        return {
-            "path": str(path),
-            "status": "deleted",
-        }
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"删除模块本地文件失败: {path}，原因: {exc}",
-        )
+    return {
+        "path": str(path),
+        "status": "deleted",
+    }
+
+def _remove_readonly_or_locked(func, path, exc_info):
+    """
+    Windows 删除模块目录时，遇到只读文件时先改权限再删。
+    """
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        raise
 
 
+def safe_rmtree(path: Path, retries: int = 5, delay: float = 0.4):
+    """
+    更稳的目录删除：
+    1. 支持只读文件；
+    2. 对 Windows 短暂占用做重试；
+    3. 最后失败时给出明确错误。
+    """
+    path = Path(path)
+
+    if not path.exists():
+        return
+
+    last_error = None
+
+    for _ in range(retries):
+        try:
+            shutil.rmtree(path, onerror=_remove_readonly_or_locked)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(delay)
+        except OSError as exc:
+            last_error = exc
+            time.sleep(delay)
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"删除模块本地文件失败: {path}\n"
+            f"原因: {last_error}\n"
+            "请关闭正在使用该模块文件的程序或停止相关任务后重试。"
+        ),
+    )
 def remove_module(module_id: str) -> dict:
     """
     删除模块：
-    1. 从 modules.json 移除模块记录；
-    2. 删除 backend/installed_modules/{module_id}；
-    3. 删除 backend/module_envs/{module_id}；
-    4. 不删除任务记录、不删除数据管理中的输出结果文件。
+    1. 先从 modules.json 移除模块记录；
+    2. 再尝试删除 backend/installed_modules/{module_id}；
+    3. 再尝试删除 backend/module_envs/{module_id}；
+    4. 如果本地文件被占用，模块记录仍然删除成功，只返回 cleanup_warning。
     """
     modules = load_modules()
 
@@ -1320,11 +1382,15 @@ def remove_module(module_id: str) -> dict:
         return {
             "removed": False,
             "deleted_paths": [],
+            "cleanup_warnings": [],
         }
 
     safe_module_id = sanitize_filename(module_id).strip()
     if not safe_module_id:
         raise HTTPException(status_code=400, detail="模块 ID 不能为空")
+
+    # 先删 modules.json 记录，避免本地文件被占用时界面一直删不掉模块。
+    save_modules(new_modules)
 
     installed_dir = INSTALLED_MODULES_DIR / safe_module_id
     env_dir = PYTHON_MODULE_ENVS_DIR / safe_module_id
@@ -1335,27 +1401,22 @@ def remove_module(module_id: str) -> dict:
     ]
 
     deleted_paths = []
+    cleanup_warnings = []
 
-    # 删除模块安装目录：backend/installed_modules/{module_id}
-    deleted_paths.append(
-        _remove_path_safely(installed_dir, allowed_roots)
-    )
-
-    # 删除 Python 独立环境目录：backend/module_envs/{module_id}
-    deleted_paths.append(
-        _remove_path_safely(env_dir, allowed_roots)
-    )
-
-    # 本地文件删除成功后，再删除 modules.json 中的记录
-    save_modules(new_modules)
+    for path in [installed_dir, env_dir]:
+        try:
+            deleted_paths.append(_remove_path_safely(path, allowed_roots))
+        except HTTPException as exc:
+            cleanup_warnings.append(str(exc.detail))
+        except Exception as exc:
+            cleanup_warnings.append(f"清理失败: {path}，原因: {exc}")
 
     return {
         "removed": True,
         "module_id": module_id,
         "deleted_paths": deleted_paths,
+        "cleanup_warnings": cleanup_warnings,
     }
-
-
 def format_command(template: List[str], values: Dict[str, Any]) -> List[str]:
     formatted = []
     for item in template:
@@ -1912,7 +1973,7 @@ def install_python_venv_module_from_values(
 
     target_dir = INSTALLED_MODULES_DIR / safe_module_id
     if target_dir.exists():
-        shutil.rmtree(target_dir)
+        safe_rmtree(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
 
     source_target_dir = target_dir / "source"
@@ -2242,7 +2303,7 @@ def create_python_module_env(module_id: str, source_dir: Path) -> Path:
     env_dir = PYTHON_MODULE_ENVS_DIR / module_id
 
     if env_dir.exists():
-        shutil.rmtree(env_dir)
+        safe_rmtree(env_dir)
 
     # 用 --clear 明确创建干净环境，--copies 在 Windows 上比软链接更稳
     run_checked_command(
@@ -2327,7 +2388,7 @@ def install_uploaded_zip(zip_path: Path, tool_type: str | None = None) -> dict:
         target_dir = INSTALLED_MODULES_DIR / module_id
 
         if target_dir.exists():
-            shutil.rmtree(target_dir)
+            safe_rmtree(target_dir)
 
         shutil.copytree(module_root, target_dir)
 
@@ -2417,7 +2478,7 @@ def install_module_from_folder(folder_path: Path, tool_type: str | None = None) 
     target_dir = INSTALLED_MODULES_DIR / module_id
 
     if target_dir.exists():
-        shutil.rmtree(target_dir)
+        safe_rmtree(target_dir)
 
     shutil.copytree(module_root, target_dir)
 
@@ -2506,7 +2567,7 @@ def api_upload_python_module(
 
         target_dir = INSTALLED_MODULES_DIR / safe_module_id
         if target_dir.exists():
-            shutil.rmtree(target_dir)
+            safe_rmtree(target_dir)
 
         target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2789,9 +2850,11 @@ def api_delete_module(module_id: str, authorization: str | None = Header(default
     if not result.get("removed"):
         raise HTTPException(status_code=404, detail="模块不存在")
 
+    warnings = result.get("cleanup_warnings") or []
+
     return {
         "ok": True,
-        "message": "模块及本地文件已删除",
+        "message": "模块记录已删除" if warnings else "模块及本地文件已删除",
         **result,
     }
 
