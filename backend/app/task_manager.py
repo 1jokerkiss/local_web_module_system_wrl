@@ -19,12 +19,41 @@ class TaskManager:
         self.tasks_file = Path(tasks_file)
         self.tasks_file.parent.mkdir(parents=True, exist_ok=True)
 
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.tasks: Dict[str, Dict[str, Any]] = {}
         self.processes: Dict[str, subprocess.Popen] = {}
         self.cancel_flags: set[str] = set()
 
+        # 运行调度器：根据本机 CPU 核数控制同时运行的模块进程数。
+        # 这里按“内存较重的遥感模块”做保守默认值：
+        # - 建议值约为 CPU 核数的 1/3，最高 8；24 核时建议 8。
+        # - 上限值约为 CPU 核数的 1/2，最高 12；24 核时上限 12。
+        # 如需手动覆盖，可设置环境变量：
+        # LOCAL_WEB_SUGGESTED_PROCESS_SLOTS / LOCAL_WEB_MAX_PROCESS_SLOTS。
+        # queued 状态的任务会留在队列里；有空闲槽位后自动启动。
+        self.cpu_count = max(1, int(os.cpu_count() or 1))
+        default_suggested_slots = max(1, min(8, (self.cpu_count + 2) // 3))
+        default_max_slots = max(default_suggested_slots, min(12, max(1, self.cpu_count // 2)))
+
+        try:
+            env_suggested_slots = int(os.environ.get("LOCAL_WEB_SUGGESTED_PROCESS_SLOTS", "") or default_suggested_slots)
+        except Exception:
+            env_suggested_slots = default_suggested_slots
+
+        try:
+            env_max_slots = int(os.environ.get("LOCAL_WEB_MAX_PROCESS_SLOTS", "") or default_max_slots)
+        except Exception:
+            env_max_slots = default_max_slots
+
+        self.max_process_slots = max(1, min(self.cpu_count, env_max_slots))
+        self.suggested_process_slots = max(1, min(self.max_process_slots, env_suggested_slots))
+        self.cpu_busy_threshold = float(os.environ.get("LOCAL_WEB_CPU_QUEUE_THRESHOLD", "85"))
+        self.scheduler_queue: list[Dict[str, Any]] = []
+        self.active_slots: Dict[str, int] = {}
+        self.drain_lock = threading.Lock()
+
         self._load_tasks()
+        self._mark_interrupted_tasks()
 
     def _load_tasks(self):
         if not self.tasks_file.exists():
@@ -45,6 +74,222 @@ class TaskManager:
                 self.tasks = {}
         except Exception:
             self.tasks = {}
+
+    def _mark_interrupted_tasks(self):
+        """服务重启后，内存里的进程和调度队列都不存在了。把旧的 running/queued 标记为 cancelled。"""
+        changed = False
+        with self.lock:
+            for task in self.tasks.values():
+                if task.get("status") in {"queued", "running"}:
+                    task["status"] = "cancelled"
+                    task["ended_at"] = now_iso()
+                    task.setdefault("logs", []).append("[SYSTEM] 服务已重启，历史未完成任务已自动取消")
+                    changed = True
+        if changed:
+            self._save_tasks()
+
+    def _system_cpu_percent(self) -> float | None:
+        """读取本机 CPU 使用率；优先用 psutil，没有安装时用 load average 粗略估算。"""
+        try:
+            import psutil  # type: ignore
+            return float(psutil.cpu_percent(interval=0.0))
+        except Exception:
+            pass
+
+        try:
+            if hasattr(os, "getloadavg"):
+                load1, _, _ = os.getloadavg()
+                return max(0.0, min(100.0, float(load1) / max(1, self.cpu_count) * 100.0))
+        except Exception:
+            pass
+        return None
+
+    def _running_process_cpu_percent(self) -> float | None:
+        """读取当前由平台启动的模块进程 CPU 占用总和；没有 psutil 时返回 None。"""
+        try:
+            import psutil  # type: ignore
+        except Exception:
+            return None
+
+        total = 0.0
+        with self.lock:
+            processes = list(self.processes.values())
+        for process in processes:
+            try:
+                if process.poll() is None:
+                    total += float(psutil.Process(process.pid).cpu_percent(interval=0.0))
+            except Exception:
+                continue
+        return round(total, 2)
+
+    def _used_slots_locked(self) -> int:
+        return sum(max(1, int(v or 1)) for v in self.active_slots.values())
+
+    def _normalize_requested_slots(self, value: int | str | None) -> int:
+        try:
+            n = int(value or 1)
+        except Exception:
+            n = 1
+        return max(1, min(n, self.max_process_slots))
+
+    def _remove_from_scheduler_queue_locked(self, task_id: str):
+        self.scheduler_queue = [item for item in self.scheduler_queue if item.get("task_id") != task_id]
+        self._refresh_queue_positions_locked()
+
+    def _refresh_queue_positions_locked(self):
+        pos = 1
+        used = self._used_slots_locked()
+        for item in self.scheduler_queue:
+            tid = str(item.get("task_id") or "")
+            task = self.tasks.get(tid)
+            if not task or task.get("status") != "queued":
+                continue
+            requested = self._normalize_requested_slots(item.get("requested_slots"))
+            task["queue_position"] = pos
+            task["queue_reason"] = (
+                f"等待本地 CPU 空闲：当前占用 {used}/{self.max_process_slots}，"
+                f"本任务需要 {requested} 个进程槽"
+            )
+            pos += 1
+
+    def get_system_resource_info(self) -> Dict[str, Any]:
+        with self.lock:
+            running_workers = self._used_slots_locked()
+            active_task_count = len(self.active_slots)
+            queued_task_count = sum(
+                1 for item in self.scheduler_queue
+                if (self.tasks.get(str(item.get("task_id") or "")) or {}).get("status") == "queued"
+            )
+            active_tasks = []
+            for task_id, slots in self.active_slots.items():
+                task = self.tasks.get(task_id) or {}
+                active_tasks.append({
+                    "id": task_id,
+                    "module_name": task.get("module_name") or "",
+                    "requested_workers": slots,
+                    "pid": task.get("pid"),
+                    "status": task.get("status") or "running",
+                })
+
+        cpu_percent = self._system_cpu_percent()
+        process_cpu_percent = self._running_process_cpu_percent()
+        return {
+            "cpu_count": self.cpu_count,
+            "suggested_workers": self.suggested_process_slots,
+            "max_workers": self.max_process_slots,
+            "running_workers": running_workers,
+            "available_workers": max(0, self.max_process_slots - running_workers),
+            "active_task_count": active_task_count,
+            "queued_task_count": queued_task_count,
+            "cpu_percent": cpu_percent,
+            "running_process_cpu_percent": process_cpu_percent,
+            "cpu_busy_threshold": self.cpu_busy_threshold,
+            "active_tasks": active_tasks,
+        }
+
+    def _can_start_queued_item_locked(self, item: Dict[str, Any]) -> tuple[bool, str]:
+        requested = self._normalize_requested_slots(item.get("requested_slots"))
+        used = self._used_slots_locked()
+        if used + requested > self.max_process_slots:
+            return False, f"进程数超过本机 CPU 上限：当前 {used}/{self.max_process_slots}，本任务需要 {requested}"
+
+        cpu_percent = self._system_cpu_percent()
+        if used > 0 and cpu_percent is not None and cpu_percent >= self.cpu_busy_threshold:
+            return False, f"当前 CPU 使用率 {cpu_percent:.1f}% 已超过阈值 {self.cpu_busy_threshold:.0f}%"
+
+        return True, ""
+
+    def _enqueue_task_runner(
+        self,
+        task_id: str,
+        runner,
+        args: tuple,
+        requested_slots: int | str | None = 1,
+    ):
+        requested_slots = self._normalize_requested_slots(requested_slots)
+        with self.lock:
+            task = self.tasks.get(task_id)
+            if not task:
+                return
+            task["status"] = "queued"
+            task["requested_workers"] = requested_slots
+            task["queued_at"] = now_iso()
+            task["queue_position"] = len(self.scheduler_queue) + 1
+            task["queue_reason"] = "等待调度"
+            self.scheduler_queue.append({
+                "task_id": task_id,
+                "runner": runner,
+                "args": args,
+                "requested_slots": requested_slots,
+            })
+            self._refresh_queue_positions_locked()
+        self._save_tasks()
+        self._drain_scheduler_queue()
+
+    def _run_scheduled_item(self, item: Dict[str, Any]):
+        task_id = str(item.get("task_id") or "")
+        try:
+            runner = item.get("runner")
+            args = item.get("args") or ()
+            if runner:
+                runner(*args)
+        finally:
+            with self.lock:
+                self.active_slots.pop(task_id, None)
+            self._save_tasks()
+            self._drain_scheduler_queue()
+
+    def _drain_scheduler_queue(self):
+        if not self.drain_lock.acquire(blocking=False):
+            return
+        try:
+            while True:
+                start_item: Dict[str, Any] | None = None
+                with self.lock:
+                    # 清理已取消/已删除的队列项。
+                    while self.scheduler_queue:
+                        candidate = self.scheduler_queue[0]
+                        task_id = str(candidate.get("task_id") or "")
+                        task = self.tasks.get(task_id)
+                        if task and task.get("status") == "queued":
+                            break
+                        self.scheduler_queue.pop(0)
+
+                    if not self.scheduler_queue:
+                        self._refresh_queue_positions_locked()
+                        return
+
+                    item = self.scheduler_queue[0]
+                    task_id = str(item.get("task_id") or "")
+                    task = self.tasks.get(task_id)
+                    can_start, reason = self._can_start_queued_item_locked(item)
+                    if not can_start:
+                        if task:
+                            task["queue_reason"] = reason
+                        self._refresh_queue_positions_locked()
+                        self._save_tasks()
+                        return
+
+                    start_item = self.scheduler_queue.pop(0)
+                    requested_slots = self._normalize_requested_slots(start_item.get("requested_slots"))
+                    self.active_slots[task_id] = requested_slots
+                    if task:
+                        task["queue_position"] = None
+                        task["queue_reason"] = ""
+                        task["scheduled_at"] = now_iso()
+                        task.setdefault("logs", []).append(
+                            f"[SYSTEM] 已获得 {requested_slots} 个 CPU 进程槽，开始运行"
+                        )
+                    self._refresh_queue_positions_locked()
+                    self._save_tasks()
+
+                threading.Thread(
+                    target=self._run_scheduled_item,
+                    args=(start_item,),
+                    daemon=True,
+                ).start()
+        finally:
+            self.drain_lock.release()
 
     def _save_tasks(self):
         with self.lock:
@@ -148,13 +393,14 @@ class TaskManager:
             extra={"owner_username": str(owner_username or "")},
         )
 
-        thread = threading.Thread(
-            target=self._run_process_task,
-            args=(task["id"], command, working_dir, env),
-            daemon=True,
+        requested_slots = inputs.get("parallel_workers") or inputs.get("_parallel_workers") or 1
+        self._enqueue_task_runner(
+            task["id"],
+            self._run_process_task,
+            (task["id"], command, working_dir, env),
+            requested_slots=requested_slots,
         )
-        thread.start()
-        return task
+        return self.get_task(task["id"]) or task
 
     def submit_parallel_module_task(
             self,
@@ -181,13 +427,13 @@ class TaskManager:
             },
         )
 
-        thread = threading.Thread(
-            target=self._run_parallel_task,
-            args=(parent["id"], jobs, max_workers),
-            daemon=True,
+        self._enqueue_task_runner(
+            parent["id"],
+            self._run_parallel_task,
+            (parent["id"], jobs, max_workers),
+            requested_slots=max_workers,
         )
-        thread.start()
-        return parent
+        return self.get_task(parent["id"]) or parent
 
     def submit_batch_group(
             self,
@@ -244,12 +490,12 @@ class TaskManager:
             self.tasks[parent["id"]]["status"] = "queued"
         self._save_tasks()
 
-        thread = threading.Thread(
-            target=self._run_batch_group,
-            args=(parent["id"], child_job_map, max_parallel),
-            daemon=True,
+        self._enqueue_task_runner(
+            parent["id"],
+            self._run_batch_group,
+            (parent["id"], child_job_map, max_parallel),
+            requested_slots=max_parallel,
         )
-        thread.start()
         return self.get_task(parent["id"]) or parent
 
     def _run_batch_group(
@@ -274,7 +520,8 @@ class TaskManager:
         progress = {"done": 0, "failed": 0}
 
         def _worker(child_id: str, job: Dict[str, Any]):
-            if parent_id in self.cancel_flags:
+            child_snapshot = self.get_task(child_id) or {}
+            if parent_id in self.cancel_flags or child_snapshot.get("status") == "cancelled":
                 self.update_task(child_id, status="cancelled", ended_at=now_iso())
                 return child_id
             self._run_process_task(
@@ -621,6 +868,39 @@ class TaskManager:
         if not task:
             return False
 
+        # queued 状态尚未启动进程，直接从调度队列移除并标记取消。
+        if task.get("status") == "queued":
+            self.cancel_flags.add(task_id)
+            with self.lock:
+                self._remove_from_scheduler_queue_locked(task_id)
+                queued_task = self.tasks.get(task_id)
+                if queued_task:
+                    queued_task["status"] = "cancelled"
+                    queued_task["ended_at"] = now_iso()
+                    queued_task.setdefault("logs", []).append("[SYSTEM] 排队任务已取消")
+
+                if queued_task and queued_task.get("kind") in {"parallel", "batch_parent"}:
+                    for child_id in queued_task.get("children") or []:
+                        child = self.tasks.get(child_id)
+                        if child and child.get("status") not in TERMINAL_STATUSES:
+                            child["status"] = "cancelled"
+                            child["ended_at"] = now_iso()
+                            child.setdefault("logs", []).append("[SYSTEM] 父任务排队取消，子任务取消")
+            self._save_tasks()
+            self._drain_scheduler_queue()
+            return True
+
+        # 子任务还没启动时，也允许取消。
+        if task.get("status") == "queued" or (task.get("parent_id") and task.get("status") not in TERMINAL_STATUSES and task_id not in self.processes):
+            with self.lock:
+                child = self.tasks.get(task_id)
+                if child:
+                    child["status"] = "cancelled"
+                    child["ended_at"] = now_iso()
+                    child.setdefault("logs", []).append("[SYSTEM] 子任务排队已取消")
+            self._save_tasks()
+            return True
+
         # 并行父任务：标记取消，并尽量停止已经启动的所有子进程。
         if task.get("kind") in {"parallel", "batch_parent"}:
             self.cancel_flags.add(task_id)
@@ -679,6 +959,10 @@ class TaskManager:
         ids_to_delete = [task_id]
         if task.get("kind") in {"parallel", "batch_parent"}:
             ids_to_delete.extend(task.get("children") or [])
+
+        with self.lock:
+            for tid in ids_to_delete:
+                self._remove_from_scheduler_queue_locked(tid)
 
         for tid in ids_to_delete:
             process = self.processes.get(tid)

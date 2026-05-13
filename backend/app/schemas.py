@@ -91,3 +91,11 @@ class TaskInfo(BaseModel):
     parallel_total: int | None = None
     parallel_done: int | None = None
     parallel_failed: int | None = None
+    requested_workers: int | None = None
+    queued_at: str | None = None
+    scheduled_at: str | None = None
+    queue_position: int | None = None
+    queue_reason: str = ""
+    max_workers: int | None = None
+    owner_username: str = ""
+    parent_id: str | None = None

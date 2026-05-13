@@ -269,6 +269,10 @@ export async function installLocalDropModules(toolType = 'cloud', filename = '')
   });
 }
 
+export async function getSystemResources() {
+  return request('/api/system/resources');
+}
+
 export async function getTasks() {
   return request('/api/tasks');
 }
