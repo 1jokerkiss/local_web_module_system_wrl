@@ -71,6 +71,80 @@ const emptyModuleForm = {
   enabled: true,
 };
 
+
+const cppExecutableModuleTemplate = {
+  id: 'parasol_aod',
+  name: 'PARASOL AOD 反演',
+  description: 'C++ 可执行模块示例：module.json、exe、resources、deps 同级放置。C++ 模块不需要上传源码。',
+  runtime: 'cpp_native',
+  executable: 'ParasolAOD.exe',
+  working_dir: '.',
+  config_mode: 'none',
+  dependency_dirs: ['deps'],
+  dependency_search_dirs: [],
+  auto_collect_deps: true,
+  command_template: ['{executable}', '{input_file}', '{output_dir}', '{config_xml}'],
+  parallel: {
+    mode: 'auto',
+    file_patterns: '*.*',
+    output_suffix: '.tif',
+    output_naming: 'source_stem',
+  },
+  tags: ['cpp', 'native', 'remote-sensing'],
+  enabled: true,
+  inputs: [
+    {
+      key: 'input_file',
+      label: '输入文件目录',
+      type: 'dir_path',
+      required: true,
+      visible_to_user: true,
+      admin_fixed: false,
+      path_mode: 'absolute',
+      batch_role: 'input',
+      match_mode: 'each_file',
+      io_role: 'input',
+    },
+    {
+      key: 'output_dir',
+      label: '输出目录',
+      type: 'dir_path',
+      required: true,
+      visible_to_user: true,
+      admin_fixed: false,
+      path_mode: 'absolute',
+      io_role: 'output',
+    },
+    {
+      key: 'config_xml',
+      label: '配置 XML',
+      type: 'file_path',
+      required: true,
+      default: 'resources/ConfigXMLFile.xml',
+      visible_to_user: false,
+      admin_fixed: true,
+      path_mode: 'relative_to_module',
+      io_role: 'input',
+    },
+  ],
+};
+
+function getCppExecutableModuleTemplateText() {
+  return JSON.stringify(cppExecutableModuleTemplate, null, 2);
+}
+
+function downloadTextFile(filename, text) {
+  const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 const styles = {
   page: {
     minHeight: '100vh',
@@ -1767,7 +1841,7 @@ async function handleRegister() {
   async function browseModuleFolder() {
   try {
     const result = await chooseLocalDir({
-      title: '选择 C++ 模块文件夹',
+      title: '选择 C++ 可执行模块文件夹',
     });
 
     if (result?.path) {
@@ -1806,7 +1880,7 @@ async function browsePythonModuleConfigJson() {
 async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options = {}) {
   const path = String(pathValue || '').trim();
   if (!path) {
-    setUploadMsg('请选择 C++ 模块文件夹');
+    setUploadMsg('请选择 C++ 可执行模块文件夹');
     setCppValidation(null);
     return null;
   }
@@ -1849,7 +1923,7 @@ async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options
 
 async function installModuleFolder() {
   if (!moduleFolderPath.trim()) {
-    setUploadMsg('请选择 C++ 模块文件夹');
+    setUploadMsg('请选择 C++ 可执行模块文件夹');
     return;
   }
 
@@ -1864,7 +1938,7 @@ async function installModuleFolder() {
     return;
   }
 
-  setUploadMsg('正在安装 C++ 模块文件夹，并尝试自动收集运行时 DLL 依赖...');
+  setUploadMsg('正在安装 C++ 可执行模块，并尝试自动收集运行时 DLL 依赖...');
 
   try {
     await uploadModuleFolder({
@@ -1876,11 +1950,11 @@ async function installModuleFolder() {
 
     setModuleFolderPath('');
     setCppValidation(null);
-    setUploadMsg('C++ 模块文件夹安装成功');
+    setUploadMsg('C++ 可执行模块安装成功');
 
     await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
   } catch (e) {
-    setUploadMsg(e?.message || 'C++ 模块文件夹安装失败');
+    setUploadMsg(e?.message || 'C++ 可执行模块安装失败');
   }
 }
 
@@ -3391,8 +3465,8 @@ function renderTaskManagementPage() {
 
                   {renderModuleMgmtButton(
                     'cpp_upload',
-                    'C++ 源代码环境上传',
-                    '选择包含 module.json、exe、源码、resources 和 deps 的 C++ 原生模块文件夹，先检查规范再安装。'
+                    'C++ 可执行模块上传',
+                    '选择包含 module.json、编译好的 exe、resources 和 deps 的 C++ 可执行模块文件夹，先检查规范再安装。'
                   )}
                   {renderModuleMgmtButton(
                     'installed_modules',
@@ -3535,12 +3609,12 @@ function renderTaskManagementPage() {
                 {moduleMgmtAction === 'cpp_upload' && (
                     <div style={{ ...styles.card, padding: 18 }}>
                       <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
-                        C++ 源代码环境上传
+                        C++ 可执行模块上传
                       </div>
 
                       <div style={{ color: '#6a7f96', lineHeight: 1.8, marginBottom: 14 }}>
-                        请选择一个已经准备好的 C++ 原生模块文件夹。推荐目录结构为：module.json、编译后的 exe、src/include 源码目录、resources 固定资源目录、deps 运行时 DLL 依赖目录。
-                        系统会先检查 module.json 是否规范、固定资源是否缺失、exe 是否存在，并尝试识别运行时 DLL 依赖。
+                        请选择一个已经准备好的 C++ 可执行模块文件夹。推荐目录结构为：module.json、编译后的 exe、resources 固定资源目录、deps 运行时 DLL 依赖目录。
+                        C++ 模块不需要上传源码；系统会先检查 module.json 是否规范、固定资源是否缺失、exe 是否存在，并尝试识别运行时 DLL 依赖。
                       </div>
 
                       <div
@@ -3556,7 +3630,7 @@ function renderTaskManagementPage() {
                       >
                         <div style={{ fontWeight: 900, color: '#12385f', marginBottom: 6 }}>依赖说明</div>
                         <div>deps 主要放 <strong>运行时 DLL 依赖</strong>，也就是 exe 启动时还需要但没有打进 exe 的动态库。</div>
-                        <div>C++ 源码编译时需要的头文件、静态库、CMake/vcpkg 配置建议放在 source_dir、build_dependency_dirs 或 src/include/lib 中；它们用于重新编译，不等同于运行时 deps。</div>
+                        <div>C++ 模块这里按成品 exe 安装，不需要源码、头文件、静态库或 CMake 工程。deps 只放 exe 运行时还缺少的 DLL。</div>
                         <div>自动收集只能尽力识别 exe 导入表中的 DLL；如果程序用 LoadLibrary 动态加载 DLL，仍建议手动放到 deps 并在 module.json 的 dependency_dirs 中声明。</div>
                       </div>
 
@@ -3576,7 +3650,7 @@ function renderTaskManagementPage() {
                         </div>
 
                         <div>
-                          <div style={labelStyle}>C++ 模块文件夹</div>
+                          <div style={labelStyle}>C++ 可执行模块文件夹</div>
                           <div style={{ display: 'flex', gap: 10 }}>
                             <input
                               style={{ ...styles.input, flex: 1 }}
@@ -3585,7 +3659,7 @@ function renderTaskManagementPage() {
                                 setModuleFolderPath(e.target.value);
                                 setCppValidation(null);
                               }}
-                              placeholder="请选择或粘贴包含 module.json 的 C++ 模块文件夹路径"
+                              placeholder="请选择或粘贴包含 module.json 和 exe 的 C++ 模块文件夹路径"
                             />
                             <button style={styles.whiteBtn} onClick={browseModuleFolder}>
                               浏览并检查
@@ -3596,6 +3670,27 @@ function renderTaskManagementPage() {
                         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                           <button
                             style={styles.whiteBtn}
+                            onClick={() => downloadTextFile('cpp_module_template.json', getCppExecutableModuleTemplateText())}
+                          >
+                            下载 module.json 模板
+                          </button>
+
+                          <button
+                            style={styles.whiteBtn}
+                            onClick={async () => {
+                              try {
+                                await navigator.clipboard.writeText(getCppExecutableModuleTemplateText());
+                                setUploadMsg('已复制 C++ 可执行模块 module.json 模板。用户需要把文件命名为 module.json，并放到 exe 同级目录。');
+                              } catch {
+                                setUploadMsg(getCppExecutableModuleTemplateText());
+                              }
+                            }}
+                          >
+                            复制模板内容
+                          </button>
+
+                          <button
+                            style={styles.whiteBtn}
                             onClick={() => validateCppModuleFolderPath(moduleFolderPath)}
                             disabled={cppValidationLoading}
                           >
@@ -3603,7 +3698,7 @@ function renderTaskManagementPage() {
                           </button>
 
                           <button style={styles.blueBtn} onClick={installModuleFolder} disabled={cppValidationLoading}>
-                            安装 C++ 模块文件夹
+                            安装 C++ 可执行模块
                           </button>
 
                           <button
@@ -3626,7 +3721,7 @@ function renderTaskManagementPage() {
                           </button>
 
                           <button style={styles.whiteBtn} onClick={() => setShowDropHint(true)}>
-                            C++ 本地模块目录说明
+                            C++ 可执行模块目录说明
                           </button>
                         </div>
 
@@ -4007,18 +4102,18 @@ function renderTaskManagementPage() {
           width="min(820px, 96vw)"
         >
           <div style={{ lineHeight: 1.9, color: '#173353' }}>
-            <p>这里用于 C++ / 本地原生模块投放。zip 内部需要包含 module.json、编译好的 exe、固定资源 resources、运行时依赖 deps，以及可选的 src/include 源码目录。</p>
+            <p>这里用于 C++ / 本地原生可执行模块投放。zip 内部需要包含 module.json、编译好的 exe、固定资源 resources，以及可选的运行时依赖 deps。C++ 模块不需要上传源码。</p>
             <p>
               当前后端会自动创建并扫描本地投放目录：
               <code>{dropInfo.drop_dir || '项目根目录/module_drop'}</code>
             </p>
             <ol>
               <li>管理员先在“模块所属工具栏”里选择云反演、气溶胶反演或自定义工具类型。</li>
-              <li>把 C++ 模块 zip 直接放进这个目录，不需要在网页里选择文件。</li>
+              <li>把 C++ 可执行模块 zip 直接放进这个目录，不需要在网页里选择文件。</li>
               <li>点击“扫描本地目录安装”，后端会先校验 module.json 和缺失文件，再安装通过的 zip。</li>
               <li>系统会尝试从 exe 导入表识别 DLL，并把可找到的非系统 DLL 复制到 deps/auto。</li>
             </ol>
-            <p>注意：deps 是运行时依赖，不是源码编译依赖。源码编译需要的头文件、静态库、CMake/vcpkg 配置请放到 src/include/lib，或在 module.json 中声明 source_dir、build_dependency_dirs。</p>
+            <p>注意：deps 是运行时依赖目录，只放 exe 运行时缺少的 DLL。源码、头文件、静态库、CMake/vcpkg 配置都不需要上传。</p>
           </div>
         </SimpleOverlay>
       )}

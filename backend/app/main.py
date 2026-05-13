@@ -184,8 +184,8 @@ class ParseParamJsonRequest(BaseModel):
 class InstallModuleFolderRequest(BaseModel):
     folder_path: str
     tool_type: str = "cloud"
-    # module_upload 已改为 C++/本地原生模块环境上传。
-    # 这里保留默认值，兼容旧前端调用。
+    # C++ 模块按本地可执行文件安装，只需要 module.json、exe、resources 和运行时 deps。
+    # 这里保留 runtime 字段，兼容旧前端调用。
     runtime: str = "cpp_native"
     auto_collect_dependencies: bool = True
 
@@ -2311,12 +2311,10 @@ def create_python_module_env(module_id: str, source_dir: Path) -> Path:
 
 
 # =========================
-# C++ / 本地原生模块校验与依赖收集
+# C++ / 本地可执行模块校验与运行时依赖收集
 # =========================
 CPP_INPUT_TYPES = {"text", "textarea", "number", "integer", "file_path", "dir_path", "password"}
 CPP_PARALLEL_MODES = {"none", "auto", "single_file", "folder_chunks", "module_internal"}
-CPP_SOURCE_MARKER_FILES = {"CMakeLists.txt", "Makefile", "makefile"}
-CPP_SOURCE_MARKER_SUFFIXES = {".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hxx"}
 CPP_SYSTEM_DLLS = {
     "kernel32.dll", "user32.dll", "gdi32.dll", "winspool.drv", "comdlg32.dll", "advapi32.dll",
     "shell32.dll", "ole32.dll", "oleaut32.dll", "uuid.dll", "odbc32.dll", "odbccp32.dll",
@@ -2465,37 +2463,13 @@ def _module_json_error_detail(report: dict) -> dict:
     report["ok"] = False
     report["can_install"] = False
     return {
-        "message": "C++ 模块校验失败，请按下面提示修改后再安装。",
+        "message": "C++ 可执行模块校验失败，请按下面提示修改后再安装。",
         **report,
     }
 
 
 def raise_cpp_validation_error(report: dict):
     raise HTTPException(status_code=400, detail=_module_json_error_detail(report))
-
-
-def _has_cpp_source_markers(module_root: Path, module_data: dict) -> bool:
-    source_candidates = []
-    for key in ["source_dir", "source_path", "src_dir"]:
-        raw = module_data.get(key)
-        if raw:
-            source_candidates.append(_resolve_module_reference(module_root, raw, str(module_data.get("id") or ""), module_root))
-    source_candidates.extend([module_root / "src", module_root / "source", module_root / "include"])
-
-    for candidate in source_candidates:
-        if candidate.exists():
-            if candidate.is_file() and candidate.suffix.lower() in CPP_SOURCE_MARKER_SUFFIXES:
-                return True
-            if candidate.is_dir():
-                for p in candidate.rglob("*"):
-                    if not p.is_file():
-                        continue
-                    if p.name in CPP_SOURCE_MARKER_FILES or p.suffix.lower() in CPP_SOURCE_MARKER_SUFFIXES:
-                        return True
-    for p in module_root.iterdir():
-        if p.is_file() and (p.name in CPP_SOURCE_MARKER_FILES or p.suffix.lower() in CPP_SOURCE_MARKER_SUFFIXES):
-            return True
-    return False
 
 
 def _validate_cpp_module_structure(module_root: Path, module_data: dict, report: dict):
@@ -2521,7 +2495,7 @@ def _validate_cpp_module_structure(module_root: Path, module_data: dict, report:
             _add_error(report, "executable", f"可执行文件不存在：{executable}", "确认 exe 放在模块文件夹中，或把 executable 改成正确的相对路径。")
             _add_missing(report, exe_path, "module.json executable 指向的文件不存在", "把编译好的 exe 放进模块目录，或修改 executable 字段。")
         elif sys.platform.startswith("win") and exe_path.suffix.lower() not in {".exe", ".bat", ".cmd"}:
-            _add_warning(report, "executable", f"Windows 下建议 executable 指向 .exe/.bat/.cmd，当前是：{exe_path.name}", "如果这是 C++ 程序，请确认已经编译为可执行文件。")
+            _add_warning(report, "executable", f"Windows 下建议 executable 指向 .exe/.bat/.cmd，当前是：{exe_path.name}", "这里按 C++ 可执行模块安装，请确认已经编译为可执行文件。")
 
     wd_path = _resolve_module_reference(module_root, working_dir, module_id, module_root)
     if not wd_path.exists() or not wd_path.is_dir():
@@ -2631,24 +2605,32 @@ def _validate_cpp_module_structure(module_root: Path, module_data: dict, report:
             _add_warning(report, "dependency_dirs", f"声明的依赖目录不存在：{dep_text}", "如果没有额外 DLL，可以删除该目录配置；如果有 DLL，请创建该目录并放入依赖。")
             _add_missing(report, dep_path, "dependency_dirs 声明的目录不存在", "创建目录并放入运行时 DLL，或从 dependency_dirs 中删除它。")
 
-    if not _has_cpp_source_markers(module_root, module_data):
-        _add_warning(
-            report,
-            "source_dir",
-            "未检测到 C/C++ 源码或工程文件",
-            "如果这是 C++ 源代码环境上传，建议加入 src/include/CMakeLists.txt 或在 module.json 中写 source_dir；如果只是 exe 成品模块，可以忽略此警告。",
-        )
+    dependency_search_dirs = module_data.get("dependency_search_dirs", [])
+    if dependency_search_dirs is None:
+        dependency_search_dirs = []
+    if isinstance(dependency_search_dirs, str):
+        dependency_search_dirs = [dependency_search_dirs]
+    if not isinstance(dependency_search_dirs, list):
+        _add_error(report, "dependency_search_dirs", "dependency_search_dirs 必须是字符串数组", "例如：\"dependency_search_dirs\": [\"C:/OSGeo4W/bin\"]。")
+        dependency_search_dirs = []
+    for dep in dependency_search_dirs:
+        dep_text = str(dep or "").strip()
+        if not dep_text:
+            continue
+        dep_path = _resolve_module_reference(module_root, dep_text, module_id, module_root)
+        if not dep_path.exists() or not dep_path.is_dir():
+            _add_warning(report, "dependency_search_dirs", f"依赖搜索目录不存在：{dep_text}", "如果希望系统自动收集 DLL，请填写本机真实存在的 DLL 目录；如果不需要自动收集，可以留空。")
 
     runtime = str(module_data.get("runtime") or "native").lower()
     if runtime not in {"native", "cpp", "cpp_native", "c++", "exe", "binary"}:
-        _add_warning(report, "runtime", f"runtime 当前是 {runtime}，C++ 原生模块建议写 native 或 cpp_native", "建议：\"runtime\": \"cpp_native\"。")
+        _add_warning(report, "runtime", f"runtime 当前是 {runtime}，C++ 可执行模块建议写 native 或 cpp_native", "建议：\"runtime\": \"cpp_native\"。")
 
 
 def _dependency_search_dirs(module_root: Path, exe_path: Path, module_data: dict) -> list[Path]:
     search_dirs: list[Path] = [exe_path.parent, module_root]
     module_id = str(module_data.get("id") or "")
 
-    for key in ["dependency_dirs", "dependency_search_dirs", "build_dependency_dirs"]:
+    for key in ["dependency_dirs", "dependency_search_dirs"]:
         raw_list = module_data.get(key) or []
         if isinstance(raw_list, str):
             raw_list = [raw_list]
@@ -2905,7 +2887,7 @@ def install_validated_cpp_module(module_root: Path, module_data: dict, collect_d
 
 
 def install_uploaded_zip(zip_path: Path, tool_type: str | None = None, collect_dependencies: bool = True) -> dict:
-    """安装 module_drop 中投放的 C++/本地原生模块 zip，并先做完整规范校验。"""
+    """安装 module_drop 中投放的 C++/本地可执行模块 zip，并先做完整规范校验。"""
     temp_dir = Path(tempfile.mkdtemp(prefix="module_zip_"))
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
@@ -2969,7 +2951,7 @@ def install_module_from_folder(
     tool_type: str | None = None,
     collect_dependencies: bool = True,
 ) -> dict:
-    """安装本地 C++/原生模块文件夹，并在复制前校验 module.json 和缺失文件。"""
+    """安装本地 C++/可执行模块文件夹，并在复制前校验 module.json 和缺失文件。"""
     validation = validate_cpp_module_folder(
         folder_path,
         tool_type=tool_type,
@@ -3010,7 +2992,7 @@ def api_validate_cpp_module_folder(
 
     return {
         "ok": bool(report.get("ok")),
-        "message": "C++ 模块校验通过" if report.get("ok") else "C++ 模块校验未通过",
+        "message": "C++ 可执行模块校验通过" if report.get("ok") else "C++ 可执行模块校验未通过",
         **report,
     }
 
