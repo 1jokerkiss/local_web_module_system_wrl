@@ -62,7 +62,10 @@ STRICT_LOCAL_BINARY_PACKAGES = {
     "cartopy",
 }
 
-PREFER_LOCAL_BINARY_PACKAGES = {
+# 这些包不再从本地 python_wheels 强制安装。
+# 例如 Python 3.8 没有本地 numpy cp38 wheel 时，直接从远程 PyPI 下载匹配 wheel。
+# 仍然使用 --only-binary :all:，避免下载源码包并在中文路径下编译失败。
+REMOTE_BINARY_PACKAGES = {
     "numpy",
     "h5py",
 }
@@ -2205,7 +2208,7 @@ def parse_requirement_package_name(line: str) -> str:
 
 def split_requirements_for_local_binary(requirements_path: Path) -> tuple[list[str], list[str], list[str]]:
     strict_specs: list[str] = []
-    prefer_specs: list[str] = []
+    remote_specs: list[str] = []
     normal_lines: list[str] = []
 
     for raw in requirements_path.read_text(encoding="utf-8").splitlines():
@@ -2219,12 +2222,13 @@ def split_requirements_for_local_binary(requirements_path: Path) -> tuple[list[s
 
         if pkg in STRICT_LOCAL_BINARY_PACKAGES:
             strict_specs.append(line)
-        elif pkg in PREFER_LOCAL_BINARY_PACKAGES:
-            prefer_specs.append(line)
+        elif pkg in REMOTE_BINARY_PACKAGES:
+            remote_specs.append(line)
         else:
             normal_lines.append(raw)
 
-    return strict_specs, prefer_specs, normal_lines
+    return strict_specs, remote_specs, normal_lines
+
 def run_checked_command(
     cmd: list[str],
     cwd: Path | None = None,
@@ -2259,10 +2263,11 @@ def install_requirements_with_local_wheels(
     if not requirements_path.exists():
         return
 
-    strict_specs, prefer_specs, normal_lines = split_requirements_for_local_binary(requirements_path)
+    strict_specs, remote_specs, normal_lines = split_requirements_for_local_binary(requirements_path)
 
-    # numpy / h5py：优先本地 wheel，但不强制本地。
-    for spec in prefer_specs:
+    # numpy / h5py：远程安装，不使用 backend/python_wheels。
+    # --only-binary :all: 表示只接受 wheel，避免下载 tar.gz 源码包编译。
+    for spec in remote_specs:
         run_checked_command(
             [
                 str(python_exe),
@@ -2272,15 +2277,13 @@ def install_requirements_with_local_wheels(
                 "--only-binary",
                 ":all:",
                 "--prefer-binary",
-                "--find-links",
-                str(PYTHON_WHEELS_DIR),
                 spec,
             ],
             cwd=work_dir,
-            title=f"安装二进制依赖 {spec}",
+            title=f"远程安装二进制依赖 {spec}",
         )
 
-    # GDAL / rasterio / pyproj / cartopy：强制从本地 wheel 安装，避免源码编译失败。
+    # GDAL / rasterio / pyproj / cartopy：仍然强制从本地 wheel 安装，避免源码编译失败。
     for spec in strict_specs:
         run_checked_command(
             [
@@ -2313,14 +2316,13 @@ def install_requirements_with_local_wheels(
                 "pip",
                 "install",
                 "--prefer-binary",
-                "--find-links",
-                str(PYTHON_WHEELS_DIR),
                 "-r",
                 str(normal_req_path),
             ],
             cwd=work_dir,
             title="安装普通 Python 依赖",
         )
+
 def create_python_module_env(
     module_id: str,
     source_dir: Path,
@@ -2356,6 +2358,9 @@ def create_python_module_env(
     )
 
     python_exe = get_venv_python_path(env_dir)
+    if not python_exe.exists():
+        raise HTTPException(status_code=400, detail=f"创建环境后未找到 Python 解释器: {python_exe}")
+
     run_checked_command(
         [
             str(python_exe),
@@ -2365,8 +2370,6 @@ def create_python_module_env(
         cwd=source_dir,
         title="检查模块 Python 版本",
     )
-    if not python_exe.exists():
-        raise HTTPException(status_code=400, detail=f"创建环境后未找到 Python 解释器: {python_exe}")
 
     # 关键：先用 ensurepip 修复/安装 pip。
     # 不依赖当前 venv 里已经损坏的 pip 包。
