@@ -1251,13 +1251,109 @@ def upsert_module(module_data: dict):
     save_modules(modules)
 
 
-def remove_module(module_id: str) -> bool:
-    modules = load_modules()
-    new_modules = [m for m in modules if m.get("id") != module_id]
-    if len(new_modules) == len(modules):
+def _is_path_inside(child: Path, parent: Path) -> bool:
+    """
+    判断 child 是否在 parent 目录内部，避免误删项目外部目录。
+    """
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
         return False
+
+
+def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
+    """
+    只允许删除指定安全目录下的文件或文件夹。
+    """
+    path = path.resolve()
+
+    if not path.exists():
+        return {
+            "path": str(path),
+            "status": "missing",
+        }
+
+    if not any(_is_path_inside(path, root) for root in allowed_roots):
+        raise HTTPException(
+            status_code=400,
+            detail=f"拒绝删除非模块目录路径: {path}",
+        )
+
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=False)
+        else:
+            path.unlink()
+
+        return {
+            "path": str(path),
+            "status": "deleted",
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"删除模块本地文件失败: {path}，原因: {exc}",
+        )
+
+
+def remove_module(module_id: str) -> dict:
+    """
+    删除模块：
+    1. 从 modules.json 移除模块记录；
+    2. 删除 backend/installed_modules/{module_id}；
+    3. 删除 backend/module_envs/{module_id}；
+    4. 不删除任务记录、不删除数据管理中的输出结果文件。
+    """
+    modules = load_modules()
+
+    target_module = None
+    new_modules = []
+
+    for module in modules:
+        if module.get("id") == module_id:
+            target_module = module
+        else:
+            new_modules.append(module)
+
+    if not target_module:
+        return {
+            "removed": False,
+            "deleted_paths": [],
+        }
+
+    safe_module_id = sanitize_filename(module_id).strip()
+    if not safe_module_id:
+        raise HTTPException(status_code=400, detail="模块 ID 不能为空")
+
+    installed_dir = INSTALLED_MODULES_DIR / safe_module_id
+    env_dir = PYTHON_MODULE_ENVS_DIR / safe_module_id
+
+    allowed_roots = [
+        INSTALLED_MODULES_DIR,
+        PYTHON_MODULE_ENVS_DIR,
+    ]
+
+    deleted_paths = []
+
+    # 删除模块安装目录：backend/installed_modules/{module_id}
+    deleted_paths.append(
+        _remove_path_safely(installed_dir, allowed_roots)
+    )
+
+    # 删除 Python 独立环境目录：backend/module_envs/{module_id}
+    deleted_paths.append(
+        _remove_path_safely(env_dir, allowed_roots)
+    )
+
+    # 本地文件删除成功后，再删除 modules.json 中的记录
     save_modules(new_modules)
-    return True
+
+    return {
+        "removed": True,
+        "module_id": module_id,
+        "deleted_paths": deleted_paths,
+    }
 
 
 def format_command(template: List[str], values: Dict[str, Any]) -> List[str]:
@@ -2687,10 +2783,17 @@ def api_save_module(payload: ModuleSaveRequest, authorization: str | None = Head
 @app.delete("/api/admin/modules/{module_id}")
 def api_delete_module(module_id: str, authorization: str | None = Header(default=None)):
     require_admin(authorization)
-    ok = remove_module(module_id)
-    if not ok:
+
+    result = remove_module(module_id)
+
+    if not result.get("removed"):
         raise HTTPException(status_code=404, detail="模块不存在")
-    return {"ok": True}
+
+    return {
+        "ok": True,
+        "message": "模块及本地文件已删除",
+        **result,
+    }
 
 
 @app.post("/api/admin/modules/upload")
@@ -3967,15 +4070,8 @@ def api_delete_data_file(file_id: int, authorization: str | None = Header(defaul
     if not username:
         raise HTTPException(status_code=401, detail="未登录")
 
+    # 只删除 data_files.json 中的登记记录，不删除本地真实文件
     items, source_index, item = get_data_file_by_id_with_permission(file_id, user)
-
-    path = Path(str(item.get("path") or ""))
-
-    if path.exists() and path.is_file():
-        try:
-            path.unlink()
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"删除文件失败: {exc}")
 
     items.pop(source_index)
 
@@ -3983,7 +4079,7 @@ def api_delete_data_file(file_id: int, authorization: str | None = Header(defaul
         row["id"] = idx
 
     save_data_files(items)
-    return {"ok": True}
+    return {"ok": True, "message": "已从数据管理列表移除，本地文件未删除"}
 
 
 @app.get("/api/data/files/{file_id}/preview")
