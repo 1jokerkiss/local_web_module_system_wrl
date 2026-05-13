@@ -49,3 +49,5 @@ module_drop/
 /backend/python_wheels/numpy-1.26.3-cp312-cp312-win_amd64.whl
 /backend/python_wheels/numpy-2.2.1-cp312-cp312-win_amd64.whl
 /backend/python_wheels/numpy-2.4.4-cp313-cp313t-win_arm64.whl
+/backend/python_wheels/GDAL-3.4.2-cp38-cp38-win_amd64.whl
+/backend/python_wheels/h5py-2.10.0-cp38-cp38-win_amd64.whl
