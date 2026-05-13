@@ -2429,17 +2429,51 @@ def install_uploaded_zip(zip_path: Path, tool_type: str | None = None) -> dict:
 
         module_data = json.loads(module_json_path.read_text(encoding="utf-8"))
 
-        selected_tool_type = (
-            normalize_tool_key(tool_type or module_data.get("tool_type") or "")
-            or guess_module_tool_type(module_data)
-        )
-        module_data["tool_type"] = selected_tool_type
-        ensure_toolbar_exists(selected_tool_type)
+    selected_tool_type = (
+        normalize_tool_key(tool_type or module_data.get("tool_type") or "")
+        or guess_module_tool_type(module_data)
+    )
+    module_data["tool_type"] = selected_tool_type
+    if str(module_data.get("runtime") or "").strip() == "":
+        module_data["runtime"] = "cpp_native"
 
-        module_id = str(module_data.get("id") or "").strip()
-        if not module_id:
-            raise HTTPException(status_code=400, detail="module.json 缺少 id")
+    _validate_cpp_module_structure(module_root, module_data, report)
 
+    executable = str(module_data.get("executable") or module_data.get("entry") or "").strip()
+    module_id = str(module_data.get("id") or "").strip()
+    if collect_dependencies and executable:
+        exe_path = _resolve_module_reference(module_root, executable, module_id, module_root)
+        dep_report = collect_cpp_runtime_dependencies(module_root, exe_path, module_data, copy_files=copy_dependencies)
+        report["dependency_report"] = dep_report
+        if dep_report.get("missing_imports"):
+            _add_warning(
+                report,
+                "dependency_dirs",
+                "部分 DLL 运行依赖未找到：" + ", ".join(dep_report.get("missing_imports") or []),
+                "把这些 DLL 放到 deps 目录，或把它们所在目录加入 module.json 的 dependency_search_dirs。",
+            )
+        if copy_dependencies and dep_report.get("copied"):
+            dependency_dirs = module_data.get("dependency_dirs") or ["deps"]
+            if isinstance(dependency_dirs, list) and "deps/auto" not in dependency_dirs:
+                dependency_dirs.append("deps/auto")
+                module_data["dependency_dirs"] = dependency_dirs
+
+    report["module"] = module_data
+    _dedupe_report_items(report)
+    report["ok"] = len(report.get("errors") or []) == 0
+    report["can_install"] = report["ok"]
+    return report
+
+
+def install_validated_cpp_module(module_root: Path, module_data: dict, collect_dependencies: bool = True) -> dict:
+    module_id = str(module_data.get("id") or "").strip()
+    if not module_id:
+        raise HTTPException(status_code=400, detail="module.json 缺少 id")
+
+    target_dir = INSTALLED_MODULES_DIR / module_id
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    shutil.copytree(module_root, target_dir)
         target_dir = INSTALLED_MODULES_DIR / module_id
 
         if target_dir.exists():
@@ -2447,38 +2481,72 @@ def install_uploaded_zip(zip_path: Path, tool_type: str | None = None) -> dict:
 
         shutil.copytree(module_root, target_dir)
 
-        # executable 保存为项目相对路径，不再保存 D:/... 这种绝对路径
-        executable = str(module_data.get("executable") or "").strip()
-        if executable:
-            exe_path = resolve_packaged_module_path(
-                raw_value=executable,
-                module_id=module_id,
-                target_dir=target_dir,
-                default_path=target_dir,
-            )
-
-            module_data["executable"] = to_project_relative_path(exe_path)
-
-        # working_dir 保存为项目相对路径
-        working_dir = str(module_data.get("working_dir") or ".").strip()
-        wd_path = resolve_packaged_module_path(
-            raw_value=working_dir,
+    executable = str(module_data.get("executable") or module_data.get("entry") or "").strip()
+    if executable:
+        exe_path = resolve_packaged_module_path(
+            raw_value=executable,
             module_id=module_id,
             target_dir=target_dir,
             default_path=target_dir,
         )
+        module_data["executable"] = to_project_relative_path(exe_path)
 
-        module_data["working_dir"] = to_project_relative_path(wd_path)
+        if collect_dependencies and module_data.get("auto_collect_deps", True) is not False:
+            dep_report = collect_cpp_runtime_dependencies(target_dir, exe_path, module_data, copy_files=True)
+            if dep_report.get("copied"):
+                dependency_dirs = module_data.get("dependency_dirs") or ["deps"]
+                if isinstance(dependency_dirs, list) and "deps/auto" not in dependency_dirs:
+                    dependency_dirs.append("deps/auto")
+                    module_data["dependency_dirs"] = dependency_dirs
 
-        upsert_module(module_data)
-        return module_data
+    working_dir = str(module_data.get("working_dir") or ".").strip()
+    wd_path = resolve_packaged_module_path(
+        raw_value=working_dir,
+        module_id=module_id,
+        target_dir=target_dir,
+        default_path=target_dir,
+    )
+    module_data["working_dir"] = to_project_relative_path(wd_path)
+    module_data["runtime"] = module_data.get("runtime") or "cpp_native"
+
+    upsert_module(module_data)
+    return module_data
+
+
+def install_uploaded_zip(zip_path: Path, tool_type: str | None = None, collect_dependencies: bool = True) -> dict:
+    """安装 module_drop 中投放的 C++/本地可执行模块 zip，并先做完整规范校验。"""
+    temp_dir = Path(tempfile.mkdtemp(prefix="module_zip_"))
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(temp_dir)
+
+        validation = validate_cpp_module_folder(
+            temp_dir,
+            tool_type=tool_type,
+            collect_dependencies=True,
+            copy_dependencies=False,
+        )
+        if not validation.get("can_install"):
+            raise_cpp_validation_error(validation)
+
+        module_data = validation["module"]
+        module_root = Path(validation["module_root"])
+        selected_tool_type = (
+            normalize_tool_key(tool_type or module_data.get("tool_type") or "")
+            or guess_module_tool_type(module_data)
+        )
+        module_data["tool_type"] = selected_tool_type
+        ensure_toolbar_exists(selected_tool_type)
+
+        return install_validated_cpp_module(
+            module_root=module_root,
+            module_data=module_data,
+            collect_dependencies=collect_dependencies,
+        )
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-# ========================
-# 认证接口
-# =========================
 @app.post("/api/auth/login")
 def api_login(payload: LoginRequest):
     user = verify_user(payload.username, payload.password, payload.role)
@@ -2504,60 +2572,58 @@ def api_register(payload: RegisterRequest):
         return {"ok": True, "user": sanitize_user(user)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-def install_module_from_folder(folder_path: Path, tool_type: str | None = None) -> dict:
-    if not folder_path.exists() or not folder_path.is_dir():
-        raise HTTPException(status_code=400, detail=f"模块文件夹不存在: {folder_path}")
 
-    module_json_path = folder_path / "module.json"
-    if not module_json_path.exists():
-        candidates = list(folder_path.rglob("module.json"))
-        if not candidates:
-            raise HTTPException(status_code=400, detail="模块文件夹中未找到 module.json")
-        module_json_path = candidates[0]
+def install_module_from_folder(
+    folder_path: Path,
+    tool_type: str | None = None,
+    collect_dependencies: bool = True,
+) -> dict:
+    """安装本地 C++/可执行模块文件夹，并在复制前校验 module.json 和缺失文件。"""
+    validation = validate_cpp_module_folder(
+        folder_path,
+        tool_type=tool_type,
+        collect_dependencies=True,
+        copy_dependencies=False,
+    )
+    if not validation.get("can_install"):
+        raise_cpp_validation_error(validation)
 
-    module_root = module_json_path.parent
-    module_data = json.loads(module_json_path.read_text(encoding="utf-8"))
-
+    module_data = validation["module"]
+    module_root = Path(validation["module_root"])
     selected_tool_type = (
         normalize_tool_key(tool_type or module_data.get("tool_type") or "")
         or guess_module_tool_type(module_data)
     )
-
     module_data["tool_type"] = selected_tool_type
     ensure_toolbar_exists(selected_tool_type)
 
-    module_id = str(module_data.get("id") or "").strip()
-    if not module_id:
-        raise HTTPException(status_code=400, detail="module.json 缺少 id")
+    return install_validated_cpp_module(
+        module_root=module_root,
+        module_data=module_data,
+        collect_dependencies=collect_dependencies,
+    )
 
-    target_dir = INSTALLED_MODULES_DIR / module_id
-
+@app.post("/api/admin/modules/validate-cpp-folder")
+def api_validate_cpp_module_folder(
+    payload: InstallModuleFolderRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
     if target_dir.exists():
         safe_rmtree(target_dir)
 
-    shutil.copytree(module_root, target_dir)
-
-    executable = str(module_data.get("executable") or "").strip()
-    if executable:
-        exe_path = resolve_packaged_module_path(
-            raw_value=executable,
-            module_id=module_id,
-            target_dir=target_dir,
-            default_path=target_dir,
-        )
-        module_data["executable"] = to_project_relative_path(exe_path)
-
-    working_dir = str(module_data.get("working_dir") or ".").strip()
-    wd_path = resolve_packaged_module_path(
-        raw_value=working_dir,
-        module_id=module_id,
-        target_dir=target_dir,
-        default_path=target_dir,
+    report = validate_cpp_module_folder(
+        Path(payload.folder_path).expanduser().resolve(),
+        tool_type=payload.tool_type,
+        collect_dependencies=payload.auto_collect_dependencies,
+        copy_dependencies=False,
     )
-    module_data["working_dir"] = to_project_relative_path(wd_path)
 
-    upsert_module(module_data)
-    return module_data
+    return {
+        "ok": bool(report.get("ok")),
+        "message": "C++ 可执行模块校验通过" if report.get("ok") else "C++ 可执行模块校验未通过",
+        **report,
+    }
 
 
 @app.post("/api/admin/modules/install-folder")
@@ -2570,11 +2636,12 @@ def api_install_module_folder(
     module_data = install_module_from_folder(
         Path(payload.folder_path).expanduser().resolve(),
         payload.tool_type,
+        collect_dependencies=payload.auto_collect_dependencies,
     )
 
     return {
         "ok": True,
-        "message": "模块文件夹安装成功",
+        "message": "C++ 模块文件夹安装成功",
         "module": module_data,
     }
 """新增 /api/admin/modules/upload-python
@@ -3043,6 +3110,8 @@ def api_install_modules_from_local_drop(
             module_data = install_uploaded_zip(zip_path, selected_tool_type)
             installed.append(module_data)
             archive_installed_zip(zip_path)
+        except HTTPException as e:
+            failed.append({"name": zip_path.name, "error": e.detail})
         except Exception as e:
             failed.append({"name": zip_path.name, "error": str(e)})
 

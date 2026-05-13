@@ -9,6 +9,61 @@ function formatApiErrorDetail(detail, fallback) {
     const parts = [];
     if (detail.message) parts.push(String(detail.message));
 
+    if (Array.isArray(detail.errors) && detail.errors.length) {
+      parts.push('错误：');
+      detail.errors.slice(0, 30).forEach((item, idx) => {
+        if (typeof item === 'object' && item) {
+          parts.push(`${idx + 1}. ${item.field || '-'}：${item.message || ''}${item.suggestion ? `；建议：${item.suggestion}` : ''}`);
+        } else {
+          parts.push(`${idx + 1}. ${String(item)}`);
+        }
+      });
+      if (detail.errors.length > 30) parts.push(`... 还有 ${detail.errors.length - 30} 项错误`);
+    }
+
+    if (Array.isArray(detail.warnings) && detail.warnings.length) {
+      parts.push('警告：');
+      detail.warnings.slice(0, 30).forEach((item, idx) => {
+        if (typeof item === 'object' && item) {
+          parts.push(`${idx + 1}. ${item.field || '-'}：${item.message || ''}${item.suggestion ? `；建议：${item.suggestion}` : ''}`);
+        } else {
+          parts.push(`${idx + 1}. ${String(item)}`);
+        }
+      });
+      if (detail.warnings.length > 30) parts.push(`... 还有 ${detail.warnings.length - 30} 项警告`);
+    }
+
+    if (Array.isArray(detail.missing_files) && detail.missing_files.length) {
+      parts.push('缺少文件/文件夹：');
+      detail.missing_files.slice(0, 50).forEach((item, idx) => {
+        if (typeof item === 'object' && item) {
+          parts.push(`${idx + 1}. ${item.path || '-'}${item.reason ? `：${item.reason}` : ''}${item.suggestion ? `；建议：${item.suggestion}` : ''}`);
+        } else {
+          parts.push(`${idx + 1}. ${String(item)}`);
+        }
+      });
+      if (detail.missing_files.length > 50) parts.push(`... 还有 ${detail.missing_files.length - 50} 项缺失`);
+    }
+
+    if (Array.isArray(detail.suggestions) && detail.suggestions.length) {
+      parts.push('修改建议：');
+      detail.suggestions.slice(0, 30).forEach((item, idx) => {
+        parts.push(`${idx + 1}. ${String(item)}`);
+      });
+      if (detail.suggestions.length > 30) parts.push(`... 还有 ${detail.suggestions.length - 30} 条建议`);
+    }
+
+    if (detail.dependency_report && typeof detail.dependency_report === 'object') {
+      const dep = detail.dependency_report;
+      if (dep.message) parts.push(`依赖收集：${dep.message}`);
+      if (Array.isArray(dep.copied) && dep.copied.length) {
+        parts.push(`已自动收集依赖：${dep.copied.slice(0, 20).join(', ')}`);
+      }
+      if (Array.isArray(dep.missing_imports) && dep.missing_imports.length) {
+        parts.push(`未找到的运行依赖：${dep.missing_imports.slice(0, 30).join(', ')}`);
+      }
+    }
+
     if (Array.isArray(detail.missing) && detail.missing.length) {
       parts.push('缺失匹配：');
       detail.missing.slice(0, 20).forEach((item, idx) => {
@@ -408,6 +463,19 @@ export async function uploadModuleFolder(payload) {
     body: JSON.stringify({
       folder_path: payload.folder_path || '',
       tool_type: payload.tool_type || '',
+      runtime: payload.runtime || 'cpp_native',
+      auto_collect_dependencies: payload.auto_collect_dependencies !== false,
+    }),
+  });
+}
+
+export async function validateCppModuleFolder(payload) {
+  return request('/api/admin/modules/validate-cpp-folder', {
+    method: 'POST',
+    body: JSON.stringify({
+      folder_path: payload.folder_path || '',
+      tool_type: payload.tool_type || '',
+      auto_collect_dependencies: payload.auto_collect_dependencies !== false,
     }),
   });
 }
