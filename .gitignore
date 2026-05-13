@@ -31,3 +31,21 @@ project_structure.txt
 # Installed/runtime module packages
 backend/installed_modules/
 module_drop/
+/backend/python_wheels/GDAL-3.8.4-cp310-cp310-win_amd64.whl
+/backend/python_wheels/GDAL-3.8.4-cp311-cp311-win_amd64.whl
+/backend/python_wheels/GDAL-3.8.4-cp311-cp311-win_arm64.whl
+/backend/python_wheels/gdal-3.12.2-cp312-cp312-win_amd64.whl
+/backend/python_wheels/gdal-3.12.2-cp312-cp312-win_arm64.whl
+/backend/python_wheels/gdal-3.12.2-cp313-cp313-win_amd64.whl
+/backend/python_wheels/gdal-3.12.2-cp313-cp313-win_arm64.whl
+/backend/python_wheels/gdal-3.12.2-cp314-cp314-win_amd64.whl
+/backend/python_wheels/gdal-3.12.2-cp314-cp314-win_arm64.whl
+/backend/python_wheels/h5py-3.8.0-cp311-cp311-win_amd64.whl
+/backend/python_wheels/h5py-3.10.0-cp310-cp310-win_amd64.whl
+/backend/python_wheels/h5py-3.10.0-cp312-cp312-win_amd64.whl
+/backend/python_wheels/numpy-1.26.3-cp39-cp39-win_amd64.whl
+/backend/python_wheels/numpy-1.26.3-cp310-cp310-win_amd64.whl
+/backend/python_wheels/numpy-1.26.3-cp311-cp311-win_amd64.whl
+/backend/python_wheels/numpy-1.26.3-cp312-cp312-win_amd64.whl
+/backend/python_wheels/numpy-2.2.1-cp312-cp312-win_amd64.whl
+/backend/python_wheels/numpy-2.4.4-cp313-cp313t-win_arm64.whl
