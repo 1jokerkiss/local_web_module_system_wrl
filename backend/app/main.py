@@ -1113,6 +1113,27 @@ def get_user_data_file_by_visible_id(file_id: int, username: str) -> tuple[list[
         raise HTTPException(status_code=404, detail="文件不存在")
 
     return all_items, source_index, item
+
+def get_data_file_by_id_with_permission(file_id: int, user) -> tuple[list[dict], int, dict]:
+    username = get_username_from_user(user)
+
+    if isinstance(user, dict):
+        role = str(user.get("role") or "")
+    else:
+        role = str(getattr(user, "role", "") or "")
+
+    # 管理员：按全局 id 访问全部文件
+    if role == "admin":
+        all_items, _ = load_visible_data_files_for_user(username)
+
+        if file_id < 0 or file_id >= len(all_items):
+            raise HTTPException(status_code=404, detail="文件不存在")
+
+        item = all_items[file_id]
+        return all_items, file_id, item
+
+    # 普通用户：只能访问自己的 visible id
+    return get_user_data_file_by_visible_id(file_id, username)
 @app.post("/api/tasks/run")
 def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
@@ -3893,12 +3914,23 @@ def api_list_data_files(authorization: str | None = Header(default=None)):
     if not username:
         raise HTTPException(status_code=401, detail="未登录")
 
-    _, visible_items = load_visible_data_files_for_user(username)
+    # 管理员查看全部用户输出文件
+    if isinstance(user, dict):
+        role = str(user.get("role") or "")
+    else:
+        role = str(getattr(user, "role", "") or "")
 
-    for item in visible_items:
+    all_items, visible_items = load_visible_data_files_for_user(username)
+
+    if role == "admin":
+        result = [dict(item) for item in all_items]
+    else:
+        result = [dict(item) for item in visible_items]
+
+    for item in result:
         item.pop("_source_index", None)
 
-    return visible_items
+    return result
 
 
 @app.post("/api/data/files/{file_id}/reveal")
@@ -3908,7 +3940,7 @@ def api_reveal_data_file(file_id: int, authorization: str | None = Header(defaul
     if not username:
         raise HTTPException(status_code=401, detail="未登录")
 
-    _, _, item = get_user_data_file_by_visible_id(file_id, username)
+    _, _, item = get_data_file_by_id_with_permission(file_id, user)
 
     path = Path(str(item.get("path") or ""))
     if not path.exists():
@@ -3935,7 +3967,7 @@ def api_delete_data_file(file_id: int, authorization: str | None = Header(defaul
     if not username:
         raise HTTPException(status_code=401, detail="未登录")
 
-    items, source_index, item = get_user_data_file_by_visible_id(file_id, username)
+    items, source_index, item = get_data_file_by_id_with_permission(file_id, user)
 
     path = Path(str(item.get("path") or ""))
 
@@ -3961,7 +3993,7 @@ def api_preview_data_file(file_id: int, authorization: str | None = Header(defau
     if not username:
         raise HTTPException(status_code=401, detail="未登录")
 
-    _, _, item = get_user_data_file_by_visible_id(file_id, username)
+    _, _, item = get_data_file_by_id_with_permission(file_id, user)
 
     path = Path(str(item.get("path") or ""))
 
