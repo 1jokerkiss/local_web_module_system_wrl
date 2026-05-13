@@ -1894,7 +1894,12 @@ def load_python_module_config(raw_path: str) -> tuple[dict, Path]:
     entry_file = str(module_cfg.get("entry_file") or "main.py").strip()
     tool_type = str(module_cfg.get("tool_type") or "").strip()
     description = str(module_cfg.get("description") or "").strip()
-
+    python_executable = str(
+        module_cfg.get("python_executable")
+        or module_cfg.get("python")
+        or module_cfg.get("python_path")
+        or ""
+    ).strip()
     if not module_id:
         raise HTTPException(status_code=400, detail="Python 模块配置 JSON 缺少 module_id")
     if not module_name:
@@ -1934,6 +1939,7 @@ def load_python_module_config(raw_path: str) -> tuple[dict, Path]:
         "description": description,
         "param_json_path": str(param_json_path) if param_json_path else "",
         "param_json": param_json,
+        "python_executable": python_executable,
     }, config_path
 def install_python_venv_module_from_values(
     module_id: str,
@@ -1944,6 +1950,7 @@ def install_python_venv_module_from_values(
     description: str = "",
     param_json_path: str = "",
     param_json: dict | None = None,
+    python_executable: str = "",
 ) -> dict:
     safe_module_id = sanitize_filename(module_id).strip()
     if not safe_module_id:
@@ -1996,7 +2003,11 @@ def install_python_venv_module_from_values(
     rel_entry = entry_candidate.resolve().relative_to(source_root.resolve())
     installed_entry_script = source_target_dir / rel_entry
 
-    python_exe = create_python_module_env(safe_module_id, source_target_dir)
+    python_exe = create_python_module_env(
+        safe_module_id,
+        source_target_dir,
+        base_python_executable=python_executable,
+    )
 
     module_json_candidates = list(source_target_dir.rglob("module.json"))
     if module_json_candidates:
@@ -2028,6 +2039,7 @@ def install_python_venv_module_from_values(
     module_data["entry_file"] = rel_entry.as_posix()
     module_data["entry_script"] = to_project_relative_path(installed_entry_script)
     module_data["python_env_dir"] = to_project_relative_path(PYTHON_MODULE_ENVS_DIR / safe_module_id)
+    module_data["base_python_executable"] = python_executable
     module_data["executable"] = to_project_relative_path(python_exe)
     module_data["working_dir"] = to_project_relative_path(source_target_dir)
 
@@ -2257,6 +2269,8 @@ def install_requirements_with_local_wheels(
                 "-m",
                 "pip",
                 "install",
+                "--only-binary",
+                ":all:",
                 "--prefer-binary",
                 "--find-links",
                 str(PYTHON_WHEELS_DIR),
@@ -2275,6 +2289,8 @@ def install_requirements_with_local_wheels(
                 "pip",
                 "install",
                 "--no-index",
+                "--only-binary",
+                ":all:",
                 "--find-links",
                 str(PYTHON_WHEELS_DIR),
                 spec,
@@ -2305,7 +2321,11 @@ def install_requirements_with_local_wheels(
             cwd=work_dir,
             title="安装普通 Python 依赖",
         )
-def create_python_module_env(module_id: str, source_dir: Path) -> Path:
+def create_python_module_env(
+    module_id: str,
+    source_dir: Path,
+    base_python_executable: str = "",
+) -> Path:
     """为 Python 源码模块创建独立 venv，并安装 requirements.txt。"""
     env_dir = PYTHON_MODULE_ENVS_DIR / module_id
 
@@ -2313,13 +2333,38 @@ def create_python_module_env(module_id: str, source_dir: Path) -> Path:
         safe_rmtree(env_dir)
 
     # 用 --clear 明确创建干净环境，--copies 在 Windows 上比软链接更稳
+    if base_python_executable:
+        base_python = Path(base_python_executable).expanduser()
+
+        if not base_python.is_absolute():
+            base_python = (PROJECT_ROOT / base_python).resolve()
+        else:
+            base_python = base_python.resolve()
+
+        if not base_python.exists() or not base_python.is_file():
+            raise HTTPException(
+                status_code=400,
+                detail=f"指定的 Python 解释器不存在: {base_python}",
+            )
+    else:
+        base_python = Path(sys.executable).resolve()
+
     run_checked_command(
-        [sys.executable, "-m", "venv", "--clear", "--copies", str(env_dir)],
+        [str(base_python), "-m", "venv", "--clear", "--copies", str(env_dir)],
         cwd=BASE_DIR,
-        title="创建 Python 独立环境",
+        title=f"创建 Python 独立环境，基础解释器: {base_python}",
     )
 
     python_exe = get_venv_python_path(env_dir)
+    run_checked_command(
+        [
+            str(python_exe),
+            "-c",
+            "import sys, struct, platform; print(sys.version); print(struct.calcsize('P')*8); print(platform.machine())",
+        ],
+        cwd=source_dir,
+        title="检查模块 Python 版本",
+    )
     if not python_exe.exists():
         raise HTTPException(status_code=400, detail=f"创建环境后未找到 Python 解释器: {python_exe}")
 
@@ -2910,6 +2955,7 @@ def api_parse_python_module_config(
             "source_dir": config["source_dir"],
             "param_json_path": config["param_json_path"],
             "description": config["description"],
+            "python_executable": config.get("python_executable") or "",
         },
         "inputs": inputs,
         "count": len(inputs),
@@ -2934,6 +2980,7 @@ def api_upload_python_config_module(
         description=config["description"],
         param_json_path=config["param_json_path"],
         param_json=config["param_json"],
+        python_executable=config.get("python_executable") or "",
     )
 
     return {

@@ -1,57 +1,5 @@
 [
   {
-    "id": "FY",
-    "name": "fy反演",
-    "description": "FY4 CTH Python 源码模块",
-    "enabled": true,
-    "tool_type": "cloud",
-    "runtime_type": "python_venv",
-    "config_mode": "config_json",
-    "command_template": [
-      "{executable}",
-      "{entry_script}",
-      "{config_json}"
-    ],
-    "inputs": [
-      {
-        "key": "out_path",
-        "label": "out_path",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "output",
-        "default": "D:\\NEPU\\实验室\\项目\\气溶胶\\FY4_CTH\\output"
-      },
-      {
-        "key": "fy4_path",
-        "label": "fy4_path",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "input",
-        "default": "D:\\NEPU\\实验室\\项目\\气溶胶\\FY4_CTH\\data"
-      }
-    ],
-    "param_template": "backend/installed_modules/FY/param_template.json",
-    "source_dir": "backend/installed_modules/FY/source",
-    "entry_file": "CTH_FY.py",
-    "entry_script": "backend/installed_modules/FY/source/CTH_FY.py",
-    "python_env_dir": "backend/module_envs/FY",
-    "executable": "backend/module_envs/FY/Scripts/python.exe",
-    "working_dir": "backend/installed_modules/FY/source",
-    "parallel": {
-      "mode": "auto",
-      "input_key": "",
-      "output_key": "",
-      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
-      "output_suffix": ".tif"
-    }
-  },
-  {
     "id": "h8aod",
     "name": "H8 AOD 反演",
     "description": "H8 AOD 本地原生模块。用户按目录输入 B01、B03、B06、SOLAR，系统后端自动按文件名时次匹配并拆分为多个单文件 job，再按并发进程数调用 AOD_AHI.exe 执行。",
