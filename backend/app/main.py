@@ -50,6 +50,25 @@ DATA_FILES_FILE = DATA_DIR / "data_files.json"
 
 INSTALLED_MODULES_DIR = BASE_DIR / "installed_modules"
 INSTALLED_MODULES_DIR.mkdir(parents=True, exist_ok=True)
+PYTHON_WHEELS_DIR = BASE_DIR / "python_wheels"
+PYTHON_WHEELS_DIR.mkdir(parents=True, exist_ok=True)
+
+STRICT_LOCAL_BINARY_PACKAGES = {
+    "gdal",
+    "rasterio",
+    "pyproj",
+    "cartopy",
+}
+
+PREFER_LOCAL_BINARY_PACKAGES = {
+    "numpy",
+    "h5py",
+}
+# Python 源码模块的独立运行环境目录。
+# 方案二：不再把 Python 源码打包成 exe，而是为每个 Python 模块创建独立 venv，
+# 运行时使用该 venv 的 python.exe 执行入口脚本，并传入平台生成的 config.json。
+PYTHON_MODULE_ENVS_DIR = BASE_DIR / "module_envs"
+PYTHON_MODULE_ENVS_DIR.mkdir(parents=True, exist_ok=True)
 
 # 单机本地投放目录：管理员可以把模块 zip 直接放到这里，前端点“扫描本地目录安装”即可。
 MODULE_DROP_DIR = PROJECT_ROOT / "module_drop"
@@ -150,6 +169,25 @@ class InstallLocalDropRequest(BaseModel):
 
 
 class FilePreviewRequest(BaseModel):
+    path: str
+
+
+class ParseParamJsonRequest(BaseModel):
+    path: str
+class InstallModuleFolderRequest(BaseModel):
+    folder_path: str
+    tool_type: str = "cloud"
+
+class PythonFolderModuleUploadRequest(BaseModel):
+    source_dir: str
+    param_json_path: str
+    module_id: str
+    module_name: str
+    entry_file: str = "main.py"
+    tool_type: str = ""
+    description: str = ""
+
+class PythonModuleConfigRequest(BaseModel):
     path: str
 # 通用辅助函数
 VALID_PARALLEL_MODES = {"none", "auto", "single_file", "folder_chunks", "module_internal"}
@@ -967,17 +1005,6 @@ def get_username_from_user(user) -> str:
     if isinstance(user, dict):
         return str(user.get("username") or "")
     return str(getattr(user, "username", "") or "")
-def get_role_from_user(user) -> str:
-    """
-    兼容 get_current_user() 返回 dict 或对象两种情况。
-    """
-    if isinstance(user, dict):
-        return str(user.get("role") or "")
-    return str(getattr(user, "role", "") or "")
-
-
-def is_admin_user(user) -> bool:
-    return get_role_from_user(user) == "admin"
 OUTPUT_ROLE_VALUES = {"output", "out", "result", "结果", "输出"}
 
 
@@ -990,10 +1017,7 @@ def data_file_belongs_to_user(item: dict, username: str) -> bool:
     return bool(owner) and owner == str(username)
 
 
-def load_visible_data_files_for_user(
-    username: str,
-    include_all: bool = False,
-) -> tuple[list[dict], list[dict]]:
+def load_visible_data_files_for_user(username: str) -> tuple[list[dict], list[dict]]:
     """
     返回：
     1. all_items：清理过不存在文件后的全量 data_files
@@ -1035,7 +1059,7 @@ def load_visible_data_files_for_user(
         source_index = len(kept_items)
         kept_items.append(row)
 
-        if include_all or data_file_belongs_to_user(row, username):
+        if data_file_belongs_to_user(row, username):
             visible_row = dict(row)
             visible_row["_source_index"] = source_index
             visible_items.append(visible_row)
@@ -1055,7 +1079,7 @@ def load_visible_data_files_for_user(
 
     visible_items = []
     for item in kept_items:
-        if not include_all and not data_file_belongs_to_user(item, username):
+        if not data_file_belongs_to_user(item, username):
             continue
 
         row = dict(item)
@@ -1071,15 +1095,8 @@ def load_visible_data_files_for_user(
     return kept_items, visible_items
 
 
-def get_user_data_file_by_visible_id(
-    file_id: int,
-    username: str,
-    include_all: bool = False,
-) -> tuple[list[dict], int, dict]:
-    all_items, visible_items = load_visible_data_files_for_user(
-        username,
-        include_all=include_all,
-    )
+def get_user_data_file_by_visible_id(file_id: int, username: str) -> tuple[list[dict], int, dict]:
+    all_items, visible_items = load_visible_data_files_for_user(username)
 
     if file_id < 0 or file_id >= len(visible_items):
         raise HTTPException(status_code=404, detail="文件不存在")
@@ -1092,7 +1109,7 @@ def get_user_data_file_by_visible_id(
 
     item = all_items[source_index]
 
-    if not include_all and not data_file_belongs_to_user(item, username):
+    if not data_file_belongs_to_user(item, username):
         raise HTTPException(status_code=404, detail="文件不存在")
 
     return all_items, source_index, item
@@ -1111,6 +1128,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
 
     # 直接使用前端传来的用户选择路径；管理员固定输入在这里补齐。
     inputs = merge_admin_fixed_inputs(module, payload.inputs or {})
+    inputs = coerce_json_marked_inputs(module, inputs)
     parallel_workers = clamp_parallel_workers(payload.parallel_workers)
 
     # 必填校验。
@@ -1299,6 +1317,28 @@ def merge_admin_fixed_inputs(module: dict, inputs: Dict[str, Any]) -> Dict[str, 
             merged[key] = resolve_input_value_for_module(module, field, merged.get(key))
     return merged
 
+
+
+def coerce_json_marked_inputs(module: dict, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """把自动识别出的复杂 JSON 参数从字符串还原成 dict/list/number/bool。"""
+    result = dict(inputs or {})
+    for field in module.get("inputs", []) or []:
+        key = field.get("key")
+        if not key or key not in result:
+            continue
+
+        if field.get("json_value") is True and isinstance(result.get(key), str):
+            raw = result.get(key, "")
+            if raw == "":
+                continue
+            try:
+                result[key] = json.loads(raw)
+            except Exception:
+                # 用户在文本框里填的不是合法 JSON 时，保留原字符串，避免任务直接崩溃。
+                result[key] = raw
+
+    return result
+
 def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list[str], str, dict]:
     import os
     import json
@@ -1341,7 +1381,19 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
 
     values = dict(inputs)
     values["executable"] = str(exe_path)
+    values["python_executable"] = str(exe_path)
     values["working_dir"] = str(module_dir)
+
+    entry_script = str(module.get("entry_script") or "").strip()
+    if entry_script:
+        entry_path = Path(entry_script)
+        if not entry_path.is_absolute():
+            entry_path = (project_root / entry_path).resolve()
+        else:
+            entry_path = entry_path.resolve()
+        if not entry_path.exists():
+            raise HTTPException(status_code=400, detail=f"Python 入口脚本不存在: {entry_path}")
+        values["entry_script"] = str(entry_path)
 
     runtime_env = os.environ.copy()
 
@@ -1364,7 +1416,46 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
             ordered_dirs.append(p)
             seen.add(p)
 
+    runtime_type_for_env = str(module.get("runtime_type") or "").lower()
+
+    if runtime_type_for_env == "python_venv":
+        try:
+            venv_python = exe_path
+            venv_root = venv_python.parent.parent
+
+            venv_dirs = [
+                venv_python.parent,
+                venv_root,
+                venv_root / "DLLs",
+                venv_root / "Library" / "bin",
+            ]
+
+            site_packages = venv_root / "Lib" / "site-packages"
+
+            if site_packages.exists():
+                for libs_dir in site_packages.glob("*.libs"):
+                    if libs_dir.is_dir():
+                        venv_dirs.append(libs_dir)
+
+                for libs_dir in [
+                    site_packages / "h5py.libs",
+                    site_packages / "numpy.libs",
+                    site_packages / "osgeo",
+                ]:
+                    if libs_dir.exists() and libs_dir.is_dir():
+                        venv_dirs.append(libs_dir)
+
+            for item in venv_dirs:
+                if item.exists() and item.is_dir():
+                    resolved_item = str(item.resolve())
+                    if resolved_item not in seen:
+                        ordered_dirs.append(resolved_item)
+                        seen.add(resolved_item)
+        except Exception:
+            pass
+
     runtime_env["PATH"] = ";".join(ordered_dirs + [runtime_env.get("PATH", "")])
+    runtime_env["MODULE_DLL_DIRS"] = ";".join(ordered_dirs)
 
     # 避免 OpenBLAS 线程过多导致崩溃
     runtime_env["OPENBLAS_NUM_THREADS"] = "1"
@@ -1375,22 +1466,74 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
     runtime_env["MODULE_DLL_DIRS"] = ";".join(ordered_dirs)
 
     if config_mode in {"json", "json_file", "config_json"}:
-        # 为本次任务创建独立 runtime 目录
         runtime_task_dir = Path(tempfile.mkdtemp(prefix="job_", dir=str(RUNTIME_DIR)))
-
-        config_path = runtime_task_dir / "config.json"
         module_config = to_module_json_value(inputs)
-        config_path.write_text(
-            json.dumps(module_config, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
 
-        values["config_json"] = str(config_path)
-        values["config_path"] = str(config_path)
-        values["runtime_dir"] = str(runtime_task_dir)
+        runtime_type = str(module.get("runtime_type") or "").lower()
 
-        if not command_template:
-            command_template = ["{executable}", "{config_json}"]
+        if runtime_type == "python_venv":
+            source_dir = Path(str(module.get("source_dir") or module.get("working_dir") or ""))
+
+            if not source_dir.is_absolute():
+                source_dir = (project_root / source_dir).resolve()
+            else:
+                source_dir = source_dir.resolve()
+
+            if not source_dir.exists() or not source_dir.is_dir():
+                raise HTTPException(status_code=400, detail=f"Python 源码目录不存在: {source_dir}")
+
+            run_source_dir = runtime_task_dir / "source"
+            shutil.copytree(
+                source_dir,
+                run_source_dir,
+                ignore=shutil.ignore_patterns(
+                    "__pycache__",
+                    "*.pyc",
+                    ".venv",
+                    "venv",
+                    ".git",
+                ),
+            )
+
+            config_path = run_source_dir / "config.json"
+            config_path.write_text(
+                json.dumps(module_config, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            entry_name = str(module.get("entry_file") or "main.py")
+            entry_path = run_source_dir / entry_name
+            if not entry_path.exists():
+                candidates = list(run_source_dir.rglob(entry_name))
+                if candidates:
+                    entry_path = candidates[0]
+
+            if not entry_path.exists():
+                raise HTTPException(status_code=400, detail=f"Python 入口脚本不存在: {entry_name}")
+
+            values["config_json"] = str(config_path)
+            values["config_path"] = str(config_path)
+            values["runtime_dir"] = str(runtime_task_dir)
+            values["entry_script"] = str(entry_path)
+
+            module_dir = run_source_dir
+
+            if not command_template:
+                command_template = ["{executable}", "{entry_script}"]
+
+        else:
+            config_path = runtime_task_dir / "config.json"
+            config_path.write_text(
+                json.dumps(module_config, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            values["config_json"] = str(config_path)
+            values["config_path"] = str(config_path)
+            values["runtime_dir"] = str(runtime_task_dir)
+
+            if not command_template:
+                command_template = ["{executable}", "{config_json}"]
     else:
         if not command_template:
             command_template = ["{executable}"]
@@ -1436,17 +1579,10 @@ def build_python_source_to_exe(
 
         # 可选：如果源码包里有 requirements.txt，先安装依赖
         if requirements_path.exists():
-            subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "-r",
-                    str(requirements_path),
-                ],
-                cwd=str(source_dir),
-                check=True,
+            install_requirements_with_local_wheels(
+                python_exe=Path(sys.executable),
+                requirements_path=requirements_path,
+                work_dir=source_dir,
             )
 
         dist_dir = temp_dir / "dist"
@@ -1501,6 +1637,550 @@ def build_python_source_to_exe(
             status_code=400,
             detail=f"安装 Python 依赖失败：{e}",
         )
+
+
+def _resolve_local_json_path(raw_path: str) -> Path:
+    raw = str(raw_path or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="参数 JSON 文件路径不能为空")
+
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (PROJECT_ROOT / path).resolve()
+    else:
+        path = path.resolve()
+
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=400, detail=f"参数 JSON 文件不存在: {path}")
+    if path.suffix.lower() != ".json":
+        raise HTTPException(status_code=400, detail="请选择 .json 参数文件")
+    return path
+
+
+def load_param_json_file(raw_path: str) -> dict:
+    path = _resolve_local_json_path(raw_path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError:
+        data = json.loads(path.read_text(encoding="gbk"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"参数 JSON 解析失败: {exc}")
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="参数 JSON 顶层必须是对象，例如 {\"input_dir\": \"...\"}")
+    return data
+
+def _resolve_path_relative_to_config(raw_path: str, config_path: Path) -> Path:
+    raw = str(raw_path or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="路径不能为空")
+
+    path = Path(raw).expanduser()
+
+    if not path.is_absolute():
+        path = (config_path.parent / path).resolve()
+    else:
+        path = path.resolve()
+
+    return path
+
+
+def load_python_module_config(raw_path: str) -> tuple[dict, Path]:
+    config_path = _resolve_local_json_path(raw_path)
+
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError:
+        data = json.loads(config_path.read_text(encoding="gbk"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Python 模块配置 JSON 解析失败: {exc}")
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Python 模块配置 JSON 顶层必须是对象")
+
+    # 兼容两种写法：
+    # 1. 直接平铺字段：module_id/source_dir/...
+    # 2. 写在 module 下面：{"module": {...}}
+    module_cfg = data.get("module") if isinstance(data.get("module"), dict) else data
+
+    module_id = str(module_cfg.get("module_id") or module_cfg.get("id") or "").strip()
+    module_name = str(module_cfg.get("module_name") or module_cfg.get("name") or "").strip()
+    source_dir_raw = str(module_cfg.get("source_dir") or module_cfg.get("python_source_dir") or "").strip()
+    entry_file = str(module_cfg.get("entry_file") or "main.py").strip()
+    tool_type = str(module_cfg.get("tool_type") or "").strip()
+    description = str(module_cfg.get("description") or "").strip()
+
+    if not module_id:
+        raise HTTPException(status_code=400, detail="Python 模块配置 JSON 缺少 module_id")
+    if not module_name:
+        raise HTTPException(status_code=400, detail="Python 模块配置 JSON 缺少 module_name")
+    if not source_dir_raw:
+        raise HTTPException(status_code=400, detail="Python 模块配置 JSON 缺少 source_dir")
+
+    source_dir = _resolve_path_relative_to_config(source_dir_raw, config_path)
+
+    if not source_dir.exists() or not source_dir.is_dir():
+        raise HTTPException(status_code=400, detail=f"Python 源码文件夹不存在: {source_dir}")
+
+    param_template = module_cfg.get("param_template")
+    param_json_path = None
+
+    if isinstance(param_template, dict):
+        param_json = param_template
+    else:
+        param_json_raw = str(module_cfg.get("param_json_path") or module_cfg.get("config_json") or "").strip()
+        if not param_json_raw:
+            # 默认找源码目录下的 config.json
+            param_json_path = source_dir / "config.json"
+        else:
+            param_json_path = _resolve_path_relative_to_config(param_json_raw, config_path)
+
+        if not param_json_path.exists() or not param_json_path.is_file():
+            raise HTTPException(status_code=400, detail=f"参数 JSON 文件不存在: {param_json_path}")
+
+        param_json = load_param_json_file(str(param_json_path))
+
+    return {
+        "module_id": module_id,
+        "module_name": module_name,
+        "source_dir": str(source_dir),
+        "entry_file": entry_file,
+        "tool_type": tool_type,
+        "description": description,
+        "param_json_path": str(param_json_path) if param_json_path else "",
+        "param_json": param_json,
+    }, config_path
+def install_python_venv_module_from_values(
+    module_id: str,
+    module_name: str,
+    source_dir: str,
+    entry_file: str,
+    tool_type: str = "",
+    description: str = "",
+    param_json_path: str = "",
+    param_json: dict | None = None,
+) -> dict:
+    safe_module_id = sanitize_filename(module_id).strip()
+    if not safe_module_id:
+        raise HTTPException(status_code=400, detail="模块 ID 不能为空")
+
+    source_root = Path(source_dir or "").expanduser()
+    if not source_root.is_absolute():
+        source_root = (PROJECT_ROOT / source_root).resolve()
+    else:
+        source_root = source_root.resolve()
+
+    if not source_root.exists() or not source_root.is_dir():
+        raise HTTPException(status_code=400, detail=f"Python 源码文件夹不存在: {source_root}")
+
+    if param_json is None:
+        if not param_json_path:
+            param_json_path = str(source_root / "config.json")
+        resolved_param_json_path = _resolve_local_json_path(param_json_path)
+        param_json = load_param_json_file(str(resolved_param_json_path))
+    else:
+        resolved_param_json_path = None
+
+    inferred_inputs = infer_inputs_from_param_json(param_json)
+
+    entry_name = entry_file or "main.py"
+    entry_candidate = source_root / entry_name
+    if not entry_candidate.exists():
+        candidates = list(source_root.rglob(entry_name))
+        if candidates:
+            entry_candidate = candidates[0]
+
+    if not entry_candidate.exists() or not entry_candidate.is_file():
+        raise HTTPException(status_code=400, detail=f"未找到 Python 入口文件: {entry_name}")
+
+    target_dir = INSTALLED_MODULES_DIR / safe_module_id
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    source_target_dir = target_dir / "source"
+    shutil.copytree(source_root, source_target_dir, dirs_exist_ok=True)
+
+    # 保存参数模板
+    param_template_path = target_dir / "param_template.json"
+    param_template_path.write_text(
+        json.dumps(param_json, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    rel_entry = entry_candidate.resolve().relative_to(source_root.resolve())
+    installed_entry_script = source_target_dir / rel_entry
+
+    python_exe = create_python_module_env(safe_module_id, source_target_dir)
+
+    module_json_candidates = list(source_target_dir.rglob("module.json"))
+    if module_json_candidates:
+        module_data = json.loads(module_json_candidates[0].read_text(encoding="utf-8"))
+    else:
+        module_data = {
+            "id": safe_module_id,
+            "name": module_name or safe_module_id,
+            "description": description or "Python 源码独立环境运行模块",
+            "enabled": True,
+        }
+
+    selected_tool_type = (
+        normalize_tool_key(tool_type or module_data.get("tool_type") or "")
+        or guess_module_tool_type(module_data)
+    )
+
+    module_data["id"] = safe_module_id
+    module_data["name"] = module_name or module_data.get("name") or safe_module_id
+    module_data["description"] = description or module_data.get("description") or "Python 源码独立环境运行模块"
+    module_data["tool_type"] = selected_tool_type
+    module_data["enabled"] = module_data.get("enabled", True)
+    module_data["runtime_type"] = "python_venv"
+    module_data["config_mode"] = "config_json"
+    module_data["command_template"] = ["{executable}", "{entry_script}", "{config_json}"]
+    module_data["inputs"] = inferred_inputs
+    module_data["param_template"] = to_project_relative_path(param_template_path)
+    module_data["source_dir"] = to_project_relative_path(source_target_dir)
+    module_data["entry_file"] = rel_entry.as_posix()
+    module_data["entry_script"] = to_project_relative_path(installed_entry_script)
+    module_data["python_env_dir"] = to_project_relative_path(PYTHON_MODULE_ENVS_DIR / safe_module_id)
+    module_data["executable"] = to_project_relative_path(python_exe)
+    module_data["working_dir"] = to_project_relative_path(source_target_dir)
+
+    ensure_toolbar_exists(selected_tool_type)
+    upsert_module(module_data)
+
+    return module_data
+
+def infer_param_input_type(key: str, value: Any) -> str:
+    k = str(key or "").lower()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "number"
+    if isinstance(value, (dict, list)):
+        return "textarea"
+
+    text = str(value or "")
+    suffix = Path(text).suffix.lower() if text else ""
+    if any(x in k for x in ["dir", "folder", "目录", "outpath", "out_dir", "output_dir", "输出目录"]):
+        return "dir_path"
+    if any(x in k for x in ["file", "path", "文件"]):
+        if suffix:
+            return "file_path"
+        return "dir_path"
+    if suffix in {".tif", ".tiff", ".nc", ".hdf", ".h5", ".json", ".txt", ".xml", ".dat", ".csv"}:
+        return "file_path"
+    return "text"
+
+
+def infer_inputs_from_param_json(data: dict) -> list[dict]:
+    inputs: list[dict] = []
+    for key, value in data.items():
+        if key in {"executable", "working_dir", "config_json", "config_path", "runtime_dir"}:
+            continue
+
+        field_type = infer_param_input_type(key, value)
+        item: dict[str, Any] = {
+            "key": str(key),
+            "label": str(key),
+            "type": field_type,
+            "required": True,
+            "visible_to_user": True,
+            "admin_fixed": False,
+            "path_mode": "absolute",
+            "io_role": "auto",
+        }
+
+        lower_key = str(key).lower()
+        if any(x in lower_key for x in ["out", "output", "result", "save", "输出"]):
+            item["io_role"] = "output"
+        elif field_type in {"file_path", "dir_path"}:
+            item["io_role"] = "input"
+
+        if isinstance(value, (dict, list)):
+            item["default"] = json.dumps(value, ensure_ascii=False, indent=2)
+            item["json_value"] = True
+            item["help_text"] = "复杂 JSON 参数，运行前会自动还原为对象或数组"
+        elif value is not None:
+            item["default"] = value
+
+        inputs.append(item)
+    return inputs
+
+
+def build_python_source_dir_to_exe(
+    source_dir_path: Path,
+    module_id: str,
+    entry_file: str = "main.py",
+) -> tuple[Path, Path]:
+    """把本地 Python 源码文件夹复制到临时目录后打包为 exe。"""
+    if not source_dir_path.exists() or not source_dir_path.is_dir():
+        raise HTTPException(status_code=400, detail=f"Python 源码文件夹不存在: {source_dir_path}")
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="python_module_folder_"))
+    source_dir = temp_dir / "source"
+    shutil.copytree(source_dir_path, source_dir, dirs_exist_ok=True)
+
+    entry_path = source_dir / entry_file
+    if not entry_path.exists():
+        candidates = list(source_dir.rglob(entry_file))
+        if candidates:
+            entry_path = candidates[0]
+
+    if not entry_path.exists():
+        raise HTTPException(status_code=400, detail=f"未找到 Python 入口文件: {entry_file}")
+
+    requirements_path = source_dir / "requirements.txt"
+    if requirements_path.exists():
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r", str(requirements_path)],
+                cwd=str(source_dir),
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise HTTPException(status_code=400, detail=f"安装 Python 依赖失败: {exc}")
+
+    dist_dir = temp_dir / "dist"
+    build_dir = temp_dir / "build"
+    spec_dir = temp_dir / "spec"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "PyInstaller",
+            "--noconfirm",
+            "--clean",
+            "--onefile",
+            "--name",
+            module_id,
+            "--distpath",
+            str(dist_dir),
+            "--workpath",
+            str(build_dir),
+            "--specpath",
+            str(spec_dir),
+            str(entry_path),
+        ],
+        cwd=str(source_dir),
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Python 代码打包失败:\n" + (result.stderr or result.stdout or "未知错误"),
+        )
+
+    exe_path = dist_dir / f"{module_id}.exe"
+    if not exe_path.exists():
+        raise HTTPException(status_code=400, detail="打包完成但未找到生成的 exe 文件")
+
+    return source_dir, exe_path
+
+def get_venv_python_path(env_dir: Path) -> Path:
+    if os.name == "nt":
+        return env_dir / "Scripts" / "python.exe"
+    return env_dir / "bin" / "python"
+def parse_requirement_package_name(line: str) -> str:
+    """
+    从 requirements.txt 的一行里解析包名。
+    例如：
+    GDAL==3.4.3 -> gdal
+    numpy>=1.23 -> numpy
+    h5py -> h5py
+    """
+    text = (line or "").strip()
+
+    if not text or text.startswith("#"):
+        return ""
+
+    if text.startswith("-"):
+        return ""
+
+    for sep in ["==", ">=", "<=", "~=", "!=", ">", "<", "[", ";"]:
+        if sep in text:
+            text = text.split(sep, 1)[0]
+            break
+
+    return text.strip().lower().replace("_", "-")
+
+
+def split_requirements_for_local_binary(requirements_path: Path) -> tuple[list[str], list[str], list[str]]:
+    strict_specs: list[str] = []
+    prefer_specs: list[str] = []
+    normal_lines: list[str] = []
+
+    for raw in requirements_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+
+        if not line or line.startswith("#"):
+            normal_lines.append(raw)
+            continue
+
+        pkg = parse_requirement_package_name(line)
+
+        if pkg in STRICT_LOCAL_BINARY_PACKAGES:
+            strict_specs.append(line)
+        elif pkg in PREFER_LOCAL_BINARY_PACKAGES:
+            prefer_specs.append(line)
+        else:
+            normal_lines.append(raw)
+
+    return strict_specs, prefer_specs, normal_lines
+def run_checked_command(
+    cmd: list[str],
+    cwd: Path | None = None,
+    title: str = "执行命令",
+) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+    )
+
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{title}失败：\n"
+                f"命令：{' '.join(map(str, cmd))}\n\n"
+                f"STDOUT:\n{result.stdout or ''}\n\n"
+                f"STDERR:\n{result.stderr or ''}"
+            ),
+        )
+
+    return result
+def install_requirements_with_local_wheels(
+    python_exe: Path,
+    requirements_path: Path,
+    work_dir: Path,
+):
+    if not requirements_path.exists():
+        return
+
+    strict_specs, prefer_specs, normal_lines = split_requirements_for_local_binary(requirements_path)
+
+    # numpy / h5py：优先本地 wheel，但不强制本地。
+    for spec in prefer_specs:
+        run_checked_command(
+            [
+                str(python_exe),
+                "-m",
+                "pip",
+                "install",
+                "--prefer-binary",
+                "--find-links",
+                str(PYTHON_WHEELS_DIR),
+                spec,
+            ],
+            cwd=work_dir,
+            title=f"安装二进制依赖 {spec}",
+        )
+
+    # GDAL / rasterio / pyproj / cartopy：强制从本地 wheel 安装，避免源码编译失败。
+    for spec in strict_specs:
+        run_checked_command(
+            [
+                str(python_exe),
+                "-m",
+                "pip",
+                "install",
+                "--no-index",
+                "--find-links",
+                str(PYTHON_WHEELS_DIR),
+                spec,
+            ],
+            cwd=work_dir,
+            title=f"从本地二进制包安装 {spec}",
+        )
+
+    normal_req_path = work_dir / "requirements.normal.txt"
+    normal_req_path.write_text(
+        "\n".join(normal_lines),
+        encoding="utf-8",
+    )
+
+    if normal_req_path.read_text(encoding="utf-8").strip():
+        run_checked_command(
+            [
+                str(python_exe),
+                "-m",
+                "pip",
+                "install",
+                "--prefer-binary",
+                "--find-links",
+                str(PYTHON_WHEELS_DIR),
+                "-r",
+                str(normal_req_path),
+            ],
+            cwd=work_dir,
+            title="安装普通 Python 依赖",
+        )
+def create_python_module_env(module_id: str, source_dir: Path) -> Path:
+    """为 Python 源码模块创建独立 venv，并安装 requirements.txt。"""
+    env_dir = PYTHON_MODULE_ENVS_DIR / module_id
+
+    if env_dir.exists():
+        shutil.rmtree(env_dir)
+
+    # 用 --clear 明确创建干净环境，--copies 在 Windows 上比软链接更稳
+    run_checked_command(
+        [sys.executable, "-m", "venv", "--clear", "--copies", str(env_dir)],
+        cwd=BASE_DIR,
+        title="创建 Python 独立环境",
+    )
+
+    python_exe = get_venv_python_path(env_dir)
+    if not python_exe.exists():
+        raise HTTPException(status_code=400, detail=f"创建环境后未找到 Python 解释器: {python_exe}")
+
+    # 关键：先用 ensurepip 修复/安装 pip。
+    # 不依赖当前 venv 里已经损坏的 pip 包。
+    run_checked_command(
+        [str(python_exe), "-m", "ensurepip", "--upgrade", "--default-pip"],
+        cwd=source_dir,
+        title="初始化 pip",
+    )
+
+    # 检查 pip 是否真的可用
+    run_checked_command(
+        [str(python_exe), "-m", "pip", "--version"],
+        cwd=source_dir,
+        title="检查 pip",
+    )
+
+    # 再升级基础打包工具。这里不要只升级 pip，也顺带装 setuptools / wheel。
+    run_checked_command(
+        [
+            str(python_exe),
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--force-reinstall",
+            "pip",
+            "setuptools",
+            "wheel",
+        ],
+        cwd=source_dir,
+        title="升级 pip/setuptools/wheel",
+    )
+
+    requirements_path = source_dir / "requirements.txt"
+    if requirements_path.exists():
+        install_requirements_with_local_wheels(
+            python_exe=python_exe,
+            requirements_path=requirements_path,
+            work_dir=source_dir,
+        )
+
+    return python_exe
+
+
 def install_uploaded_zip(zip_path: Path, tool_type: str | None = None) -> dict:
     temp_dir = Path(tempfile.mkdtemp(prefix="module_zip_"))
     try:
@@ -1591,7 +2271,79 @@ def api_register(payload: RegisterRequest):
         return {"ok": True, "user": sanitize_user(user)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+def install_module_from_folder(folder_path: Path, tool_type: str | None = None) -> dict:
+    if not folder_path.exists() or not folder_path.is_dir():
+        raise HTTPException(status_code=400, detail=f"模块文件夹不存在: {folder_path}")
 
+    module_json_path = folder_path / "module.json"
+    if not module_json_path.exists():
+        candidates = list(folder_path.rglob("module.json"))
+        if not candidates:
+            raise HTTPException(status_code=400, detail="模块文件夹中未找到 module.json")
+        module_json_path = candidates[0]
+
+    module_root = module_json_path.parent
+    module_data = json.loads(module_json_path.read_text(encoding="utf-8"))
+
+    selected_tool_type = (
+        normalize_tool_key(tool_type or module_data.get("tool_type") or "")
+        or guess_module_tool_type(module_data)
+    )
+
+    module_data["tool_type"] = selected_tool_type
+    ensure_toolbar_exists(selected_tool_type)
+
+    module_id = str(module_data.get("id") or "").strip()
+    if not module_id:
+        raise HTTPException(status_code=400, detail="module.json 缺少 id")
+
+    target_dir = INSTALLED_MODULES_DIR / module_id
+
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+
+    shutil.copytree(module_root, target_dir)
+
+    executable = str(module_data.get("executable") or "").strip()
+    if executable:
+        exe_path = resolve_packaged_module_path(
+            raw_value=executable,
+            module_id=module_id,
+            target_dir=target_dir,
+            default_path=target_dir,
+        )
+        module_data["executable"] = to_project_relative_path(exe_path)
+
+    working_dir = str(module_data.get("working_dir") or ".").strip()
+    wd_path = resolve_packaged_module_path(
+        raw_value=working_dir,
+        module_id=module_id,
+        target_dir=target_dir,
+        default_path=target_dir,
+    )
+    module_data["working_dir"] = to_project_relative_path(wd_path)
+
+    upsert_module(module_data)
+    return module_data
+
+
+@app.post("/api/admin/modules/install-folder")
+def api_install_module_folder(
+    payload: InstallModuleFolderRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+
+    module_data = install_module_from_folder(
+        Path(payload.folder_path).expanduser().resolve(),
+        payload.tool_type,
+    )
+
+    return {
+        "ok": True,
+        "message": "模块文件夹安装成功",
+        "module": module_data,
+    }
 """新增 /api/admin/modules/upload-python
 
 这个接口负责：
@@ -1659,8 +2411,6 @@ def api_upload_python_module(
                 "name": module_name,
                 "description": "Python 源码自动打包生成的模块",
                 "enabled": True,
-                "config_mode": "config_json",
-                "command_template": ["{executable}", "{config_json}"],
                 "inputs": [],
             }
 
@@ -1690,6 +2440,30 @@ def api_upload_python_module(
 
     finally:
         shutil.rmtree(upload_tmp, ignore_errors=True)
+
+
+@app.post("/api/admin/modules/upload-python-folder")
+def api_upload_python_folder_module(
+    payload: PythonFolderModuleUploadRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+
+    module_data = install_python_venv_module_from_values(
+        module_id=payload.module_id,
+        module_name=payload.module_name,
+        source_dir=payload.source_dir,
+        entry_file=payload.entry_file or "main.py",
+        tool_type=payload.tool_type,
+        description=payload.description,
+        param_json_path=payload.param_json_path,
+    )
+
+    return {
+        "ok": True,
+        "message": "Python 源码模块已创建独立环境并安装成功",
+        "module": module_data,
+    }
 @app.get("/api/auth/forgot-password/question")
 def api_forgot_password_question(username: str):
     try:
@@ -1921,7 +2695,58 @@ def api_upload_module_zip(
         if temp_zip.exists():
             temp_zip.unlink(missing_ok=True)
 
+@app.post("/api/admin/modules/parse-python-module-config")
+def api_parse_python_module_config(
+    payload: PythonModuleConfigRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
 
+    config, config_path = load_python_module_config(payload.path)
+    inputs = infer_inputs_from_param_json(config["param_json"])
+
+    return {
+        "ok": True,
+        "config_path": str(config_path),
+        "module": {
+            "module_id": config["module_id"],
+            "module_name": config["module_name"],
+            "tool_type": config["tool_type"],
+            "entry_file": config["entry_file"],
+            "source_dir": config["source_dir"],
+            "param_json_path": config["param_json_path"],
+            "description": config["description"],
+        },
+        "inputs": inputs,
+        "count": len(inputs),
+    }
+
+
+@app.post("/api/admin/modules/upload-python-config")
+def api_upload_python_config_module(
+    payload: PythonModuleConfigRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+
+    config, _ = load_python_module_config(payload.path)
+
+    module_data = install_python_venv_module_from_values(
+        module_id=config["module_id"],
+        module_name=config["module_name"],
+        source_dir=config["source_dir"],
+        entry_file=config["entry_file"],
+        tool_type=config["tool_type"],
+        description=config["description"],
+        param_json_path=config["param_json_path"],
+        param_json=config["param_json"],
+    )
+
+    return {
+        "ok": True,
+        "message": "Python 模块配置 JSON 安装成功",
+        "module": module_data,
+    }
 @app.get("/api/admin/modules/drop-zips")
 def api_list_module_drop_zips(authorization: str | None = Header(default=None)):
     require_admin(authorization)
@@ -2756,10 +3581,6 @@ def task_belongs_to_user(task: dict, user) -> bool:
     if not task:
         return False
 
-    # 管理员可以查看、取消、删除所有用户的任务
-    if is_admin_user(user):
-        return True
-
     owner = str(task.get("owner_username") or "")
     username = get_username_from_user(user)
 
@@ -2778,15 +3599,7 @@ def require_own_task(task_id: str, user) -> dict:
 @app.get("/api/tasks")
 def api_list_tasks(authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
-
-    # 管理员查看全部任务
-    if is_admin_user(user):
-        return task_manager.list_tasks()
-
     username = get_username_from_user(user)
-    if not username:
-        raise HTTPException(status_code=401, detail="未登录")
-
     return task_manager.list_tasks(owner_username=username)
 
 
@@ -3080,12 +3893,7 @@ def api_list_data_files(authorization: str | None = Header(default=None)):
     if not username:
         raise HTTPException(status_code=401, detail="未登录")
 
-    include_all = is_admin_user(user)
-
-    _, visible_items = load_visible_data_files_for_user(
-        username,
-        include_all=include_all,
-    )
+    _, visible_items = load_visible_data_files_for_user(username)
 
     for item in visible_items:
         item.pop("_source_index", None)
@@ -3100,11 +3908,7 @@ def api_reveal_data_file(file_id: int, authorization: str | None = Header(defaul
     if not username:
         raise HTTPException(status_code=401, detail="未登录")
 
-    _, _, item = get_user_data_file_by_visible_id(
-        file_id,
-        username,
-        include_all=is_admin_user(user),
-    )
+    _, _, item = get_user_data_file_by_visible_id(file_id, username)
 
     path = Path(str(item.get("path") or ""))
     if not path.exists():
@@ -3131,11 +3935,7 @@ def api_delete_data_file(file_id: int, authorization: str | None = Header(defaul
     if not username:
         raise HTTPException(status_code=401, detail="未登录")
 
-    items, source_index, item = get_user_data_file_by_visible_id(
-        file_id,
-        username,
-        include_all=is_admin_user(user),
-    )
+    items, source_index, item = get_user_data_file_by_visible_id(file_id, username)
 
     path = Path(str(item.get("path") or ""))
 
@@ -3161,11 +3961,7 @@ def api_preview_data_file(file_id: int, authorization: str | None = Header(defau
     if not username:
         raise HTTPException(status_code=401, detail="未登录")
 
-    _, _, item = get_user_data_file_by_visible_id(
-        file_id,
-        username,
-        include_all=is_admin_user(user),
-    )
+    _, _, item = get_user_data_file_by_visible_id(file_id, username)
 
     path = Path(str(item.get("path") or ""))
 
@@ -3294,3 +4090,4 @@ if FRONTEND_DIST_DIR.exists():
         if index_file.exists():
             return FileResponse(str(index_file))
         raise HTTPException(status_code=404, detail="前端未构建")
+

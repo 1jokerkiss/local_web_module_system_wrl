@@ -22,8 +22,11 @@ import {
   runModule,
   saveModule,
   deleteModule as deleteModuleApi,
-  uploadModuleZip,
-  uploadPythonModule,
+    uploadModuleFolder,
+  uploadPythonFolderModule,
+  parseModuleParamJson,
+  parsePythonModuleConfig,
+  uploadPythonModuleConfig,
   listDropZips,
   installLocalDropModules,
   getTask,
@@ -1286,6 +1289,7 @@ const TASK_TRAY_RESERVED_BOTTOM = 150;
 export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [authMode, setAuthMode] = useState('login');
+  const [moduleFolderPath, setModuleFolderPath] = useState('');
   const [loginType, setLoginType] = useState('user');
   const [activeCloudId, setActiveCloudId] = useState('');
   const [activeAerosolId, setActiveAerosolId] = useState('');
@@ -1324,18 +1328,18 @@ export default function App() {
   const [editingModuleId, setEditingModuleId] = useState('');
   const [inputEditorOpen, setInputEditorOpen] = useState(false);
   const [inputEditorFields, setInputEditorFields] = useState([]);
-  const [zipFile, setZipFile] = useState(null);
   const [uploadToolType, setUploadToolType] = useState('');
   const [dropInfo, setDropInfo] = useState({ drop_dir: '', items: [] });
   const [uploadMsg, setUploadMsg] = useState('');
   const [moduleMgmtAction, setModuleMgmtAction] = useState('module_upload');
-  const [pythonUploadOpen, setPythonUploadOpen] = useState(false);
-
-
-  const [pythonZipFile, setPythonZipFile] = useState(null);
+  const [pythonSourceDir, setPythonSourceDir] = useState('');
+  const [pythonParamJsonPath, setPythonParamJsonPath] = useState('');
   const [pythonModuleId, setPythonModuleId] = useState('');
   const [pythonModuleName, setPythonModuleName] = useState('');
   const [pythonEntryFile, setPythonEntryFile] = useState('main.py');
+  const [pythonModuleConfigPath, setPythonModuleConfigPath] = useState('');
+  const [pythonModuleConfigPreview, setPythonModuleConfigPreview] = useState(null);
+  const [pythonParamInputs, setPythonParamInputs] = useState([]);
   const [pythonUploadMsg, setPythonUploadMsg] = useState('');
   const [newToolbarForm, setNewToolbarForm] = useState({ key: '', label: '' });
   const [editingToolbarKey, setEditingToolbarKey] = useState('');
@@ -1680,6 +1684,70 @@ async function handleRegister() {
       alert(e?.message || '获取安全问题失败');
     }
   }
+  async function browseModuleFolder() {
+  try {
+    const result = await chooseLocalDir({
+      title: '选择模块文件夹',
+    });
+
+    if (result?.path) {
+      setModuleFolderPath(result.path);
+    }
+  } catch (e) {
+    setUploadMsg(e?.message || '选择模块文件夹失败');
+  }
+}
+async function browsePythonModuleConfigJson() {
+  try {
+    const result = await chooseLocalFile({
+      title: '选择 Python 模块配置 JSON',
+      filetypes: [['JSON 文件', '*.json'], ['All Files', '*.*']],
+    });
+
+    if (!result?.path) return;
+
+    setPythonModuleConfigPath(result.path);
+    setPythonUploadMsg('正在解析 Python 模块配置 JSON...');
+
+    const data = await parsePythonModuleConfig(result.path);
+
+    setPythonModuleConfigPreview(data?.module || null);
+    setPythonParamInputs(Array.isArray(data?.inputs) ? data.inputs : []);
+    setPythonUploadMsg(`已识别 ${Array.isArray(data?.inputs) ? data.inputs.length : 0} 个参数`);
+  } catch (e) {
+    setPythonModuleConfigPath('');
+    setPythonModuleConfigPreview(null);
+    setPythonParamInputs([]);
+    setPythonUploadMsg(e?.message || '解析 Python 模块配置 JSON 失败');
+  }
+}
+async function installModuleFolder() {
+  if (!moduleFolderPath.trim()) {
+    setUploadMsg('请选择模块文件夹');
+    return;
+  }
+
+  if (!uploadToolType) {
+    alert('请先选择模块所属工具栏');
+    return;
+  }
+
+  setUploadMsg('正在安装模块文件夹...');
+
+  try {
+    await uploadModuleFolder({
+      folder_path: moduleFolderPath.trim(),
+      tool_type: uploadToolType,
+    });
+
+    setModuleFolderPath('');
+    setUploadMsg('模块文件夹安装成功');
+
+    await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
+  } catch (e) {
+    setUploadMsg(e?.message || '模块文件夹安装失败');
+  }
+}
 
   async function handleForgotReset() {
     try {
@@ -1962,70 +2030,6 @@ function addTaskWindow(task, title) {
     }
   }
 
-  async function uploadZip() {
-    if (!zipFile) {
-      setUploadMsg('未选择 zip 文件；如果已放入本地投放目录，请点“扫描本地目录安装”。');
-      return;
-    }
-    if (!uploadToolType) {
-      alert('请先添加或选择一个工具栏');
-      return;
-    }
-    setUploadMsg('上传中...');
-    try {
-      await uploadModuleZip(zipFile, uploadToolType);
-      setZipFile(null);
-      setUploadMsg('上传并安装成功');
-      await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
-    } catch (e) {
-      setUploadMsg(e?.message || '上传失败');
-    }
-  }
-  async function uploadPythonZip() {
-  if (!pythonZipFile) {
-    setPythonUploadMsg('请选择 Python 源码 zip 包');
-    return;
-  }
-
-  if (!uploadToolType) {
-    alert('请先选择模块所属工具栏');
-    return;
-  }
-
-  if (!pythonModuleId.trim()) {
-    alert('请输入模块 ID');
-    return;
-  }
-
-  if (!pythonModuleName.trim()) {
-    alert('请输入模块名称');
-    return;
-  }
-
-  setPythonUploadMsg('正在上传并自动打包 Python 源码，请稍等...');
-
-  try {
-    await uploadPythonModule(pythonZipFile, {
-      module_id: pythonModuleId.trim(),
-      module_name: pythonModuleName.trim(),
-      entry_file: pythonEntryFile.trim() || 'main.py',
-      tool_type: uploadToolType,
-    });
-
-    setPythonZipFile(null);
-    setPythonModuleId('');
-    setPythonModuleName('');
-    setPythonEntryFile('main.py');
-    setPythonUploadMsg('');
-
-    await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
-
-    setPythonUploadOpen(false);
-    alert('Python 源码打包并安装成功');
-  } catch (e) {
-    setPythonUploadMsg(e?.message || 'Python 源码上传或打包失败');
-  }
-}
 function renderModuleMgmtButton(key, title, desc, onClick) {
   const active = moduleMgmtAction === key;
 
@@ -2077,7 +2081,29 @@ function renderModuleMgmtButton(key, title, desc, onClick) {
       setUploadMsg(e?.message || '本地目录安装失败');
     }
   }
+async function uploadPythonConfigJson() {
+  if (!pythonModuleConfigPath.trim()) {
+    setPythonUploadMsg('请选择 Python 模块配置 JSON');
+    return;
+  }
 
+  setPythonUploadMsg('正在读取配置 JSON、创建独立 Python 环境并安装模块，请稍等...');
+
+  try {
+    await uploadPythonModuleConfig(pythonModuleConfigPath.trim());
+
+    setPythonModuleConfigPath('');
+    setPythonModuleConfigPreview(null);
+    setPythonParamInputs([]);
+    setPythonUploadMsg('');
+
+    await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
+
+    alert('Python 模块已根据配置 JSON 安装成功');
+  } catch (e) {
+    setPythonUploadMsg(e?.message || 'Python 模块配置 JSON 安装失败');
+  }
+}
   async function handleAddToolbar() {
     try {
       const label = newToolbarForm.label.trim();
@@ -3082,17 +3108,15 @@ function renderTaskManagementPage() {
                 <div style={{ display: 'grid', gap: 12 }}>
                   {renderModuleMgmtButton(
                     'python_upload',
-                    'Python 源代码打包上传',
-                    '上传 Python 源码 zip 包，系统自动打包为 exe 并注册为模块。',
-                    () => setPythonUploadOpen(true)
+                    'Python 源代码环境上传',
+                    '选择 Python 源码文件夹和参数 JSON，系统自动创建独立环境并注册模块。'
                   )}
 
                   {renderModuleMgmtButton(
                     'module_upload',
                     '模块上传/投放',
-                    '上传已有 exe 模块 zip，或扫描本地 module_drop 目录安装。'
+                    '选择包含 module.json 的模块文件夹，直接安装到系统中。'
                   )}
-
                   {renderModuleMgmtButton(
                     'installed_modules',
                     '已安装模块',
@@ -3109,84 +3133,200 @@ function renderTaskManagementPage() {
 
               <div style={{ display: 'grid', gap: 16, minWidth: 0 }}>
                 {moduleMgmtAction === 'python_upload' && (
-                  <div style={{ ...styles.card, padding: 18 }}>
-                    <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 10 }}>
-                      Python 源代码打包上传
+                  <div style={{ ...styles.card, padding: 22 }}>
+                    <div style={{ fontSize: 24, fontWeight: 900, color: '#12385f', marginBottom: 10 }}>
+                      Python 模块配置 JSON 上传
                     </div>
-                    <div style={{ color: '#6a7f96', lineHeight: 1.8, marginBottom: 14 }}>
-                      点击下方按钮打开上传弹窗，填写模块 ID、模块名称、入口文件并选择 Python 源码 zip。
+
+                    <div style={{ color: '#6a7f96', lineHeight: 1.8, marginBottom: 18 }}>
+                      选择一个 Python 模块配置 JSON。系统会从该 JSON 中读取模块 ID、模块名称、
+                      所属工具栏、入口文件、源码文件夹和参数 JSON，然后自动识别参数并创建独立 Python 环境。
                     </div>
-                    <button style={styles.blueBtn} onClick={() => setPythonUploadOpen(true)}>
-                      打开上传弹窗
-                    </button>
+
+                    <div style={{ display: 'grid', gap: 16, maxWidth: 960 }}>
+                      <div>
+                        <div style={labelStyle}>Python 模块配置 JSON</div>
+                        <div style={{ display: 'flex', gap: 10 }}>
+                          <input
+                            style={{ ...styles.input, flex: 1 }}
+                            value={pythonModuleConfigPath}
+                            readOnly
+                            placeholder="请选择 python_module.json"
+                          />
+                          <button style={styles.whiteBtn} onClick={browsePythonModuleConfigJson}>
+                            浏览并识别
+                          </button>
+                        </div>
+                      </div>
+
+                      {pythonModuleConfigPreview && (
+                        <div
+                          style={{
+                            border: '1px solid #d7e3f0',
+                            borderRadius: 12,
+                            background: '#fff',
+                            padding: 12,
+                            color: '#37536f',
+                            lineHeight: 1.8,
+                          }}
+                        >
+                          <div style={{ fontWeight: 900, color: '#12385f', marginBottom: 8 }}>
+                            模块配置预览
+                          </div>
+                          <div>模块 ID：{pythonModuleConfigPreview.module_id}</div>
+                          <div>模块名称：{pythonModuleConfigPreview.module_name}</div>
+                          <div>所属工具栏：{pythonModuleConfigPreview.tool_type}</div>
+                          <div>入口文件：{pythonModuleConfigPreview.entry_file}</div>
+                          <div style={{ wordBreak: 'break-all' }}>源码文件夹：{pythonModuleConfigPreview.source_dir}</div>
+                          <div style={{ wordBreak: 'break-all' }}>参数 JSON：{pythonModuleConfigPreview.param_json_path || '已内嵌 param_template'}</div>
+                        </div>
+                      )}
+
+                      {pythonParamInputs.length > 0 && (
+                        <div
+                          style={{
+                            border: '1px solid #d7e3f0',
+                            borderRadius: 12,
+                            background: '#fff',
+                            padding: 12,
+                          }}
+                        >
+                          <div style={{ fontWeight: 900, color: '#12385f', marginBottom: 8 }}>
+                            已识别参数：{pythonParamInputs.length} 个
+                          </div>
+
+                          <div style={{ display: 'grid', gap: 6 }}>
+                            {pythonParamInputs.map((item) => (
+                              <div
+                                key={item.key}
+                                style={{
+                                  display: 'grid',
+                                  gridTemplateColumns: '1fr 120px 1.5fr',
+                                  gap: 10,
+                                  fontSize: 13,
+                                  color: '#37536f',
+                                  borderTop: '1px solid #edf2f7',
+                                  paddingTop: 6,
+                                }}
+                              >
+                                <div>{item.label || item.key}</div>
+                                <div>{item.type}</div>
+                                <div style={{ wordBreak: 'break-all' }}>{String(item.default ?? '')}</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                        <button style={styles.blueBtn} onClick={uploadPythonConfigJson}>
+                          根据配置 JSON 安装模块
+                        </button>
+
+                        <button
+                          style={styles.whiteBtn}
+                          onClick={() => {
+                            setPythonModuleConfigPath('');
+                            setPythonModuleConfigPreview(null);
+                            setPythonParamInputs([]);
+                            setPythonUploadMsg('');
+                          }}
+                        >
+                          清空
+                        </button>
+                      </div>
+
+                      {pythonUploadMsg && (
+                        <div
+                          style={{
+                            whiteSpace: 'pre-wrap',
+                            color:
+                              pythonUploadMsg.includes('失败') ||
+                              pythonUploadMsg.includes('错误')
+                                ? '#bb2c2c'
+                                : '#4f6682',
+                            lineHeight: 1.7,
+                          }}
+                        >
+                          {pythonUploadMsg}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 )}
 
                 {moduleMgmtAction === 'module_upload' && (
-                  <div style={{ ...styles.card, padding: 18 }}>
-                    <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
-                      模块上传 / 本地投放
-                    </div>
-
-                    <div style={{ display: 'grid', gap: 12 }}>
-                      <div>
-                        <div style={labelStyle}>模块所属工具栏</div>
-                        <select
-                          value={uploadToolType}
-                          onChange={(e) => setUploadToolType(e.target.value)}
-                          style={styles.input}
-                        >
-                          {renderToolbarOptions()}
-                        </select>
+                    <div style={{ ...styles.card, padding: 18 }}>
+                      <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
+                        模块文件夹安装
                       </div>
 
-                      <div>
-                        <div style={labelStyle}>可选：上传模块 zip</div>
-                        <input
-                          style={styles.input}
-                          type="file"
-                          accept=".zip"
-                          onChange={(e) => setZipFile(e.target.files?.[0] || null)}
-                        />
+                      <div style={{ color: '#6a7f96', lineHeight: 1.8, marginBottom: 14 }}>
+                        请选择一个已经准备好的模块文件夹。该文件夹内需要包含 module.json，
+                        并且 module.json 中配置 executable、working_dir、inputs 等信息。
                       </div>
 
-                      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                        <button style={styles.blueBtn} onClick={uploadZip}>上传并安装</button>
-                        <button style={styles.blueBtn} onClick={() => installFromDrop()}>扫描本地目录安装</button>
-                        <button style={styles.whiteBtn} onClick={refreshDropZipList}>刷新目录</button>
-                        <button style={styles.whiteBtn} onClick={() => setShowDropHint(true)}>本地模块目录说明</button>
-                      </div>
-
-                      {uploadMsg && <div style={{ color: '#4f6682' }}>{uploadMsg}</div>}
-
-                      {dropInfo.drop_dir && (
-                        <div style={{ color: '#6a7f96', fontSize: 13, wordBreak: 'break-all' }}>
-                          本地投放目录：{dropInfo.drop_dir}
+                      <div style={{ display: 'grid', gap: 12 }}>
+                        <div>
+                          <div style={labelStyle}>模块所属工具栏</div>
+                          <select
+                            value={uploadToolType}
+                            onChange={(e) => setUploadToolType(e.target.value)}
+                            style={styles.input}
+                          >
+                            {renderToolbarOptions()}
+                          </select>
                         </div>
-                      )}
 
-                      {dropInfo.items?.length > 0 && (
-                        <div style={{ display: 'grid', gap: 8 }}>
-                          <div style={{ fontWeight: 800, color: '#12385f' }}>目录中待安装 zip</div>
-                          {dropInfo.items.map((item) => (
-                            <div
-                              key={item.path}
-                              style={{ border: '1px solid #e1eaf3', background: '#fff', borderRadius: 10, padding: 10 }}
-                            >
-                              <div style={{ fontWeight: 700, wordBreak: 'break-all' }}>{item.name}</div>
-                              <button
-                                style={{ ...styles.whiteBtn, marginTop: 8 }}
-                                onClick={() => installFromDrop(item.name)}
-                              >
-                                安装这个 zip
-                              </button>
-                            </div>
-                          ))}
+                        <div>
+                          <div style={labelStyle}>模块文件夹</div>
+                          <div style={{ display: 'flex', gap: 10 }}>
+                            <input
+                              style={{ ...styles.input, flex: 1 }}
+                              value={moduleFolderPath}
+                              onChange={(e) => setModuleFolderPath(e.target.value)}
+                              placeholder="请选择或粘贴包含 module.json 的模块文件夹路径"
+                            />
+                            <button style={styles.whiteBtn} onClick={browseModuleFolder}>
+                              浏览
+                            </button>
+                          </div>
                         </div>
-                      )}
+
+                        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                          <button style={styles.blueBtn} onClick={installModuleFolder}>
+                            安装模块文件夹
+                          </button>
+
+                          <button
+                            style={styles.whiteBtn}
+                            onClick={() => {
+                              setModuleFolderPath('');
+                              setUploadMsg('');
+                            }}
+                          >
+                            清空
+                          </button>
+
+                          <button style={styles.whiteBtn} onClick={refreshDropZipList}>
+                            刷新目录
+                          </button>
+
+                          <button style={styles.whiteBtn} onClick={() => setShowDropHint(true)}>
+                            本地模块目录说明
+                          </button>
+                        </div>
+
+                        {uploadMsg && <div style={{ color: '#4f6682' }}>{uploadMsg}</div>}
+
+                        {dropInfo.drop_dir && (
+                          <div style={{ color: '#6a7f96', fontSize: 13, wordBreak: 'break-all' }}>
+                            本地投放目录：{dropInfo.drop_dir}
+                          </div>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                )}
+                  )}
 
                 {moduleMgmtAction === 'installed_modules' && (
                   <>
@@ -3365,110 +3505,6 @@ function renderTaskManagementPage() {
           </TaskTrayFloatingWindow>
         )}
 
-{pythonUploadOpen && (
-  <SimpleOverlay
-    title="Python 源代码打包上传"
-    onClose={() => {
-      setPythonUploadOpen(false);
-      setPythonUploadMsg('');
-    }}
-    width="min(760px, 96vw)"
-  >
-    <div style={{ display: 'grid', gap: 14 }}>
-      <div style={{ color: '#6a7f96', lineHeight: 1.8 }}>
-        上传 Python 源码 zip 包，后端会使用 PyInstaller 自动打包为 exe，
-        并注册为系统可运行模块。zip 包内建议包含 main.py、requirements.txt 和 module.json。
-      </div>
-
-      <div>
-        <div style={labelStyle}>模块所属工具栏</div>
-        <select
-          value={uploadToolType}
-          onChange={(e) => setUploadToolType(e.target.value)}
-          style={styles.input}
-        >
-          {renderToolbarOptions()}
-        </select>
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-        <div>
-          <div style={labelStyle}>模块 ID</div>
-          <input
-            style={styles.input}
-            value={pythonModuleId}
-            onChange={(e) => setPythonModuleId(e.target.value)}
-            placeholder="例如：python_cloud_demo"
-          />
-        </div>
-
-        <div>
-          <div style={labelStyle}>模块名称</div>
-          <input
-            style={styles.input}
-            value={pythonModuleName}
-            onChange={(e) => setPythonModuleName(e.target.value)}
-            placeholder="例如：Python 云检测模块"
-          />
-        </div>
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-        <div>
-          <div style={labelStyle}>入口文件</div>
-          <input
-            style={styles.input}
-            value={pythonEntryFile}
-            onChange={(e) => setPythonEntryFile(e.target.value)}
-            placeholder="main.py"
-          />
-        </div>
-
-        <div>
-          <div style={labelStyle}>Python 源码 zip</div>
-          <input
-            style={styles.input}
-            type="file"
-            accept=".zip"
-            onChange={(e) => setPythonZipFile(e.target.files?.[0] || null)}
-          />
-        </div>
-      </div>
-
-      {pythonUploadMsg && (
-        <div
-          style={{
-            whiteSpace: 'pre-wrap',
-            color:
-              pythonUploadMsg.includes('失败') ||
-              pythonUploadMsg.includes('错误')
-                ? '#bb2c2c'
-                : '#4f6682',
-            lineHeight: 1.7,
-          }}
-        >
-          {pythonUploadMsg}
-        </div>
-      )}
-
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 8 }}>
-        <button
-          style={styles.whiteBtn}
-          onClick={() => {
-            setPythonUploadOpen(false);
-            setPythonUploadMsg('');
-          }}
-        >
-          取消
-        </button>
-
-        <button style={styles.blueBtn} onClick={uploadPythonZip}>
-          上传并自动打包
-        </button>
-      </div>
-    </div>
-  </SimpleOverlay>
-)}
 {inputEditorOpen && (
         <SimpleOverlay
           title="编辑输入文件"

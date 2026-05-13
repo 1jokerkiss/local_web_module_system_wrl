@@ -376,3 +376,48 @@ export async function uploadPythonModule(file, options) {
     body: fd,
   });
 }
+export async function parseModuleParamJson(path) {
+  return request('/api/admin/modules/parse-param-json', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  });
+}
+
+export async function uploadPythonFolderModule(options) {
+  return request('/api/admin/modules/upload-python-folder', {
+    method: 'POST',
+    body: JSON.stringify({
+      source_dir: options.source_dir || '',
+      param_json_path: options.param_json_path || '',
+      module_id: options.module_id || '',
+      module_name: options.module_name || '',
+      entry_file: options.entry_file || 'main.py',
+      tool_type: options.tool_type || '',
+      description: options.description || '',
+    }),
+  });
+}
+
+export async function uploadModuleFolder(payload) {
+  return request('/api/admin/modules/install-folder', {
+    method: 'POST',
+    body: JSON.stringify({
+      folder_path: payload.folder_path || '',
+      tool_type: payload.tool_type || '',
+    }),
+  });
+}
+
+export async function parsePythonModuleConfig(path) {
+  return request('/api/admin/modules/parse-python-module-config', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  });
+}
+
+export async function uploadPythonModuleConfig(path) {
+  return request('/api/admin/modules/upload-python-config', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  });
+}
