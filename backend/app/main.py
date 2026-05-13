@@ -2228,11 +2228,41 @@ def split_requirements_for_local_binary(requirements_path: Path) -> tuple[list[s
             normal_lines.append(raw)
 
     return strict_specs, remote_specs, normal_lines
+PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+PIP_TRUSTED_HOST = "pypi.tuna.tsinghua.edu.cn"
 
+
+def build_clean_pip_env() -> dict[str, str]:
+    """
+    pip 安装依赖时使用的干净环境：
+    1. 清掉错误代理；
+    2. 忽略 pip 全局配置；
+    3. 走清华 PyPI 镜像；
+    4. 避免 pip 版本检查干扰日志。
+    """
+    env = os.environ.copy()
+
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ]:
+        env.pop(key, None)
+
+    env["NO_PROXY"] = "*"
+    env["no_proxy"] = "*"
+    env["PIP_CONFIG_FILE"] = os.devnull
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+
+    return env
 def run_checked_command(
     cmd: list[str],
     cwd: Path | None = None,
     title: str = "执行命令",
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     result = subprocess.run(
         cmd,
@@ -2241,6 +2271,7 @@ def run_checked_command(
         text=True,
         encoding="utf-8",
         errors="ignore",
+        env=env,
     )
 
     if result.returncode != 0:
@@ -2274,13 +2305,19 @@ def install_requirements_with_local_wheels(
                 "-m",
                 "pip",
                 "install",
+                "--no-cache-dir",
                 "--only-binary",
                 ":all:",
                 "--prefer-binary",
+                "--index-url",
+                PIP_INDEX_URL,
+                "--trusted-host",
+                PIP_TRUSTED_HOST,
                 spec,
             ],
             cwd=work_dir,
             title=f"远程安装二进制依赖 {spec}",
+            env=build_clean_pip_env(),
         )
 
     # GDAL / rasterio / pyproj / cartopy：仍然强制从本地 wheel 安装，避免源码编译失败。
@@ -2315,12 +2352,18 @@ def install_requirements_with_local_wheels(
                 "-m",
                 "pip",
                 "install",
+                "--no-cache-dir",
                 "--prefer-binary",
+                "--index-url",
+                PIP_INDEX_URL,
+                "--trusted-host",
+                PIP_TRUSTED_HOST,
                 "-r",
                 str(normal_req_path),
             ],
             cwd=work_dir,
             title="安装普通 Python 依赖",
+            env=build_clean_pip_env(),
         )
 
 def create_python_module_env(
@@ -2395,12 +2438,17 @@ def create_python_module_env(
             "install",
             "--upgrade",
             "--force-reinstall",
+            "--index-url",
+            PIP_INDEX_URL,
+            "--trusted-host",
+            PIP_TRUSTED_HOST,
             "pip",
             "setuptools",
             "wheel",
         ],
         cwd=source_dir,
         title="升级 pip/setuptools/wheel",
+        env=build_clean_pip_env(),
     )
 
     requirements_path = source_dir / "requirements.txt"
