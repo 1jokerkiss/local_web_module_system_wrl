@@ -19,6 +19,7 @@ import {
   updateToolbar,
   deleteToolbar,
   getTasks,
+  getSystemResources,
   runModule,
   saveModule,
   deleteModule as deleteModuleApi,
@@ -249,10 +250,74 @@ function isParallelWorkerField(field) {
   );
 }
 
-function clampParallelWorkersValue(value) {
+function clampParallelWorkersValue(value, maxWorkers = 64) {
+  const max = Math.max(1, Number.parseInt(String(maxWorkers || 64), 10) || 64);
   const n = Number.parseInt(String(value ?? '1').trim(), 10);
   if (!Number.isFinite(n)) return 1;
-  return Math.max(1, Math.min(n, 64));
+  return Math.max(1, Math.min(n, max));
+}
+
+function getConservativeSuggestedWorkers(cpuCount) {
+  const cpu = Math.max(1, Number.parseInt(String(cpuCount || 1), 10) || 1);
+  return Math.max(1, Math.min(8, Math.ceil(cpu / 3)));
+}
+
+function getConservativeMaxWorkers(cpuCount, suggestedWorkers) {
+  const cpu = Math.max(1, Number.parseInt(String(cpuCount || 1), 10) || 1);
+  const suggested = Math.max(1, Number.parseInt(String(suggestedWorkers || getConservativeSuggestedWorkers(cpu)), 10) || 1);
+  return Math.max(suggested, Math.min(12, Math.max(1, Math.floor(cpu / 2))));
+}
+
+const defaultSystemResources = {
+  cpu_count: 1,
+  suggested_workers: 1,
+  max_workers: 1,
+  running_workers: 0,
+  available_workers: 1,
+  active_task_count: 0,
+  queued_task_count: 0,
+  cpu_percent: null,
+  running_process_cpu_percent: null,
+  cpu_busy_threshold: 85,
+  active_tasks: [],
+};
+
+function normalizeSystemResources(data) {
+  const cpuCount = Math.max(1, Number.parseInt(String(data?.cpu_count || 1), 10) || 1);
+  const fallbackSuggested = getConservativeSuggestedWorkers(cpuCount);
+  const fallbackMax = getConservativeMaxWorkers(cpuCount, fallbackSuggested);
+  const maxWorkers = Math.max(1, Number.parseInt(String(data?.max_workers || fallbackMax), 10) || fallbackMax);
+  const suggestedWorkers = Math.max(1, Math.min(
+    maxWorkers,
+    Number.parseInt(String(data?.suggested_workers || fallbackSuggested), 10) || fallbackSuggested
+  ));
+
+  return {
+    ...defaultSystemResources,
+    ...(data || {}),
+    cpu_count: cpuCount,
+    max_workers: maxWorkers,
+    suggested_workers: suggestedWorkers,
+    running_workers: Math.max(0, Number.parseInt(String(data?.running_workers || 0), 10) || 0),
+    available_workers: Math.max(0, Number.parseInt(String(data?.available_workers ?? Math.max(0, maxWorkers)), 10) || 0),
+    active_task_count: Math.max(0, Number.parseInt(String(data?.active_task_count || 0), 10) || 0),
+    queued_task_count: Math.max(0, Number.parseInt(String(data?.queued_task_count || 0), 10) || 0),
+    active_tasks: Array.isArray(data?.active_tasks) ? data.active_tasks : [],
+  };
+}
+
+function getParallelWorkerOptions(systemResources) {
+  const info = normalizeSystemResources(systemResources);
+  return Array.from({ length: info.max_workers }, (_, idx) => {
+    const value = idx + 1;
+    const marks = [];
+    if (value === info.suggested_workers) marks.push('建议');
+    if (value === info.max_workers) marks.push('上限');
+    return {
+      value,
+      label: marks.length ? `${value}（${marks.join('/')}）` : String(value),
+    };
+  });
 }
 
 function makeEmptyInputField() {
@@ -514,6 +579,9 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
           <div><strong>任务ID：</strong>{task?.id || '-'}</div>
           <div><strong>模块：</strong>{task?.module_name || '-'}</div>
           <div><strong>PID：</strong>{task?.pid || '-'}</div>
+          {task?.status === 'queued' && (
+            <div><strong>排队：</strong>{task?.queue_position ? `第 ${task.queue_position} 位` : '等待中'}{task?.queue_reason ? `，${task.queue_reason}` : ''}</div>
+          )}
         </div>
 
         <div style={{ marginTop: 12 }}>
@@ -1312,6 +1380,7 @@ export default function App() {
 
   const [modules, setModules] = useState([]);
   const [tasks, setTasks] = useState([]);
+  const [systemResources, setSystemResources] = useState(defaultSystemResources);
   const [users, setUsers] = useState([]);
   const [toolbars, setToolbars] = useState(DEFAULT_TOOLBARS);
   const [dataFiles, setDataFiles] = useState([]);
@@ -1404,17 +1473,19 @@ export default function App() {
         setCurrentUser(me);
         setActiveTab(getSavedActiveTab() || 'tool:cloud');
 
-        const [toolbarList, mods, taskList, dataList] = await Promise.all([
+        const [toolbarList, mods, taskList, dataList, resources] = await Promise.all([
           getToolbars(),
           me.role === 'admin' ? getAdminModules() : getModules(),
           getTasks(),
           listDataFiles(),
+          getSystemResources().catch(() => defaultSystemResources),
         ]);
 
         setDataFiles(Array.isArray(dataList) ? dataList : []);
         setToolbars(Array.isArray(toolbarList) ? toolbarList : DEFAULT_TOOLBARS);
         setModules(Array.isArray(mods) ? mods : []);
         setTasks(Array.isArray(taskList) ? taskList : []);
+        setSystemResources(normalizeSystemResources(resources));
 
         if (me.role === 'admin') {
           const [userList, drop] = await Promise.all([getUsers(), listDropZips().catch(() => null)]);
@@ -1432,14 +1503,14 @@ useEffect(() => {
   modules.forEach((m) => {
     setRuntimeForms((prev) => {
       if (prev[m.id]) return prev;
-      const init = { task_name: m.name, _parallel_workers: 1 };
+      const init = { task_name: m.name, _parallel_workers: systemResources.suggested_workers || 1 };
       (m.inputs || []).filter((f) => isFieldVisibleToUser(f) && !isParallelWorkerField(f)).forEach((f) => {
         init[f.key] = f.default ?? '';
       });
       return { ...prev, [m.id]: init };
     });
   });
-}, [modules]);
+}, [modules, systemResources.suggested_workers]);
 
 useEffect(() => {
   setActiveModuleByTool((prev) => {
@@ -1525,8 +1596,12 @@ useEffect(() => {
 
     pollTimerRef.current = setInterval(async () => {
       try {
-        const latestTasks = await getTasks();
+        const [latestTasks, resources] = await Promise.all([
+          getTasks(),
+          getSystemResources().catch(() => null),
+        ]);
         setTasks(Array.isArray(latestTasks) ? latestTasks : []);
+        if (resources) setSystemResources(normalizeSystemResources(resources));
         await refreshDataFiles();
 
         for (const w of windows) {
@@ -1608,17 +1683,19 @@ useEffect(() => {
       setActiveTab('tool:cloud');
       saveActiveTab('tool:cloud');
 
-      const [toolbarList, mods, taskList, dataList] = await Promise.all([
+      const [toolbarList, mods, taskList, dataList, resources] = await Promise.all([
         getToolbars(),
         data.user.role === 'admin' ? getAdminModules() : getModules(),
         getTasks(),
         listDataFiles(),
+        getSystemResources().catch(() => defaultSystemResources),
       ]);
 
       setToolbars(Array.isArray(toolbarList) ? toolbarList : DEFAULT_TOOLBARS);
       setModules(Array.isArray(mods) ? mods : []);
       setTasks(Array.isArray(taskList) ? taskList : []);
       setDataFiles(Array.isArray(dataList) ? dataList : []);
+      setSystemResources(normalizeSystemResources(resources));
 
       if (data.user.role === 'admin') {
         const [userList, drop] = await Promise.all([getUsers(), listDropZips().catch(() => null)]);
@@ -1805,8 +1882,12 @@ async function installModuleFolder() {
   }
 
   async function refreshTasks() {
-    const list = await getTasks();
+    const [list, resources] = await Promise.all([
+      getTasks(),
+      getSystemResources().catch(() => null),
+    ]);
     setTasks(Array.isArray(list) ? list : []);
+    if (resources) setSystemResources(normalizeSystemResources(resources));
   }
   async function refreshDataFiles() {
     const list = await listDataFiles();
@@ -1968,7 +2049,7 @@ function addTaskWindow(task, title) {
       const form = runtimeForms[module.id] || {};
       const inputs = { ...form };
       const title = form.task_name || module.name;
-      const parallelWorkers = clampParallelWorkersValue(form._parallel_workers);
+      const parallelWorkers = clampParallelWorkersValue(form._parallel_workers, systemResources.max_workers);
       delete inputs.task_name;
       delete inputs._parallel_workers;
 
@@ -2313,7 +2394,16 @@ async function uploadPythonConfigJson() {
       return <div style={{ padding: 20 }}>当前没有匹配到可运行模块</div>;
     }
 
-    const form = runtimeForms[module.id] || { task_name: module.name };
+    const form = runtimeForms[module.id] || {
+      task_name: module.name,
+      _parallel_workers: systemResources.suggested_workers || 1,
+    };
+    const resourceInfo = normalizeSystemResources(systemResources);
+    const parallelWorkerOptions = getParallelWorkerOptions(resourceInfo);
+    const selectedParallelWorkers = clampParallelWorkersValue(
+      form._parallel_workers || resourceInfo.suggested_workers || 1,
+      resourceInfo.max_workers
+    );
 
     return (
       <>
@@ -2344,35 +2434,43 @@ async function uploadPythonConfigJson() {
             <div style={{ fontWeight: 800, color: '#173353', marginBottom: 8 }}>
               并行进程数
             </div>
-            <input
-              type="number"
-              min="1"
-              max="64"
-              step="1"
-              value={form._parallel_workers || 1}
+            <select
+              value={selectedParallelWorkers}
               onChange={(e) =>
                 setRuntimeForms((prev) => ({
                   ...prev,
                   [module.id]: {
                     ...prev[module.id],
-                    _parallel_workers: e.target.value,
-                  },
-                }))
-              }
-              onBlur={(e) =>
-                setRuntimeForms((prev) => ({
-                  ...prev,
-                  [module.id]: {
-                    ...prev[module.id],
-                    _parallel_workers: clampParallelWorkersValue(e.target.value),
+                    _parallel_workers: clampParallelWorkersValue(e.target.value, resourceInfo.max_workers),
                   },
                 }))
               }
               style={styles.input}
-              placeholder="例如 2"
-            />
-            <div style={{ marginTop: 6, color: '#6a7f96', fontSize: 13, lineHeight: 1.6 }}>
-              单文件模块：输入字段可填文件夹，平台按文件拆成多个进程；文件夹遍历模块：平台把输入文件夹拆成多个临时子文件夹并行运行。
+            >
+              {parallelWorkerOptions.map((item) => (
+                <option key={item.value} value={item.value}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+
+            <div
+              style={{
+                marginTop: 10,
+                padding: 12,
+                borderRadius: 12,
+                background: 'rgba(45,124,246,0.06)',
+                border: '1px solid rgba(45,124,246,0.13)',
+                color: '#45627f',
+                fontSize: 13,
+                lineHeight: 1.7,
+              }}
+            >
+              <div>本机 CPU 核数：<strong>{resourceInfo.cpu_count}</strong>；建议进程数：<strong>{resourceInfo.suggested_workers}</strong>；上限进程数：<strong>{resourceInfo.max_workers}</strong></div>
+              <div style={{ marginTop: 4 }}>建议值按内存较重的模块保守计算：约 CPU 核数 1/3，最高 8；上限约 CPU 核数 1/2，最高 12。</div>
+              <div>当前已占用进程槽：<strong>{resourceInfo.running_workers}/{resourceInfo.max_workers}</strong>；等待队列：<strong>{resourceInfo.queued_task_count}</strong></div>
+              <div>系统 CPU 使用率：<strong>{resourceInfo.cpu_percent == null ? '-' : `${Number(resourceInfo.cpu_percent).toFixed(1)}%`}</strong>；模块进程 CPU：<strong>{resourceInfo.running_process_cpu_percent == null ? '-' : `${Number(resourceInfo.running_process_cpu_percent).toFixed(1)}%`}</strong></div>
+              <div style={{ marginTop: 4 }}>超过上限或 CPU 负载较高时，任务会自动进入排队状态；排队任务可在任务管理里取消。</div>
             </div>
           </label>
 
@@ -2968,7 +3066,15 @@ function renderTaskManagementPage() {
                     {task.module_name}
                   </td>
                   <td style={taskTdStyle}>{task.kind}</td>
-                  <td style={taskTdStyle}>{statusBadge(task.status)}</td>
+                  <td style={taskTdStyle}>
+                    {statusBadge(task.status)}
+                    {task.status === 'queued' && (task.queue_position || task.queue_reason) && (
+                      <div style={{ marginTop: 6, fontSize: 12, color: '#6b5aa8', lineHeight: 1.45 }}>
+                        {task.queue_position ? `排队第 ${task.queue_position} 位` : '排队中'}
+                        {task.queue_reason ? `：${task.queue_reason}` : ''}
+                      </div>
+                    )}
+                  </td>
                   <td style={taskTdStyle}>{task.started_at || '-'}</td>
                   <td style={taskTdStyle}>{task.ended_at || '-'}</td>
                   <td style={taskTdStyle}>

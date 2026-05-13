@@ -94,6 +94,13 @@ app.add_middleware(
 task_manager = TaskManager(TASKS_FILE)
 
 
+@app.get("/api/system/resources")
+def api_system_resources(authorization: str | None = Header(default=None)):
+    """返回本机 CPU 核数、建议进程数、上限进程数和当前任务资源占用。"""
+    get_current_user(authorization)
+    return task_manager.get_system_resource_info()
+
+
 # =========================
 # 数据模型
 # =========================
@@ -1152,7 +1159,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
     # 直接使用前端传来的用户选择路径；管理员固定输入在这里补齐。
     inputs = merge_admin_fixed_inputs(module, payload.inputs or {})
     inputs = coerce_json_marked_inputs(module, inputs)
-    parallel_workers = clamp_parallel_workers(payload.parallel_workers)
+    parallel_workers = clamp_parallel_workers(payload.parallel_workers, task_manager.max_process_slots)
 
     # 必填校验。
     for field in module.get("inputs", []) or []:
@@ -3005,12 +3012,18 @@ VALID_PARALLEL_MODES = {"none", "auto", "single_file", "folder_chunks", "module_
 DEFAULT_PARALLEL_PATTERNS = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
 
 
-def clamp_parallel_workers(value: int | str | None) -> int:
+def clamp_parallel_workers(value: int | str | None, max_workers: int | None = None) -> int:
     try:
         n = int(value or 1)
     except Exception:
         n = 1
-    return max(1, min(n, 64))
+
+    try:
+        limit = int(max_workers or task_manager.max_process_slots or os.cpu_count() or 1)
+    except Exception:
+        limit = 1
+    limit = max(1, limit)
+    return max(1, min(n, limit))
 
 
 def parse_parallel_patterns(pattern_text: str | None) -> list[str]:
