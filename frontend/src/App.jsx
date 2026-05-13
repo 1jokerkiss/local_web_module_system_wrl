@@ -2743,6 +2743,8 @@ function renderTaskTrayPanel() {
 
       {minimizedWindows.map((w) => {
         const terminal = isTerminalTaskStatus(w.task?.status);
+        const trayTaskId = w.task?.id || w.taskId || '';
+        const trayTitle = trayTaskId ? `${w.title} · ${trayTaskId}` : w.title;
         return (
           <div
             key={w.id}
@@ -2780,9 +2782,9 @@ function renderTaskTrayPanel() {
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
                 }}
-                title={w.title}
+                title={trayTaskId ? `${w.title}（任务ID：${trayTaskId}）` : w.title}
               >
-                {w.title}
+                {trayTitle}
               </div>
               <div style={{ color: '#6a7f96', marginTop: 4, fontSize: 12 }}>
                 {w.task?.status || '-'}
