@@ -1597,7 +1597,7 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
 
     # tqdm 默认会输出 unicode 进度条块字符，在 Windows 日志管道里容易乱码；
     # 让 tqdm 使用 ASCII 进度条，例如 ####，避免出现 ��。
-    runtime_env["TQDM_ASCII"] = "1"
+
 
     # 便于排查 DLL 搜索路径
     runtime_env["MODULE_DLL_DIRS"] = ";".join(ordered_dirs)
@@ -1656,7 +1656,7 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
             module_dir = run_source_dir
 
             if not command_template:
-                command_template = ["{executable}", "{entry_script}"]
+                command_template = ["{executable}", "{entry_script}", "{config_json}"]
 
         else:
             config_path = runtime_task_dir / "config.json"

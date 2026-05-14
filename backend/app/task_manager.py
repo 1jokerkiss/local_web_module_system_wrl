@@ -606,11 +606,11 @@ class TaskManager:
                 pass
 
     def _log_runtime_context(
-        self,
-        task_id: str,
-        command: List[str],
-        working_dir: str | None,
-        merged_env: Dict[str, str],
+            self,
+            task_id: str,
+            command: List[str],
+            working_dir: str | None,
+            merged_env: Dict[str, str],
     ):
         self.append_log(task_id, "[INFO] 准备启动模块")
         self.append_log(task_id, f"[INFO] cwd = {working_dir or os.getcwd()}")
@@ -635,17 +635,30 @@ class TaskManager:
             f"[INFO] GOTO_NUM_THREADS = {merged_env.get('GOTO_NUM_THREADS', '')}",
         )
 
-        if len(command) > 1:
-            cfg = Path(command[1])
-            self.append_log(task_id, f"[INFO] config/input = {cfg}")
-            if cfg.exists() and cfg.suffix.lower() == ".json":
-                try:
-                    content = cfg.read_text(encoding="utf-8")
-                    self.append_log(task_id, "[INFO] config.json 内容如下：")
-                    for line in content.splitlines():
-                        self.append_log(task_id, line)
-                except Exception as e:
-                    self.append_log(task_id, f"[WARN] 读取 config.json 失败: {repr(e)}")
+        config_arg = None
+
+        for item in reversed(command):
+            try:
+                p = Path(str(item))
+                if p.suffix.lower() == ".json":
+                    config_arg = p
+                    break
+            except Exception:
+                pass
+
+        if not config_arg:
+            return
+
+        self.append_log(task_id, f"[INFO] config/input = {config_arg}")
+
+        if config_arg.exists() and config_arg.suffix.lower() == ".json":
+            try:
+                content = config_arg.read_text(encoding="utf-8")
+                self.append_log(task_id, "[INFO] config.json 内容如下：")
+                for line in content.splitlines():
+                    self.append_log(task_id, line)
+            except Exception as e:
+                self.append_log(task_id, f"[WARN] 读取 config.json 失败: {repr(e)}")
 
     def _hint_from_return_code(self, return_code: int) -> Optional[str]:
         if return_code == 0:
@@ -662,12 +675,6 @@ class TaskManager:
 
     @staticmethod
     def decode_process_output(raw: bytes) -> str:
-        """
-        子进程日志解码：
-        1. Python 模块优先 UTF-8；
-        2. Windows C++/exe 模块可能是 GBK/CP936；
-        3. 最后兜底 replacement，避免接口崩溃。
-        """
         if raw is None:
             return ""
 
