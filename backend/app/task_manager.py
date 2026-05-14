@@ -512,24 +512,45 @@ class TaskManager:
             parallel_total=total,
             parallel_done=0,
             parallel_failed=0,
+            parallel_started=0,
+            parallel_running=0,
         )
         self.append_log(parent_id, f"[INFO] 批处理开始，共 {total} 个子任务")
         self.append_log(parent_id, f"[INFO] 最大并发数 = {max_parallel}")
 
         progress_lock = threading.Lock()
-        progress = {"done": 0, "failed": 0}
+        progress = {"done": 0, "failed": 0, "started": 0, "running": 0}
 
         def _worker(child_id: str, job: Dict[str, Any]):
             child_snapshot = self.get_task(child_id) or {}
             if parent_id in self.cancel_flags or child_snapshot.get("status") == "cancelled":
                 self.update_task(child_id, status="cancelled", ended_at=now_iso())
                 return child_id
-            self._run_process_task(
-                child_id,
-                job["command"],
-                job.get("working_dir"),
-                job.get("env"),
-            )
+
+            with progress_lock:
+                progress["started"] += 1
+                progress["running"] += 1
+                self.update_task(
+                    parent_id,
+                    parallel_started=progress["started"],
+                    parallel_running=progress["running"],
+                )
+                self.append_log(
+                    parent_id,
+                    f"[INFO] 当前已启动 {progress['started']}/{total} 个子任务，正在运行 {progress['running']} 个，子任务ID={child_id}",
+                )
+
+            try:
+                self._run_process_task(
+                    child_id,
+                    job["command"],
+                    job.get("working_dir"),
+                    job.get("env"),
+                )
+            finally:
+                with progress_lock:
+                    progress["running"] = max(0, progress["running"] - 1)
+                    self.update_task(parent_id, parallel_running=progress["running"])
             return child_id
 
         failures = 0
@@ -793,13 +814,15 @@ class TaskManager:
             parallel_total=total,
             parallel_done=0,
             parallel_failed=0,
+            parallel_started=0,
+            parallel_running=0,
         )
         self.append_log(parent_id, f"[PARALLEL] 并行任务启动，总任务数={total}，并行数={max_workers}")
 
         index_lock = threading.Lock()
         progress_lock = threading.Lock()
         next_index = {"value": 0}
-        progress = {"done": 0, "failed": 0}
+        progress = {"done": 0, "failed": 0, "started": 0, "running": 0}
 
         def next_job() -> tuple[int, Dict[str, Any]] | None:
             with index_lock:
@@ -840,28 +863,44 @@ class TaskManager:
                         parent.setdefault("children", []).append(child["id"])
                 self._save_tasks()
 
-                self.append_log(parent_id, f"[PARALLEL] Worker-{worker_no} 启动 {idx + 1}/{total}: {label}")
-                self._run_process_task(
-                    child["id"],
-                    spec.get("command") or [],
-                    spec.get("working_dir"),
-                    spec.get("env"),
-                )
-                child_task = self.get_task(child["id"]) or {}
-                child_status = child_task.get("status")
                 with progress_lock:
-                    progress["done"] += 1
-                    if child_status != "success":
-                        progress["failed"] += 1
+                    progress["started"] += 1
+                    progress["running"] += 1
                     self.update_task(
                         parent_id,
-                        parallel_done=progress["done"],
-                        parallel_failed=progress["failed"],
+                        parallel_started=progress["started"],
+                        parallel_running=progress["running"],
                     )
-                self.append_log(
-                    parent_id,
-                    f"[PARALLEL] 完成 {progress['done']}/{total}: {label}，状态={child_status}",
-                )
+                    self.append_log(
+                        parent_id,
+                        f"[PARALLEL] 当前已启动 {progress['started']}/{total} 个任务，正在运行 {progress['running']} 个；Worker-{worker_no} 启动 {idx + 1}/{total}: {label}，子任务ID={child['id']}",
+                    )
+
+                try:
+                    self._run_process_task(
+                        child["id"],
+                        spec.get("command") or [],
+                        spec.get("working_dir"),
+                        spec.get("env"),
+                    )
+                finally:
+                    child_task = self.get_task(child["id"]) or {}
+                    child_status = child_task.get("status")
+                    with progress_lock:
+                        progress["done"] += 1
+                        progress["running"] = max(0, progress["running"] - 1)
+                        if child_status != "success":
+                            progress["failed"] += 1
+                        self.update_task(
+                            parent_id,
+                            parallel_done=progress["done"],
+                            parallel_failed=progress["failed"],
+                            parallel_running=progress["running"],
+                        )
+                    self.append_log(
+                        parent_id,
+                        f"[PARALLEL] 完成 {progress['done']}/{total}: {label}，状态={child_status}，当前仍在运行 {progress['running']} 个",
+                    )
 
         thread_count = max(1, min(max_workers, total))
         workers = [

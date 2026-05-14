@@ -1200,7 +1200,6 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
             p.parent.mkdir(parents=True, exist_ok=True)
 
     # 旧系统进程池批处理：只要识别到批处理目录，就算进程数是 1，也先拆成具体文件 job。
-    # 适用于气溶胶这类“算法一次吃一个文件”的模块，依赖 inputs 里的 batch_role / match_mode。
     if _is_batch_request(module, inputs):
         jobs, output_paths = build_batch_jobs_for_module(module, inputs, parallel_workers)
         task = task_manager.submit_batch_group(
@@ -1218,37 +1217,44 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
                 owner_username=username,
             )
         return task
+        return task
 
-    # 通用文件夹拆分并行：适用于风云 / H8 云类型这类“算法接受文件夹，内部循环读取多个文件”的 Python 模块。
-    # 之前的问题就在这里：没有 batch_role 的 Python 文件夹模块不会进入上面的批处理分支，
-    # 只会启动 1 个 Python 进程，并把 parallel_workers 写进 config.json，所以看起来拿到了 6 个进程槽，
-    # 但实际只有一个 PID 在串行循环。这里把输入文件夹拆成多个 worker_xx 临时目录，
-    # 再启动多个模块进程，每个进程只处理自己目录里的那一份文件。
+    # 文件夹型模块的平台级并行：
+    # 有些 Python 模块本身只接收一个文件夹，然后在算法内部 for 循环逐个文件处理。
+    # 这种情况下，单纯把 parallel_workers 写进 config.json 不会自动产生多个进程，
+    # 需要平台先把输入文件夹拆成多个 worker_xx 子文件夹，再同时启动多个 Python 进程。
     if parallel_workers > 1:
-        parallel_jobs = prepare_parallel_jobs(module, inputs, parallel_workers)
-        if parallel_jobs:
-            task_inputs = dict(inputs)
-            task_inputs["parallel_workers"] = parallel_workers
-            task_inputs["_parallel_workers"] = parallel_workers
-            output_paths = collect_output_paths_from_inputs(module, inputs)
-            task = task_manager.submit_parallel_module_task(
-                module_id=module["id"],
-                module_name=f"{module.get('name', module['id'])} 文件夹并行",
-                jobs=parallel_jobs,
-                inputs=task_inputs,
-                max_workers=parallel_workers,
-                owner_username=username,
-            )
-            if output_paths:
-                start_data_file_scan_after_task(
-                    task["id"],
-                    module,
-                    output_paths,
+        parallel_mode = str(normalize_parallel_config(module).get("mode") or "auto").strip() or "auto"
+        if parallel_mode != "module_internal":
+            parallel_jobs = prepare_parallel_jobs(module, inputs, parallel_workers)
+            if len(parallel_jobs) > 1:
+                task_inputs = dict(inputs)
+                task_inputs["parallel_workers"] = parallel_workers
+                task_inputs["_parallel_workers"] = parallel_workers
+                task_inputs["_parallel_job_count"] = len(parallel_jobs)
+                task_inputs["_parallel_mode"] = parallel_mode
+
+                task = task_manager.submit_parallel_module_task(
+                    module_id=module["id"],
+                    module_name=module.get("name", module["id"]),
+                    jobs=parallel_jobs,
+                    inputs=task_inputs,
+                    max_workers=parallel_workers,
                     owner_username=username,
                 )
-            return task
+
+                output_paths = collect_output_paths_from_inputs(module, inputs)
+                if output_paths:
+                    start_data_file_scan_after_task(
+                        task["id"],
+                        module,
+                        output_paths,
+                        owner_username=username,
+                    )
+                return task
 
     # 非批处理模块：如果模块内部自己处理并行，则把并行数传给模块。
+    # 注意：这里只是把数值写入 config.json，并不会自动创建多个进程。
     if parallel_workers > 1:
         inputs = dict(inputs)
         inputs["parallel_workers"] = parallel_workers
@@ -3961,34 +3967,28 @@ def choose_parallel_input_key(module: dict, inputs: dict) -> str:
         return explicit
 
     input_fields = module.get("inputs", []) or []
-
-    # 优先从 inputs 配置里挑“输入路径”字段，避免把 outpath/output_dir 当成并行拆分目录。
     for field in input_fields:
         key = field.get("key")
-        if not key or key not in inputs or inputs.get(key) in ("", None):
+        if not key or key not in inputs:
             continue
-        if is_output_field(field):
+        if field.get("control_only") is True or is_output_field(field):
             continue
         if field.get("type") in {"file_path", "dir_path"}:
             return key
 
-    # 再按常见命名兜底，但仍然跳过显式输出字段。
-    output_keys = {
-        str(field.get("key") or "")
-        for field in input_fields
-        if field.get("key") and is_output_field(field)
-    }
-
-    preferred_words = ["input", "infile", "file", "inpath", "folder", "dir", "path"]
+    preferred_words = ["input", "infile", "file", "inpath", "folder", "dir", "path", "数据"]
+    output_like_words = ["out", "output", "result", "save", "输出", "结果", "保存"]
     for word in preferred_words:
         for key, value in inputs.items():
-            if key in output_keys:
+            key_text = str(key).lower()
+            if any(x in key_text for x in output_like_words):
                 continue
-            if word in str(key).lower() and value not in ("", None):
+            if word in key_text and value not in ("", None):
                 return key
 
     for key, value in inputs.items():
-        if key in output_keys:
+        key_text = str(key).lower()
+        if any(x in key_text for x in output_like_words):
             continue
         if value not in ("", None):
             return key
@@ -4172,13 +4172,19 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
         chunks = split_evenly(files, workers)
         chunk_root = RUNTIME_DIR / "parallel_chunks" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         chunk_root.mkdir(parents=True, exist_ok=True)
+        source_root = Path(str(input_value)).expanduser().resolve()
 
         for idx, chunk in enumerate(chunks, start=1):
             chunk_dir = chunk_root / f"worker_{idx:02d}"
             chunk_dir.mkdir(parents=True, exist_ok=True)
             used_names: set[str] = set()
             for src in chunk:
-                dst = chunk_dir / unique_chunk_filename(src, used_names)
+                # 尽量保留输入目录下的相对层级，避免算法依赖子目录结构时被打平。
+                try:
+                    rel = src.resolve().relative_to(source_root)
+                    dst = chunk_dir / rel
+                except Exception:
+                    dst = chunk_dir / unique_chunk_filename(src, used_names)
                 link_or_copy_file(src, dst)
 
             job_inputs = dict(inputs)
