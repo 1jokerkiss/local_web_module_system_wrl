@@ -1483,6 +1483,153 @@ def merge_admin_fixed_inputs(module: dict, inputs: Dict[str, Any]) -> Dict[str, 
 
 
 
+# Python 源码模块运行时复制策略：
+# 每个任务仍然需要独立的 runtime/source/config.json，避免并行任务互相覆盖配置；
+# 但 models、weights 等固定大文件不能重复真实复制，否则并行 20 个任务会占用 20 份磁盘空间。
+# 因此 runtime/source 里对大模型、固定资源优先创建硬链接，失败时尝试符号链接；
+# 只有普通小文件才复制。硬链接在同一磁盘分区内不额外占用数据空间。
+RUNTIME_SHARED_FILE_SUFFIXES = {
+    ".pkl", ".pickle", ".joblib", ".model", ".onnx",
+    ".h5", ".hdf5", ".npy", ".npz",
+    ".pt", ".pth", ".ckpt", ".bin", ".weights",
+    ".tif", ".tiff", ".img", ".nc", ".nc4", ".hdf",
+}
+
+RUNTIME_SHARED_DIR_NAMES = {
+    "model", "models", "weight", "weights", "checkpoint", "checkpoints",
+    "ckpt", "pretrained", "resource", "resources", "lut", "luts",
+}
+
+try:
+    RUNTIME_SHARED_LINK_MIN_BYTES = max(1, int(os.environ.get("LOCAL_WEB_RUNTIME_LINK_MIN_MB", "16"))) * 1024 * 1024
+except Exception:
+    RUNTIME_SHARED_LINK_MIN_BYTES = 16 * 1024 * 1024
+
+
+def _runtime_file_should_be_shared(src_path: Path, source_root: Path) -> bool:
+    """判断 runtime/source 中应该链接而不是复制的固定资源文件。"""
+    try:
+        suffix = src_path.suffix.lower()
+        if suffix in RUNTIME_SHARED_FILE_SUFFIXES:
+            return True
+
+        try:
+            rel_parts = [part.lower() for part in src_path.resolve().relative_to(source_root.resolve()).parts]
+            if any(part in RUNTIME_SHARED_DIR_NAMES for part in rel_parts[:-1]):
+                return True
+        except Exception:
+            pass
+
+        if src_path.stat().st_size >= RUNTIME_SHARED_LINK_MIN_BYTES:
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _link_shared_runtime_file(src_path: Path, dst_path: Path) -> str:
+    """对固定大文件创建链接，不允许悄悄退化成复制。"""
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    if dst_path.exists() or dst_path.is_symlink():
+        dst_path.unlink()
+
+    hardlink_error = None
+    symlink_error = None
+
+    try:
+        os.link(str(src_path), str(dst_path))
+        return "hardlink"
+    except Exception as exc:
+        hardlink_error = exc
+
+    try:
+        if hasattr(os, "symlink"):
+            os.symlink(str(src_path), str(dst_path))
+            return "symlink"
+    except Exception as exc:
+        symlink_error = exc
+
+    raise RuntimeError(
+        "固定大文件不能复制到每个并行任务目录，且创建硬链接/符号链接失败。"
+        f"\n源文件: {src_path}"
+        f"\n目标: {dst_path}"
+        f"\n硬链接错误: {hardlink_error!r}"
+        f"\n符号链接错误: {symlink_error!r}"
+        "\n建议：确保 backend/installed_modules 和 backend/runtime 在同一个磁盘分区；"
+        "Windows 下可开启开发者模式或用管理员权限运行后端以支持符号链接。"
+    )
+
+
+def copy_python_runtime_source(source_dir: Path, run_source_dir: Path) -> dict:
+    """
+    创建 Python 模块单次运行目录。
+
+    普通 .py/.json 小文件复制到 runtime/source，保证每个任务有独立 config.json；
+    模型、权重、LUT、resources 里的大文件用硬链接/符号链接指向安装目录的同一份文件，
+    避免并行进程池启动多个任务时把 1GB 模型复制几十份。
+    """
+    stats = {
+        "copied_files": 0,
+        "linked_files": 0,
+        "hardlinked_files": 0,
+        "symlinked_files": 0,
+        "shared_bytes": 0,
+    }
+
+    def copy_function(src: str, dst: str):
+        src_path = Path(src)
+        dst_path = Path(dst)
+        if _runtime_file_should_be_shared(src_path, source_dir):
+            method = _link_shared_runtime_file(src_path, dst_path)
+            stats["linked_files"] += 1
+            if method == "hardlink":
+                stats["hardlinked_files"] += 1
+            elif method == "symlink":
+                stats["symlinked_files"] += 1
+            try:
+                stats["shared_bytes"] += int(src_path.stat().st_size)
+            except Exception:
+                pass
+            return str(dst_path)
+
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        result = shutil.copy2(src, dst)
+        stats["copied_files"] += 1
+        return result
+
+    try:
+        shutil.copytree(
+            source_dir,
+            run_source_dir,
+            ignore=shutil.ignore_patterns(
+                "__pycache__",
+                "*.pyc",
+                ".venv",
+                "venv",
+                ".git",
+            ),
+            copy_function=copy_function,
+        )
+    except shutil.Error as exc:
+        text = str(exc)
+        if "WinError 112" in text or "磁盘空间不足" in text:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "创建 Python 模块运行目录失败：磁盘空间不足。\n"
+                    "原因通常是并行任务重复复制大模型或固定资源。\n"
+                    "新版逻辑会对模型/权重/resources 中的大文件创建硬链接，不再真实复制。\n"
+                    "请先清理 backend/runtime/job_* 后重试。\n\n"
+                    f"原始错误：{text}"
+                ),
+            )
+        raise HTTPException(status_code=400, detail=f"创建 Python 模块运行目录失败：{text}")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return stats
+
+
 def coerce_json_marked_inputs(module: dict, inputs: Dict[str, Any]) -> Dict[str, Any]:
     """把自动识别出的复杂 JSON 参数从字符串还原成 dict/list/number/bool。"""
     result = dict(inputs or {})
@@ -1655,17 +1802,12 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
                 raise HTTPException(status_code=400, detail=f"Python 源码目录不存在: {source_dir}")
 
             run_source_dir = runtime_task_dir / "source"
-            shutil.copytree(
-                source_dir,
-                run_source_dir,
-                ignore=shutil.ignore_patterns(
-                    "__pycache__",
-                    "*.pyc",
-                    ".venv",
-                    "venv",
-                    ".git",
-                ),
-            )
+            runtime_copy_stats = copy_python_runtime_source(source_dir, run_source_dir)
+            runtime_env["RUNTIME_SHARED_LINKED_FILES"] = str(runtime_copy_stats.get("linked_files", 0))
+            runtime_env["RUNTIME_SHARED_HARDLINKED_FILES"] = str(runtime_copy_stats.get("hardlinked_files", 0))
+            runtime_env["RUNTIME_SHARED_SYMLINKED_FILES"] = str(runtime_copy_stats.get("symlinked_files", 0))
+            runtime_env["RUNTIME_SHARED_BYTES"] = str(runtime_copy_stats.get("shared_bytes", 0))
+            runtime_env["RUNTIME_COPIED_SMALL_FILES"] = str(runtime_copy_stats.get("copied_files", 0))
 
             config_path = run_source_dir / "config.json"
             config_path.write_text(

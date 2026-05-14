@@ -656,6 +656,26 @@ class TaskManager:
             f"[INFO] GOTO_NUM_THREADS = {merged_env.get('GOTO_NUM_THREADS', '')}",
         )
 
+        linked_files = merged_env.get("RUNTIME_SHARED_LINKED_FILES")
+        copied_small_files = merged_env.get("RUNTIME_COPIED_SMALL_FILES")
+        shared_bytes = merged_env.get("RUNTIME_SHARED_BYTES")
+        if linked_files is not None:
+            try:
+                shared_gb = int(shared_bytes or "0") / 1024 / 1024 / 1024
+                self.append_log(
+                    task_id,
+                    (
+                        f"[INFO] runtime/source 创建完成：固定大文件链接 {linked_files} 个，"
+                        f"普通小文件复制 {copied_small_files or 0} 个，"
+                        f"避免重复复制约 {shared_gb:.2f} GB"
+                    ),
+                )
+            except Exception:
+                self.append_log(
+                    task_id,
+                    f"[INFO] runtime/source 创建完成：固定大文件链接 {linked_files} 个，普通小文件复制 {copied_small_files or 0} 个",
+                )
+
         config_arg = None
 
         for item in reversed(command):
