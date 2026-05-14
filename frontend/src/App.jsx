@@ -511,7 +511,53 @@ function RunningDots({ active }) {
   }, [active]);
   return <span>{dots}</span>;
 }
+function cleanLogLine(line) {
+  return String(line || '')
+    .replace(/\uFFFD/g, '')
+    .replace(/�/g, '')
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')
+    .trim();
+}
 
+function parseTqdmProgressLine(line) {
+  const text = cleanLogLine(line);
+
+  // 兼容：
+  // [STDERR]  4%|xx | 1/27 [01:25<37:04, 85.55s/it]
+  // [STDERR] 11%|   | 3/27 [04:06<32:43, 81.81s/it]
+  const match = text.match(
+    /(?:\[(?:STDERR|STDOUT)\]\s*)?(\d{1,3})%\|.*?\|\s*(\d+)\s*\/\s*(\d+)(?:\s*\[([^\]]+)\])?/
+  );
+
+  if (!match) return null;
+
+  const percent = Math.max(0, Math.min(100, Number.parseInt(match[1], 10) || 0));
+  const current = Number.parseInt(match[2], 10) || 0;
+  const total = Number.parseInt(match[3], 10) || 0;
+  const detail = match[4] || '';
+
+  return {
+    percent,
+    current,
+    total,
+    detail,
+  };
+}
+
+function getTaskProgressFromLogs(logs) {
+  if (!Array.isArray(logs)) return null;
+
+  for (let i = logs.length - 1; i >= 0; i -= 1) {
+    const progress = parseTqdmProgressLine(logs[i]);
+    if (progress) return progress;
+  }
+
+  return null;
+}
+
+function isTqdmProgressLog(line) {
+  return !!parseTqdmProgressLine(line);
+}
 function SimpleOverlay({ title, onClose, children, width = 'min(960px, 96vw)' }) {
   return (
     <div
@@ -565,7 +611,11 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
     : task?.logs
       ? [String(task.logs)]
       : [];
+  const taskProgress = getTaskProgressFromLogs(taskLogs);
 
+  const visibleLogs = taskLogs
+    .map(cleanLogLine)
+    .filter((line) => line && !isTqdmProgressLog(line));
   function onMouseDown(e) {
     if (e.button !== 0) return;
     onFront(win.id);
@@ -658,7 +708,70 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
             <div><strong>排队：</strong>{task?.queue_position ? `第 ${task.queue_position} 位` : '等待中'}{task?.queue_reason ? `，${task.queue_reason}` : ''}</div>
           )}
         </div>
+        {taskProgress && (
+            <div
+              style={{
+                marginTop: 12,
+                padding: 12,
+                borderRadius: 12,
+                background: '#ffffff',
+                border: '1px solid #d8e6f5',
+                boxShadow: '0 6px 16px rgba(13, 79, 146, 0.08)',
+              }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginBottom: 8,
+                  fontSize: 13,
+                  color: '#17406b',
+                  fontWeight: 800,
+                }}
+              >
+                <span>处理进度</span>
+                <span>{taskProgress.percent}%</span>
+              </div>
 
+              <div
+                style={{
+                  height: 10,
+                  borderRadius: 999,
+                  background: '#e6eef8',
+                  overflow: 'hidden',
+                }}
+              >
+                <div
+                  style={{
+                    width: `${taskProgress.percent}%`,
+                    height: '100%',
+                    borderRadius: 999,
+                    background: 'linear-gradient(135deg, #2d7cf6 0%, #37b6ff 100%)',
+                    transition: 'width 0.35s ease',
+                  }}
+                />
+              </div>
+
+              <div
+                style={{
+                  marginTop: 8,
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  gap: 8,
+                  fontSize: 12,
+                  color: '#5f7088',
+                }}
+              >
+                <span>
+                  {taskProgress.current}/{taskProgress.total}
+                </span>
+                <span style={{ textAlign: 'right' }}>
+                  {taskProgress.detail || '正在处理'}
+                </span>
+              </div>
+            </div>
+          )}
         <div style={{ marginTop: 12 }}>
           <div style={{ fontWeight: 700, marginBottom: 8 }}>运行日志</div>
           <div
@@ -676,7 +789,7 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
               lineHeight: 1.45,
             }}
           >
-            {taskLogs.length ? taskLogs.join('\n') : '暂无日志'}
+            {visibleLogs.length ? visibleLogs.join('\n') : '暂无日志'}
           </div>
         </div>
 

@@ -591,10 +591,18 @@ class TaskManager:
                 if not raw:
                     break
 
-                line = self.decode_process_output(raw).rstrip("\r\n")
+                text = self.decode_process_output(raw)
 
-                if line:
-                    self.append_log(task_id, f"[{prefix}] {line}")
+                # tqdm 常用 \r 原地刷新，进入网页日志后会显示混乱；
+                # 这里按 \r / \n 拆成普通日志行。
+                for part in text.replace("\r", "\n").splitlines():
+                    line = part.strip()
+
+                    # 去掉 Unicode replacement character，避免出现 ��。
+                    line = line.replace("\ufffd", "").replace("�", "")
+
+                    if line:
+                        self.append_log(task_id, f"[{prefix}] {line}")
 
         except Exception as e:
             self.append_log(task_id, f"[PYTHON-LOG-ERROR] {prefix}: {repr(e)}")
