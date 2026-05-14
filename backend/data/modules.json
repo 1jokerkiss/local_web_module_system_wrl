@@ -331,6 +331,8 @@
       "{entry_script}",
       "{config_json}"
     ],
+    "python_env_mode": "existing",
+    "base_python_executable": "D:/envs/fy4/python.exe",
     "inputs": [
       {
         "key": "out_path",
@@ -359,10 +361,9 @@
     "source_dir": "backend/installed_modules/FY/source",
     "entry_file": "CTH_FY.py",
     "entry_script": "backend/installed_modules/FY/source/CTH_FY.py",
-    "python_env_dir": "backend/module_envs/FY",
-    "base_python_executable": "D:/Python/Python38/python.exe",
-    "executable": "backend/module_envs/FY/Scripts/python.exe",
     "working_dir": "backend/installed_modules/FY/source",
+    "python_env_dir": "D:\\envs",
+    "executable": "D:\\envs\\fy4\\python.exe",
     "parallel": {
       "mode": "auto",
       "input_key": "",
