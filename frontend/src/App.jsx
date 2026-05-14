@@ -25,8 +25,6 @@ import {
   deleteModule as deleteModuleApi,
     uploadModuleFolder,
   validateCppModuleFolder,
-  uploadPythonFolderModule,
-  parseModuleParamJson,
   parsePythonModuleConfig,
   validatePythonModuleConfig,
   uploadPythonModuleConfig,
@@ -529,7 +527,52 @@ function RunningDots({ active }) {
   }, [active]);
   return <span>{dots}</span>;
 }
+function cleanLogLine(line) {
+  return String(line || '')
+    .replace(/\uFFFD/g, '')
+    .replace(/�/g, '')
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')
+    .trim();
+}
 
+function parseTqdmProgressLine(line) {
+  const text = cleanLogLine(line);
+
+  const match = text.match(
+    /(?:\[(STDERR|STDOUT)\]\s*)?(\d{1,3})%\|.*?\|\s*(\d+)\s*\/\s*(\d+)(?:\s*\[([^\]]+)\])?/
+  );
+
+  if (!match) return null;
+
+  const stream = match[1] || 'STDERR';
+  const percent = Math.max(0, Math.min(100, Number.parseInt(match[2], 10) || 0));
+  const current = Number.parseInt(match[3], 10) || 0;
+  const total = Number.parseInt(match[4], 10) || 0;
+  const detail = match[5] || '';
+
+  return {
+    stream,
+    percent,
+    current,
+    total,
+    detail,
+  };
+}
+
+function getTaskProgressFromLogs(logs) {
+  if (!Array.isArray(logs)) return null;
+
+  for (let i = logs.length - 1; i >= 0; i -= 1) {
+    const progress = parseTqdmProgressLine(logs[i]);
+    if (progress) return progress;
+  }
+
+  return null;
+}
+
+function isTqdmProgressLog(line) {
+  return !!parseTqdmProgressLine(line);
+}
 function SimpleOverlay({ title, onClose, children, width = 'min(960px, 96vw)' }) {
   return (
     <div
@@ -584,6 +627,20 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
       ? [String(task.logs)]
       : [];
 
+  const taskProgress = getTaskProgressFromLogs(taskLogs);
+
+  const visibleLogs = taskLogs
+    .map(cleanLogLine)
+    .filter((line) => line && !isTqdmProgressLog(line));
+
+  const progressLogLine = taskProgress
+    ? `PID = ${task?.pid || '-'} [${taskProgress.stream || 'STDERR'}] ${taskProgress.percent}%| | ${taskProgress.current}/${taskProgress.total}${taskProgress.detail ? ` [${taskProgress.detail}]` : ''}`
+    : '';
+
+  const displayLogs = [
+    ...(progressLogLine ? [progressLogLine] : []),
+    ...visibleLogs.slice(-120),
+  ];
   function onMouseDown(e) {
     if (e.button !== 0) return;
     onFront(win.id);
@@ -694,7 +751,7 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
               lineHeight: 1.45,
             }}
           >
-            {taskLogs.length ? taskLogs.join('\n') : '暂无日志'}
+            {displayLogs.length ? displayLogs.join('\n') : '暂无日志'}
           </div>
         </div>
 
@@ -1757,7 +1814,7 @@ useEffect(() => {
             } catch {}
           }
       } catch {}
-    }, 3000);
+    }, 1000);
 
     return () => {
       if (pollTimerRef.current) {
