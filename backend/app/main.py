@@ -1903,6 +1903,17 @@ def load_python_module_config(raw_path: str) -> tuple[dict, Path]:
         or module_cfg.get("python_path")
         or ""
     ).strip()
+    python_env_mode = str(
+        module_cfg.get("python_env_mode")
+        or module_cfg.get("env_mode")
+        or "create_venv"
+    ).strip().lower()
+
+    if python_env_mode not in {"create_venv", "existing"}:
+        raise HTTPException(
+            status_code=400,
+            detail="python_env_mode 只支持 create_venv 或 existing",
+        )
     if not module_id:
         raise HTTPException(status_code=400, detail="Python 模块配置 JSON 缺少 module_id")
     if not module_name:
@@ -1943,6 +1954,7 @@ def load_python_module_config(raw_path: str) -> tuple[dict, Path]:
         "param_json_path": str(param_json_path) if param_json_path else "",
         "param_json": param_json,
         "python_executable": python_executable,
+        "python_env_mode": python_env_mode,
     }, config_path
 def install_python_venv_module_from_values(
     module_id: str,
@@ -1954,6 +1966,7 @@ def install_python_venv_module_from_values(
     param_json_path: str = "",
     param_json: dict | None = None,
     python_executable: str = "",
+    python_env_mode: str = "create_venv",
 ) -> dict:
     safe_module_id = sanitize_filename(module_id).strip()
     if not safe_module_id:
@@ -2006,11 +2019,16 @@ def install_python_venv_module_from_values(
     rel_entry = entry_candidate.resolve().relative_to(source_root.resolve())
     installed_entry_script = source_target_dir / rel_entry
 
-    python_exe = create_python_module_env(
-        safe_module_id,
-        source_target_dir,
-        base_python_executable=python_executable,
-    )
+    python_env_mode = str(python_env_mode or "create_venv").strip().lower()
+
+    if python_env_mode == "existing":
+        python_exe = resolve_existing_python_executable(python_executable)
+    else:
+        python_exe = create_python_module_env(
+            safe_module_id,
+            source_target_dir,
+            base_python_executable=python_executable,
+        )
 
     module_json_candidates = list(source_target_dir.rglob("module.json"))
     if module_json_candidates:
@@ -2036,15 +2054,23 @@ def install_python_venv_module_from_values(
     module_data["runtime_type"] = "python_venv"
     module_data["config_mode"] = "config_json"
     module_data["command_template"] = ["{executable}", "{entry_script}", "{config_json}"]
+    module_data["python_env_mode"] = python_env_mode
+    module_data["base_python_executable"] = python_executable
     module_data["inputs"] = inferred_inputs
     module_data["param_template"] = to_project_relative_path(param_template_path)
     module_data["source_dir"] = to_project_relative_path(source_target_dir)
     module_data["entry_file"] = rel_entry.as_posix()
     module_data["entry_script"] = to_project_relative_path(installed_entry_script)
-    module_data["python_env_dir"] = to_project_relative_path(PYTHON_MODULE_ENVS_DIR / safe_module_id)
+
     module_data["base_python_executable"] = python_executable
-    module_data["executable"] = to_project_relative_path(python_exe)
+
     module_data["working_dir"] = to_project_relative_path(source_target_dir)
+    if python_env_mode == "existing":
+        module_data["python_env_dir"] = str(python_exe.parent.parent)
+    else:
+        module_data["python_env_dir"] = to_project_relative_path(PYTHON_MODULE_ENVS_DIR / safe_module_id)
+
+    module_data["executable"] = to_project_relative_path(python_exe)
 
     ensure_toolbar_exists(selected_tool_type)
     upsert_module(module_data)
@@ -2365,7 +2391,39 @@ def install_requirements_with_local_wheels(
             title="安装普通 Python 依赖",
             env=build_clean_pip_env(),
         )
+def resolve_existing_python_executable(raw_path: str) -> Path:
+    raw = str(raw_path or "").strip()
 
+    if not raw:
+        raise HTTPException(
+            status_code=400,
+            detail="使用 existing 模式时，必须在 python_module.json 中指定 python_executable",
+        )
+
+    python_exe = Path(raw).expanduser()
+
+    if not python_exe.is_absolute():
+        python_exe = (PROJECT_ROOT / python_exe).resolve()
+    else:
+        python_exe = python_exe.resolve()
+
+    if not python_exe.exists() or not python_exe.is_file():
+        raise HTTPException(
+            status_code=400,
+            detail=f"指定的虚拟环境 Python 不存在: {python_exe}",
+        )
+
+    run_checked_command(
+        [
+            str(python_exe),
+            "-c",
+            "import sys, struct, platform; print(sys.executable); print(sys.version); print(struct.calcsize('P')*8); print(platform.machine())",
+        ],
+        cwd=BASE_DIR,
+        title="检查已有 Python 虚拟环境",
+    )
+
+    return python_exe
 def create_python_module_env(
     module_id: str,
     source_dir: Path,
@@ -3007,6 +3065,7 @@ def api_parse_python_module_config(
             "param_json_path": config["param_json_path"],
             "description": config["description"],
             "python_executable": config.get("python_executable") or "",
+            "python_env_mode": config.get("python_env_mode") or "create_venv",
         },
         "inputs": inputs,
         "count": len(inputs),
@@ -3032,6 +3091,7 @@ def api_upload_python_config_module(
         param_json_path=config["param_json_path"],
         param_json=config["param_json"],
         python_executable=config.get("python_executable") or "",
+        python_env_mode=config.get("python_env_mode") or "create_venv",
     )
 
     return {
