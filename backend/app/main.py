@@ -1,6 +1,4 @@
 from __future__ import annotations
-import stat
-import time
 import sys
 import base64
 import json
@@ -11,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+import traceback
 from pathlib import Path
 from string import Formatter
 from typing import Any, Dict, List, Optional
@@ -62,10 +61,7 @@ STRICT_LOCAL_BINARY_PACKAGES = {
     "cartopy",
 }
 
-# 这些包不再从本地 python_wheels 强制安装。
-# 例如 Python 3.8 没有本地 numpy cp38 wheel 时，直接从远程 PyPI 下载匹配 wheel。
-# 仍然使用 --only-binary :all:，避免下载源码包并在中文路径下编译失败。
-REMOTE_BINARY_PACKAGES = {
+PREFER_LOCAL_BINARY_PACKAGES = {
     "numpy",
     "h5py",
 }
@@ -189,6 +185,10 @@ class ParseParamJsonRequest(BaseModel):
 class InstallModuleFolderRequest(BaseModel):
     folder_path: str
     tool_type: str = "cloud"
+    # C++ 模块按本地可执行文件安装，只需要 module.json、exe、resources 和运行时 deps。
+    # 这里保留 runtime 字段，兼容旧前端调用。
+    runtime: str = "cpp_native"
+    auto_collect_dependencies: bool = True
 
 class PythonFolderModuleUploadRequest(BaseModel):
     source_dir: str
@@ -1273,12 +1273,12 @@ def _is_path_inside(child: Path, parent: Path) -> bool:
     except ValueError:
         return False
 
+
 def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
     """
     只允许删除指定安全目录下的文件或文件夹。
-    Windows 下目录删除使用 safe_rmtree，避免只读文件或短暂占用直接失败。
     """
-    path = Path(path).resolve()
+    path = path.resolve()
 
     if not path.exists():
         return {
@@ -1292,90 +1292,30 @@ def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
             detail=f"拒绝删除非模块目录路径: {path}",
         )
 
-    if path.is_dir():
-        safe_rmtree(path)
-    else:
-        last_error = None
-
-        for _ in range(5):
-            try:
-                os.chmod(path, stat.S_IWRITE)
-                path.unlink()
-                break
-            except FileNotFoundError:
-                break
-            except PermissionError as exc:
-                last_error = exc
-                time.sleep(0.4)
-            except OSError as exc:
-                last_error = exc
-                time.sleep(0.4)
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"删除模块本地文件失败: {path}\n"
-                    f"原因: {last_error}\n"
-                    "请关闭正在使用该文件的程序或停止相关任务后重试。"
-                ),
-            )
-
-    return {
-        "path": str(path),
-        "status": "deleted",
-    }
-
-def _remove_readonly_or_locked(func, path, exc_info):
-    """
-    Windows 删除模块目录时，遇到只读文件时先改权限再删。
-    """
     try:
-        os.chmod(path, stat.S_IWRITE)
-        func(path)
-    except Exception:
-        raise
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=False)
+        else:
+            path.unlink()
+
+        return {
+            "path": str(path),
+            "status": "deleted",
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"删除模块本地文件失败: {path}，原因: {exc}",
+        )
 
 
-def safe_rmtree(path: Path, retries: int = 5, delay: float = 0.4):
-    """
-    更稳的目录删除：
-    1. 支持只读文件；
-    2. 对 Windows 短暂占用做重试；
-    3. 最后失败时给出明确错误。
-    """
-    path = Path(path)
-
-    if not path.exists():
-        return
-
-    last_error = None
-
-    for _ in range(retries):
-        try:
-            shutil.rmtree(path, onerror=_remove_readonly_or_locked)
-            return
-        except PermissionError as exc:
-            last_error = exc
-            time.sleep(delay)
-        except OSError as exc:
-            last_error = exc
-            time.sleep(delay)
-
-    raise HTTPException(
-        status_code=400,
-        detail=(
-            f"删除模块本地文件失败: {path}\n"
-            f"原因: {last_error}\n"
-            "请关闭正在使用该模块文件的程序或停止相关任务后重试。"
-        ),
-    )
 def remove_module(module_id: str) -> dict:
     """
     删除模块：
-    1. 先从 modules.json 移除模块记录；
-    2. 再尝试删除 backend/installed_modules/{module_id}；
-    3. 再尝试删除 backend/module_envs/{module_id}；
-    4. 如果本地文件被占用，模块记录仍然删除成功，只返回 cleanup_warning。
+    1. 从 modules.json 移除模块记录；
+    2. 删除 backend/installed_modules/{module_id}；
+    3. 删除 backend/module_envs/{module_id}；
+    4. 不删除任务记录、不删除数据管理中的输出结果文件。
     """
     modules = load_modules()
 
@@ -1392,15 +1332,11 @@ def remove_module(module_id: str) -> dict:
         return {
             "removed": False,
             "deleted_paths": [],
-            "cleanup_warnings": [],
         }
 
     safe_module_id = sanitize_filename(module_id).strip()
     if not safe_module_id:
         raise HTTPException(status_code=400, detail="模块 ID 不能为空")
-
-    # 先删 modules.json 记录，避免本地文件被占用时界面一直删不掉模块。
-    save_modules(new_modules)
 
     installed_dir = INSTALLED_MODULES_DIR / safe_module_id
     env_dir = PYTHON_MODULE_ENVS_DIR / safe_module_id
@@ -1411,22 +1347,27 @@ def remove_module(module_id: str) -> dict:
     ]
 
     deleted_paths = []
-    cleanup_warnings = []
 
-    for path in [installed_dir, env_dir]:
-        try:
-            deleted_paths.append(_remove_path_safely(path, allowed_roots))
-        except HTTPException as exc:
-            cleanup_warnings.append(str(exc.detail))
-        except Exception as exc:
-            cleanup_warnings.append(f"清理失败: {path}，原因: {exc}")
+    # 删除模块安装目录：backend/installed_modules/{module_id}
+    deleted_paths.append(
+        _remove_path_safely(installed_dir, allowed_roots)
+    )
+
+    # 删除 Python 独立环境目录：backend/module_envs/{module_id}
+    deleted_paths.append(
+        _remove_path_safely(env_dir, allowed_roots)
+    )
+
+    # 本地文件删除成功后，再删除 modules.json 中的记录
+    save_modules(new_modules)
 
     return {
         "removed": True,
         "module_id": module_id,
         "deleted_paths": deleted_paths,
-        "cleanup_warnings": cleanup_warnings,
     }
+
+
 def format_command(template: List[str], values: Dict[str, Any]) -> List[str]:
     formatted = []
     for item in template:
@@ -1897,23 +1838,7 @@ def load_python_module_config(raw_path: str) -> tuple[dict, Path]:
     entry_file = str(module_cfg.get("entry_file") or "main.py").strip()
     tool_type = str(module_cfg.get("tool_type") or "").strip()
     description = str(module_cfg.get("description") or "").strip()
-    python_executable = str(
-        module_cfg.get("python_executable")
-        or module_cfg.get("python")
-        or module_cfg.get("python_path")
-        or ""
-    ).strip()
-    python_env_mode = str(
-        module_cfg.get("python_env_mode")
-        or module_cfg.get("env_mode")
-        or "create_venv"
-    ).strip().lower()
 
-    if python_env_mode not in {"create_venv", "existing"}:
-        raise HTTPException(
-            status_code=400,
-            detail="python_env_mode 只支持 create_venv 或 existing",
-        )
     if not module_id:
         raise HTTPException(status_code=400, detail="Python 模块配置 JSON 缺少 module_id")
     if not module_name:
@@ -1953,8 +1878,6 @@ def load_python_module_config(raw_path: str) -> tuple[dict, Path]:
         "description": description,
         "param_json_path": str(param_json_path) if param_json_path else "",
         "param_json": param_json,
-        "python_executable": python_executable,
-        "python_env_mode": python_env_mode,
     }, config_path
 def install_python_venv_module_from_values(
     module_id: str,
@@ -1965,8 +1888,6 @@ def install_python_venv_module_from_values(
     description: str = "",
     param_json_path: str = "",
     param_json: dict | None = None,
-    python_executable: str = "",
-    python_env_mode: str = "create_venv",
 ) -> dict:
     safe_module_id = sanitize_filename(module_id).strip()
     if not safe_module_id:
@@ -2003,7 +1924,7 @@ def install_python_venv_module_from_values(
 
     target_dir = INSTALLED_MODULES_DIR / safe_module_id
     if target_dir.exists():
-        safe_rmtree(target_dir)
+        shutil.rmtree(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
 
     source_target_dir = target_dir / "source"
@@ -2019,16 +1940,7 @@ def install_python_venv_module_from_values(
     rel_entry = entry_candidate.resolve().relative_to(source_root.resolve())
     installed_entry_script = source_target_dir / rel_entry
 
-    python_env_mode = str(python_env_mode or "create_venv").strip().lower()
-
-    if python_env_mode == "existing":
-        python_exe = resolve_existing_python_executable(python_executable)
-    else:
-        python_exe = create_python_module_env(
-            safe_module_id,
-            source_target_dir,
-            base_python_executable=python_executable,
-        )
+    python_exe = create_python_module_env(safe_module_id, source_target_dir)
 
     module_json_candidates = list(source_target_dir.rglob("module.json"))
     if module_json_candidates:
@@ -2054,23 +1966,14 @@ def install_python_venv_module_from_values(
     module_data["runtime_type"] = "python_venv"
     module_data["config_mode"] = "config_json"
     module_data["command_template"] = ["{executable}", "{entry_script}", "{config_json}"]
-    module_data["python_env_mode"] = python_env_mode
-    module_data["base_python_executable"] = python_executable
     module_data["inputs"] = inferred_inputs
     module_data["param_template"] = to_project_relative_path(param_template_path)
     module_data["source_dir"] = to_project_relative_path(source_target_dir)
     module_data["entry_file"] = rel_entry.as_posix()
     module_data["entry_script"] = to_project_relative_path(installed_entry_script)
-
-    module_data["base_python_executable"] = python_executable
-
-    module_data["working_dir"] = to_project_relative_path(source_target_dir)
-    if python_env_mode == "existing":
-        module_data["python_env_dir"] = str(python_exe.parent.parent)
-    else:
-        module_data["python_env_dir"] = to_project_relative_path(PYTHON_MODULE_ENVS_DIR / safe_module_id)
-
+    module_data["python_env_dir"] = to_project_relative_path(PYTHON_MODULE_ENVS_DIR / safe_module_id)
     module_data["executable"] = to_project_relative_path(python_exe)
+    module_data["working_dir"] = to_project_relative_path(source_target_dir)
 
     ensure_toolbar_exists(selected_tool_type)
     upsert_module(module_data)
@@ -2234,7 +2137,7 @@ def parse_requirement_package_name(line: str) -> str:
 
 def split_requirements_for_local_binary(requirements_path: Path) -> tuple[list[str], list[str], list[str]]:
     strict_specs: list[str] = []
-    remote_specs: list[str] = []
+    prefer_specs: list[str] = []
     normal_lines: list[str] = []
 
     for raw in requirements_path.read_text(encoding="utf-8").splitlines():
@@ -2248,47 +2151,16 @@ def split_requirements_for_local_binary(requirements_path: Path) -> tuple[list[s
 
         if pkg in STRICT_LOCAL_BINARY_PACKAGES:
             strict_specs.append(line)
-        elif pkg in REMOTE_BINARY_PACKAGES:
-            remote_specs.append(line)
+        elif pkg in PREFER_LOCAL_BINARY_PACKAGES:
+            prefer_specs.append(line)
         else:
             normal_lines.append(raw)
 
-    return strict_specs, remote_specs, normal_lines
-PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
-PIP_TRUSTED_HOST = "pypi.tuna.tsinghua.edu.cn"
-
-
-def build_clean_pip_env() -> dict[str, str]:
-    """
-    pip 安装依赖时使用的干净环境：
-    1. 清掉错误代理；
-    2. 忽略 pip 全局配置；
-    3. 走清华 PyPI 镜像；
-    4. 避免 pip 版本检查干扰日志。
-    """
-    env = os.environ.copy()
-
-    for key in [
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ]:
-        env.pop(key, None)
-
-    env["NO_PROXY"] = "*"
-    env["no_proxy"] = "*"
-    env["PIP_CONFIG_FILE"] = os.devnull
-    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
-
-    return env
+    return strict_specs, prefer_specs, normal_lines
 def run_checked_command(
     cmd: list[str],
     cwd: Path | None = None,
     title: str = "执行命令",
-    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     result = subprocess.run(
         cmd,
@@ -2297,7 +2169,6 @@ def run_checked_command(
         text=True,
         encoding="utf-8",
         errors="ignore",
-        env=env,
     )
 
     if result.returncode != 0:
@@ -2320,33 +2191,26 @@ def install_requirements_with_local_wheels(
     if not requirements_path.exists():
         return
 
-    strict_specs, remote_specs, normal_lines = split_requirements_for_local_binary(requirements_path)
+    strict_specs, prefer_specs, normal_lines = split_requirements_for_local_binary(requirements_path)
 
-    # numpy / h5py：远程安装，不使用 backend/python_wheels。
-    # --only-binary :all: 表示只接受 wheel，避免下载 tar.gz 源码包编译。
-    for spec in remote_specs:
+    # numpy / h5py：优先本地 wheel，但不强制本地。
+    for spec in prefer_specs:
         run_checked_command(
             [
                 str(python_exe),
                 "-m",
                 "pip",
                 "install",
-                "--no-cache-dir",
-                "--only-binary",
-                ":all:",
                 "--prefer-binary",
-                "--index-url",
-                PIP_INDEX_URL,
-                "--trusted-host",
-                PIP_TRUSTED_HOST,
+                "--find-links",
+                str(PYTHON_WHEELS_DIR),
                 spec,
             ],
             cwd=work_dir,
-            title=f"远程安装二进制依赖 {spec}",
-            env=build_clean_pip_env(),
+            title=f"安装二进制依赖 {spec}",
         )
 
-    # GDAL / rasterio / pyproj / cartopy：仍然强制从本地 wheel 安装，避免源码编译失败。
+    # GDAL / rasterio / pyproj / cartopy：强制从本地 wheel 安装，避免源码编译失败。
     for spec in strict_specs:
         run_checked_command(
             [
@@ -2355,8 +2219,6 @@ def install_requirements_with_local_wheels(
                 "pip",
                 "install",
                 "--no-index",
-                "--only-binary",
-                ":all:",
                 "--find-links",
                 str(PYTHON_WHEELS_DIR),
                 spec,
@@ -2378,99 +2240,32 @@ def install_requirements_with_local_wheels(
                 "-m",
                 "pip",
                 "install",
-                "--no-cache-dir",
                 "--prefer-binary",
-                "--index-url",
-                PIP_INDEX_URL,
-                "--trusted-host",
-                PIP_TRUSTED_HOST,
+                "--find-links",
+                str(PYTHON_WHEELS_DIR),
                 "-r",
                 str(normal_req_path),
             ],
             cwd=work_dir,
             title="安装普通 Python 依赖",
-            env=build_clean_pip_env(),
         )
-def resolve_existing_python_executable(raw_path: str) -> Path:
-    raw = str(raw_path or "").strip()
-
-    if not raw:
-        raise HTTPException(
-            status_code=400,
-            detail="使用 existing 模式时，必须在 python_module.json 中指定 python_executable",
-        )
-
-    python_exe = Path(raw).expanduser()
-
-    if not python_exe.is_absolute():
-        python_exe = (PROJECT_ROOT / python_exe).resolve()
-    else:
-        python_exe = python_exe.resolve()
-
-    if not python_exe.exists() or not python_exe.is_file():
-        raise HTTPException(
-            status_code=400,
-            detail=f"指定的虚拟环境 Python 不存在: {python_exe}",
-        )
-
-    run_checked_command(
-        [
-            str(python_exe),
-            "-c",
-            "import sys, struct, platform; print(sys.executable); print(sys.version); print(struct.calcsize('P')*8); print(platform.machine())",
-        ],
-        cwd=BASE_DIR,
-        title="检查已有 Python 虚拟环境",
-    )
-
-    return python_exe
-def create_python_module_env(
-    module_id: str,
-    source_dir: Path,
-    base_python_executable: str = "",
-) -> Path:
+def create_python_module_env(module_id: str, source_dir: Path) -> Path:
     """为 Python 源码模块创建独立 venv，并安装 requirements.txt。"""
     env_dir = PYTHON_MODULE_ENVS_DIR / module_id
 
     if env_dir.exists():
-        safe_rmtree(env_dir)
+        shutil.rmtree(env_dir)
 
     # 用 --clear 明确创建干净环境，--copies 在 Windows 上比软链接更稳
-    if base_python_executable:
-        base_python = Path(base_python_executable).expanduser()
-
-        if not base_python.is_absolute():
-            base_python = (PROJECT_ROOT / base_python).resolve()
-        else:
-            base_python = base_python.resolve()
-
-        if not base_python.exists() or not base_python.is_file():
-            raise HTTPException(
-                status_code=400,
-                detail=f"指定的 Python 解释器不存在: {base_python}",
-            )
-    else:
-        base_python = Path(sys.executable).resolve()
-
     run_checked_command(
-        [str(base_python), "-m", "venv", "--clear", "--copies", str(env_dir)],
+        [sys.executable, "-m", "venv", "--clear", "--copies", str(env_dir)],
         cwd=BASE_DIR,
-        title=f"创建 Python 独立环境，基础解释器: {base_python}",
+        title="创建 Python 独立环境",
     )
 
     python_exe = get_venv_python_path(env_dir)
     if not python_exe.exists():
         raise HTTPException(status_code=400, detail=f"创建环境后未找到 Python 解释器: {python_exe}")
-
-    run_checked_command(
-        [
-            str(python_exe),
-            "-c",
-            "import sys, struct, platform; print(sys.version); print(struct.calcsize('P')*8); print(platform.machine())",
-        ],
-        cwd=source_dir,
-        title="检查模块 Python 版本",
-    )
 
     # 关键：先用 ensurepip 修复/安装 pip。
     # 不依赖当前 venv 里已经损坏的 pip 包。
@@ -2496,17 +2291,12 @@ def create_python_module_env(
             "install",
             "--upgrade",
             "--force-reinstall",
-            "--index-url",
-            PIP_INDEX_URL,
-            "--trusted-host",
-            PIP_TRUSTED_HOST,
             "pip",
             "setuptools",
             "wheel",
         ],
         cwd=source_dir,
         title="升级 pip/setuptools/wheel",
-        env=build_clean_pip_env(),
     )
 
     requirements_path = source_dir / "requirements.txt"
@@ -2520,21 +2310,649 @@ def create_python_module_env(
     return python_exe
 
 
-def install_uploaded_zip(zip_path: Path, tool_type: str | None = None) -> dict:
+
+# =========================
+# C++ / 本地可执行模块校验与运行时依赖收集
+# =========================
+CPP_INPUT_TYPES = {"text", "textarea", "number", "integer", "file_path", "dir_path", "password"}
+CPP_PARALLEL_MODES = {"none", "auto", "single_file", "folder_chunks", "module_internal"}
+CPP_SYSTEM_DLLS = {
+    "kernel32.dll", "user32.dll", "gdi32.dll", "winspool.drv", "comdlg32.dll", "advapi32.dll",
+    "shell32.dll", "ole32.dll", "oleaut32.dll", "uuid.dll", "odbc32.dll", "odbccp32.dll",
+    "ws2_32.dll", "bcrypt.dll", "crypt32.dll", "secur32.dll", "rpcrt4.dll", "shlwapi.dll",
+    "msvcrt.dll", "ucrtbase.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll",
+    "api-ms-win-crt-runtime-l1-1-0.dll", "api-ms-win-crt-stdio-l1-1-0.dll",
+    "api-ms-win-crt-string-l1-1-0.dll", "api-ms-win-crt-heap-l1-1-0.dll",
+    "api-ms-win-crt-convert-l1-1-0.dll", "api-ms-win-crt-math-l1-1-0.dll",
+}
+
+
+def _validation_item(field: str, message: str, suggestion: str = "", **extra) -> dict:
+    item = {"field": field, "message": message, "suggestion": suggestion}
+    for key, value in extra.items():
+        if value not in [None, "", [], {}]:
+            item[key] = value
+    return item
+
+
+def _missing_item(path: str | Path, reason: str, suggestion: str = "") -> dict:
+    return {"path": str(path), "reason": reason, "suggestion": suggestion}
+
+
+def make_cpp_validation_report(folder_path: str | Path) -> dict:
+    return {
+        "ok": False,
+        "can_install": False,
+        "folder_path": str(folder_path),
+        "module_root": "",
+        "module_json_path": "",
+        "module": None,
+        "errors": [],
+        "warnings": [],
+        "missing_files": [],
+        "suggestions": [],
+        "dependency_report": {
+            "auto_collect_enabled": False,
+            "analyzer": "",
+            "copied": [],
+            "missing_imports": [],
+            "search_dirs": [],
+            "target_dir": "",
+            "message": "",
+        },
+    }
+
+
+def _add_error(report: dict, field: str, message: str, suggestion: str = "", **extra):
+    report.setdefault("errors", []).append(_validation_item(field, message, suggestion, **extra))
+    if suggestion:
+        report.setdefault("suggestions", []).append(suggestion)
+
+
+def _add_warning(report: dict, field: str, message: str, suggestion: str = "", **extra):
+    report.setdefault("warnings", []).append(_validation_item(field, message, suggestion, **extra))
+    if suggestion:
+        report.setdefault("suggestions", []).append(suggestion)
+
+
+def _add_missing(report: dict, path: str | Path, reason: str, suggestion: str = ""):
+    report.setdefault("missing_files", []).append(_missing_item(path, reason, suggestion))
+    if suggestion:
+        report.setdefault("suggestions", []).append(suggestion)
+
+
+def _dedupe_report_items(report: dict):
+    for key in ["errors", "warnings", "missing_files"]:
+        seen = set()
+        unique = []
+        for item in report.get(key, []) or []:
+            sig = json.dumps(item, ensure_ascii=False, sort_keys=True)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            unique.append(item)
+        report[key] = unique
+
+    seen_suggestions = []
+    for item in report.get("suggestions", []) or []:
+        if item and item not in seen_suggestions:
+            seen_suggestions.append(item)
+    report["suggestions"] = seen_suggestions
+
+
+def _read_text_with_encoding(path: Path) -> tuple[str, str]:
+    try:
+        return path.read_text(encoding="utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        return path.read_text(encoding="gbk"), "gbk"
+
+
+def _json_error_snippet(text: str, line_no: int, col_no: int, window: int = 2) -> str:
+    lines = text.splitlines() or [text]
+    start = max(1, line_no - window)
+    end = min(len(lines), line_no + window)
+    out: list[str] = []
+    for current in range(start, end + 1):
+        prefix = ">>" if current == line_no else "  "
+        line_text = lines[current - 1] if 0 <= current - 1 < len(lines) else ""
+        out.append(f"{prefix} {current:>4}: {line_text}")
+        if current == line_no:
+            caret_pos = max(col_no - 1, 0)
+            out.append("       " + " " * caret_pos + "^")
+    return "\n".join(out)
+
+
+def _load_module_json_for_validation(module_json_path: Path, report: dict) -> dict | None:
+    try:
+        text, encoding = _read_text_with_encoding(module_json_path)
+    except Exception as exc:
+        _add_error(
+            report,
+            "module.json",
+            f"读取 module.json 失败：{type(exc).__name__}: {exc}",
+            "确认 module.json 没有被其他程序占用，并且文件编码建议保存为 UTF-8。",
+        )
+        return None
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        snippet = _json_error_snippet(text, exc.lineno, exc.colno)
+        _add_error(
+            report,
+            f"module.json 第 {exc.lineno} 行，第 {exc.colno} 列",
+            f"JSON 语法错误：{exc.msg}",
+            "按箭头位置检查：常见问题是少逗号、多逗号、用了中文引号、字符串没有双引号、数组或对象括号没有闭合。JSON 不能写注释。",
+            line=exc.lineno,
+            column=exc.colno,
+            char=exc.pos,
+            encoding=encoding,
+            snippet=snippet,
+        )
+        return None
+    except Exception as exc:
+        _add_error(
+            report,
+            "module.json",
+            f"JSON 解析失败：{type(exc).__name__}: {exc}",
+            "用 JSON 校验工具检查 module.json，注意不能有注释、尾随逗号或非法引号。",
+        )
+        return None
+
+    if not isinstance(data, dict):
+        _add_error(report, "module.json", "顶层必须是 JSON 对象", "module.json 顶层应写成 { ... }，不能是数组或字符串。")
+        return None
+
+    return data
+
+
+def _find_module_json(folder_path: Path, report: dict) -> Path | None:
+    direct = folder_path / "module.json"
+    if direct.exists() and direct.is_file():
+        return direct
+
+    candidates = [p for p in folder_path.rglob("module.json") if p.is_file()]
+    if not candidates:
+        _add_error(report, "module.json", "模块文件夹中未找到 module.json", "把 module.json 放在模块根目录，和 exe、resources、deps 等目录放在同一级。")
+        _add_missing(report, folder_path / "module.json", "缺少模块清单文件", "新增 module.json，并填写 id、name、executable、command_template、inputs。")
+        return None
+
+    candidates.sort(key=lambda x: len(x.parts))
+    if len(candidates) > 1:
+        _add_warning(report, "module.json", f"检测到 {len(candidates)} 个 module.json，系统会使用最靠近根目录的这个：{candidates[0]}", "建议一个模块包只保留一个 module.json，避免安装错模块。")
+    else:
+        _add_warning(report, "module.json", f"module.json 不在选择目录根部，当前使用：{candidates[0]}", "建议把 module.json 放到你选择的模块文件夹根目录。")
+    return candidates[0]
+
+
+def _resolve_module_reference(module_root: Path, raw_value: Any, module_id: str = "", default_path: Path | None = None) -> Path:
+    raw = str(raw_value or "").strip()
+    if not raw or raw == ".":
+        return default_path or module_root
+
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        if p.exists():
+            return p.resolve()
+        parts = list(p.parts)
+        if module_id and module_id in parts:
+            idx = parts.index(module_id)
+            rel_parts = parts[idx + 1:]
+            if rel_parts:
+                return (module_root.joinpath(*rel_parts)).resolve()
+        if p.name:
+            return (module_root / p.name).resolve()
+        return p.resolve()
+
+    return (module_root / p).resolve()
+
+
+def _module_json_error_detail(report: dict) -> dict:
+    _dedupe_report_items(report)
+    report["ok"] = False
+    report["can_install"] = False
+    return {
+        "message": "C++ 可执行模块校验失败，请按下面提示修改后再安装。",
+        **report,
+    }
+
+
+def raise_cpp_validation_error(report: dict):
+    raise HTTPException(status_code=400, detail=_module_json_error_detail(report))
+
+
+def _validate_cpp_module_structure(module_root: Path, module_data: dict, report: dict):
+    module_id = str(module_data.get("id") or "").strip()
+    module_name = str(module_data.get("name") or "").strip()
+    executable = str(module_data.get("executable") or module_data.get("entry") or "").strip()
+    working_dir = str(module_data.get("working_dir") or ".").strip() or "."
+
+    if not module_id:
+        _add_error(report, "id", "缺少模块 id", "在 module.json 中添加例如：\"id\": \"parasol_aod\"。")
+    elif not re.match(r"^[A-Za-z0-9_\-\.]+$", module_id):
+        _add_error(report, "id", f"模块 id 不建议包含空格、中文或特殊符号：{module_id}", "建议只使用英文、数字、下划线、中划线或点，例如 parasol_aod。")
+
+    if not module_name:
+        _add_error(report, "name", "缺少模块名称 name", "在 module.json 中添加例如：\"name\": \"PARASOL AOD 反演\"。")
+
+    if not executable:
+        _add_error(report, "executable", "缺少 executable / entry", "C++ 原生模块需要写可执行程序，例如：\"executable\": \"ParasolAOD.exe\"。")
+        exe_path = None
+    else:
+        exe_path = _resolve_module_reference(module_root, executable, module_id, module_root)
+        if not exe_path.exists() or not exe_path.is_file():
+            _add_error(report, "executable", f"可执行文件不存在：{executable}", "确认 exe 放在模块文件夹中，或把 executable 改成正确的相对路径。")
+            _add_missing(report, exe_path, "module.json executable 指向的文件不存在", "把编译好的 exe 放进模块目录，或修改 executable 字段。")
+        elif sys.platform.startswith("win") and exe_path.suffix.lower() not in {".exe", ".bat", ".cmd"}:
+            _add_warning(report, "executable", f"Windows 下建议 executable 指向 .exe/.bat/.cmd，当前是：{exe_path.name}", "这里按 C++ 可执行模块安装，请确认已经编译为可执行文件。")
+
+    wd_path = _resolve_module_reference(module_root, working_dir, module_id, module_root)
+    if not wd_path.exists() or not wd_path.is_dir():
+        _add_error(report, "working_dir", f"工作目录不存在：{working_dir}", "通常 C++ 模块 working_dir 写 \".\" 即可，资源路径写相对模块目录。")
+        _add_missing(report, wd_path, "module.json working_dir 指向的目录不存在", "创建该目录，或把 working_dir 改为 \".\"。")
+
+    command_template = module_data.get("command_template")
+    if command_template is None:
+        _add_warning(report, "command_template", "缺少 command_template，系统会默认只执行 executable", "建议显式写出命令参数，例如 [\"{executable}\", \"{input_file}\", \"{output_dir}\", \"{config_xml}\"]。")
+        command_template = []
+    elif not isinstance(command_template, list) or not all(isinstance(x, str) and x.strip() for x in command_template):
+        _add_error(report, "command_template", "command_template 必须是非空字符串数组", "例如：[\"{executable}\", \"{input_file}\", \"{output_dir}\"]。")
+        command_template = []
+
+    inputs = module_data.get("inputs")
+    input_keys = set()
+    if not isinstance(inputs, list):
+        _add_error(report, "inputs", "inputs 必须是数组", "例如：\"inputs\": [{\"key\": \"input_file\", \"label\": \"输入文件\", \"type\": \"file_path\"}]。")
+        inputs = []
+
+    for idx, field in enumerate(inputs):
+        field_path = f"inputs[{idx}]"
+        if not isinstance(field, dict):
+            _add_error(report, field_path, "输入项必须是对象", "每个 inputs 项都要包含 key、label、type 等字段。")
+            continue
+
+        key = str(field.get("key") or "").strip()
+        label = str(field.get("label") or "").strip()
+        ftype = str(field.get("type") or "text").strip()
+        path_mode = str(field.get("path_mode") or "absolute").strip()
+        visible = field.get("visible_to_user", True) is not False
+        admin_fixed = field.get("admin_fixed", False) is True
+        required = field.get("required", True) is not False
+        default_value = field.get("default")
+
+        if not key:
+            _add_error(report, f"{field_path}.key", "缺少 key", "给每个输入项设置唯一 key，例如 input_file、output_dir、config_xml。")
+        elif key in input_keys:
+            _add_error(report, f"{field_path}.key", f"key 重复：{key}", "inputs 中每个 key 必须唯一。")
+        else:
+            input_keys.add(key)
+
+        if not label:
+            _add_warning(report, f"{field_path}.label", f"{key or field_path} 缺少 label", "建议写中文显示名，方便用户理解。")
+
+        if ftype not in CPP_INPUT_TYPES:
+            _add_error(report, f"{field_path}.type", f"不支持的 type：{ftype}", "type 只能是 text、textarea、number、integer、file_path、dir_path、password。")
+
+        if path_mode not in {"absolute", "relative_to_module"}:
+            _add_error(report, f"{field_path}.path_mode", f"不支持的 path_mode：{path_mode}", "path_mode 只能是 absolute 或 relative_to_module。")
+
+        if required and (admin_fixed or not visible):
+            if default_value in [None, ""]:
+                _add_error(report, f"{field_path}.default", f"隐藏/管理员固定参数 {key} 必须提供 default", "隐藏参数用户无法填写，default 应写 resources 中的相对路径或固定值。")
+            elif ftype in {"file_path", "dir_path"} and path_mode == "relative_to_module":
+                target = _resolve_module_reference(module_root, default_value, module_id, module_root)
+                if ftype == "file_path" and (not target.exists() or not target.is_file()):
+                    _add_error(report, f"{field_path}.default", f"固定文件不存在：{default_value}", "把文件放进 resources 目录，或修改 default 为正确相对路径。")
+                    _add_missing(report, target, f"隐藏参数 {key} 指向的文件不存在", "确认 resources、LUT、XML、模型文件随模块一起上传。")
+                if ftype == "dir_path" and (not target.exists() or not target.is_dir()):
+                    _add_error(report, f"{field_path}.default", f"固定目录不存在：{default_value}", "把目录放进 resources 目录，或修改 default 为正确相对路径。")
+                    _add_missing(report, target, f"隐藏参数 {key} 指向的目录不存在", "确认 resources、LUT、XML、模型目录随模块一起上传。")
+
+    known_placeholders = set(input_keys) | {
+        "executable", "python_executable", "working_dir", "config_json", "config_path",
+        "runtime_dir", "entry_script", "module_dir",
+    }
+    for idx, token in enumerate(command_template):
+        try:
+            parsed = Formatter().parse(token)
+            for _, field_name, _, _ in parsed:
+                if not field_name:
+                    continue
+                base = re.split(r"[.\[]", field_name, 1)[0]
+                if base and base not in known_placeholders:
+                    _add_error(
+                        report,
+                        f"command_template[{idx}]",
+                        f"命令模板引用了未知占位符：{{{field_name}}}",
+                        f"把占位符改成 inputs 中已有的 key，或在 inputs 中新增 key={base} 的输入项。",
+                    )
+        except Exception as exc:
+            _add_error(report, f"command_template[{idx}]", f"命令模板格式错误：{exc}", "检查大括号是否成对，例如 {input_file}。")
+
+    parallel = module_data.get("parallel")
+    if parallel is not None:
+        if not isinstance(parallel, dict):
+            _add_error(report, "parallel", "parallel 必须是对象", "例如：\"parallel\": {\"mode\": \"auto\", \"file_patterns\": \"*.tif\"}。")
+        else:
+            mode = str(parallel.get("mode") or "auto")
+            if mode not in CPP_PARALLEL_MODES:
+                _add_error(report, "parallel.mode", f"不支持的并行模式：{mode}", "可选 none、auto、single_file、folder_chunks、module_internal。")
+
+    dependency_dirs = module_data.get("dependency_dirs", ["deps"])
+    if dependency_dirs is None:
+        dependency_dirs = []
+    if not isinstance(dependency_dirs, list):
+        _add_error(report, "dependency_dirs", "dependency_dirs 必须是字符串数组", "例如：\"dependency_dirs\": [\"deps\"]。")
+        dependency_dirs = []
+
+    for dep in dependency_dirs:
+        dep_text = str(dep or "").strip()
+        if not dep_text:
+            continue
+        dep_path = _resolve_module_reference(module_root, dep_text, module_id, module_root)
+        if not dep_path.exists() or not dep_path.is_dir():
+            _add_warning(report, "dependency_dirs", f"声明的依赖目录不存在：{dep_text}", "如果没有额外 DLL，可以删除该目录配置；如果有 DLL，请创建该目录并放入依赖。")
+            _add_missing(report, dep_path, "dependency_dirs 声明的目录不存在", "创建目录并放入运行时 DLL，或从 dependency_dirs 中删除它。")
+
+    dependency_search_dirs = module_data.get("dependency_search_dirs", [])
+    if dependency_search_dirs is None:
+        dependency_search_dirs = []
+    if isinstance(dependency_search_dirs, str):
+        dependency_search_dirs = [dependency_search_dirs]
+    if not isinstance(dependency_search_dirs, list):
+        _add_error(report, "dependency_search_dirs", "dependency_search_dirs 必须是字符串数组", "例如：\"dependency_search_dirs\": [\"C:/OSGeo4W/bin\"]。")
+        dependency_search_dirs = []
+    for dep in dependency_search_dirs:
+        dep_text = str(dep or "").strip()
+        if not dep_text:
+            continue
+        dep_path = _resolve_module_reference(module_root, dep_text, module_id, module_root)
+        if not dep_path.exists() or not dep_path.is_dir():
+            _add_warning(report, "dependency_search_dirs", f"依赖搜索目录不存在：{dep_text}", "如果希望系统自动收集 DLL，请填写本机真实存在的 DLL 目录；如果不需要自动收集，可以留空。")
+
+    runtime = str(module_data.get("runtime") or "native").lower()
+    if runtime not in {"native", "cpp", "cpp_native", "c++", "exe", "binary"}:
+        _add_warning(report, "runtime", f"runtime 当前是 {runtime}，C++ 可执行模块建议写 native 或 cpp_native", "建议：\"runtime\": \"cpp_native\"。")
+
+
+def _dependency_search_dirs(module_root: Path, exe_path: Path, module_data: dict) -> list[Path]:
+    search_dirs: list[Path] = [exe_path.parent, module_root]
+    module_id = str(module_data.get("id") or "")
+
+    for key in ["dependency_dirs", "dependency_search_dirs"]:
+        raw_list = module_data.get(key) or []
+        if isinstance(raw_list, str):
+            raw_list = [raw_list]
+        if isinstance(raw_list, list):
+            for item in raw_list:
+                if not str(item or "").strip():
+                    continue
+                search_dirs.append(_resolve_module_reference(module_root, item, module_id, module_root))
+
+    path_value = os.environ.get("PATH", "")
+    sep = ";" if sys.platform.startswith("win") else os.pathsep
+    for item in path_value.split(sep):
+        item = item.strip().strip('"')
+        if item:
+            search_dirs.append(Path(item))
+
+    result: list[Path] = []
+    seen = set()
+    for d in search_dirs:
+        try:
+            rd = d.resolve()
+        except Exception:
+            rd = d
+        key = str(rd).lower() if sys.platform.startswith("win") else str(rd)
+        if key in seen:
+            continue
+        seen.add(key)
+        if rd.exists() and rd.is_dir():
+            result.append(rd)
+    return result
+
+
+def _find_dependency_file(name: str, search_dirs: list[Path]) -> Path | None:
+    target_lower = name.lower()
+    for directory in search_dirs:
+        direct = directory / name
+        if direct.exists() and direct.is_file():
+            return direct
+        try:
+            for child in directory.iterdir():
+                if child.is_file() and child.name.lower() == target_lower:
+                    return child
+        except Exception:
+            continue
+    return None
+
+
+def _parse_imports_with_pefile(exe_path: Path) -> tuple[list[str], str]:
+    try:
+        import pefile  # type: ignore
+    except Exception:
+        return [], ""
+
+    try:
+        pe = pefile.PE(str(exe_path))
+        deps = []
+        for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) or []:
+            dll = entry.dll.decode("utf-8", errors="ignore") if isinstance(entry.dll, bytes) else str(entry.dll)
+            if dll:
+                deps.append(dll)
+        return sorted(set(deps)), "pefile"
+    except Exception:
+        return [], ""
+
+
+def _parse_imports_with_command(exe_path: Path) -> tuple[list[str], str]:
+    candidates = [
+        ("dumpbin", ["dumpbin", "/DEPENDENTS", str(exe_path)]),
+        ("llvm-objdump", ["llvm-objdump", "-p", str(exe_path)]),
+        ("objdump", ["objdump", "-p", str(exe_path)]),
+    ]
+    for analyzer, cmd in candidates:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=20)
+        except Exception:
+            continue
+        if result.returncode != 0:
+            continue
+        text = (result.stdout or "") + "\n" + (result.stderr or "")
+        deps = set()
+        for line in text.splitlines():
+            line = line.strip()
+            match = re.search(r"(?i)\b([A-Za-z0-9_.+\-]+\.dll)\b", line)
+            if match:
+                deps.add(match.group(1))
+        if deps:
+            return sorted(deps), analyzer
+    return [], ""
+
+
+def collect_cpp_runtime_dependencies(module_root: Path, exe_path: Path, module_data: dict, copy_files: bool = False) -> dict:
+    report = {
+        "auto_collect_enabled": bool(copy_files),
+        "analyzer": "",
+        "copied": [],
+        "missing_imports": [],
+        "search_dirs": [],
+        "target_dir": "",
+        "message": "",
+    }
+
+    if not exe_path.exists() or not exe_path.is_file():
+        report["message"] = "可执行文件不存在，跳过依赖收集。"
+        return report
+
+    deps, analyzer = _parse_imports_with_pefile(exe_path)
+    if not deps:
+        deps, analyzer = _parse_imports_with_command(exe_path)
+
+    report["analyzer"] = analyzer
+    if not deps:
+        report["message"] = "没有可用的 PE 依赖分析器，未能自动识别 DLL。可安装 pefile，或在 Visual Studio Developer Prompt 中启动后端以使用 dumpbin。"
+        return report
+
+    search_dirs = _dependency_search_dirs(module_root, exe_path, module_data)
+    report["search_dirs"] = [str(p) for p in search_dirs]
+
+    target_dir = module_root / "deps" / "auto"
+    if copy_files:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    report["target_dir"] = str(target_dir)
+
+    copied = []
+    missing = []
+    for dep_name in deps:
+        if dep_name.lower() in CPP_SYSTEM_DLLS:
+            continue
+        found = _find_dependency_file(dep_name, search_dirs)
+        if not found:
+            missing.append(dep_name)
+            continue
+        try:
+            # 已经在模块目录内的依赖不需要再复制，但仍然算作已找到。
+            if str(found.resolve()).lower().startswith(str(module_root.resolve()).lower()):
+                continue
+            if copy_files:
+                dst = target_dir / found.name
+                if not dst.exists():
+                    shutil.copy2(found, dst)
+                copied.append(found.name)
+        except Exception:
+            missing.append(dep_name)
+
+    report["copied"] = sorted(set(copied))
+    report["missing_imports"] = sorted(set(missing))
+    if missing:
+        report["message"] = "已识别运行时 DLL，但有部分依赖未在模块目录、dependency_dirs 或系统 PATH 中找到。"
+    elif copied:
+        report["message"] = f"已自动复制 {len(copied)} 个运行时 DLL 到 deps/auto。"
+    else:
+        report["message"] = "运行时依赖已在模块目录、dependency_dirs 或系统 PATH 中找到，无需额外复制。"
+    return report
+
+
+def validate_cpp_module_folder(folder_path: Path, tool_type: str | None = None, collect_dependencies: bool = False, copy_dependencies: bool = False) -> dict:
+    report = make_cpp_validation_report(folder_path)
+
+    if not folder_path.exists() or not folder_path.is_dir():
+        _add_error(report, "folder_path", f"模块文件夹不存在：{folder_path}", "请选择包含 module.json 的模块根目录。")
+        _add_missing(report, folder_path, "选择的模块文件夹不存在", "重新选择正确的本地文件夹路径。")
+        _dedupe_report_items(report)
+        return report
+
+    module_json_path = _find_module_json(folder_path, report)
+    if not module_json_path:
+        _dedupe_report_items(report)
+        return report
+
+    module_root = module_json_path.parent
+    report["module_json_path"] = str(module_json_path)
+    report["module_root"] = str(module_root)
+
+    module_data = _load_module_json_for_validation(module_json_path, report)
+    if module_data is None:
+        _dedupe_report_items(report)
+        return report
+
+    selected_tool_type = (
+        normalize_tool_key(tool_type or module_data.get("tool_type") or "")
+        or guess_module_tool_type(module_data)
+    )
+    module_data["tool_type"] = selected_tool_type
+    if str(module_data.get("runtime") or "").strip() == "":
+        module_data["runtime"] = "cpp_native"
+
+    _validate_cpp_module_structure(module_root, module_data, report)
+
+    executable = str(module_data.get("executable") or module_data.get("entry") or "").strip()
+    module_id = str(module_data.get("id") or "").strip()
+    if collect_dependencies and executable:
+        exe_path = _resolve_module_reference(module_root, executable, module_id, module_root)
+        dep_report = collect_cpp_runtime_dependencies(module_root, exe_path, module_data, copy_files=copy_dependencies)
+        report["dependency_report"] = dep_report
+        if dep_report.get("missing_imports"):
+            _add_warning(
+                report,
+                "dependency_dirs",
+                "部分 DLL 运行依赖未找到：" + ", ".join(dep_report.get("missing_imports") or []),
+                "把这些 DLL 放到 deps 目录，或把它们所在目录加入 module.json 的 dependency_search_dirs。",
+            )
+        if copy_dependencies and dep_report.get("copied"):
+            dependency_dirs = module_data.get("dependency_dirs") or ["deps"]
+            if isinstance(dependency_dirs, list) and "deps/auto" not in dependency_dirs:
+                dependency_dirs.append("deps/auto")
+                module_data["dependency_dirs"] = dependency_dirs
+
+    report["module"] = module_data
+    _dedupe_report_items(report)
+    report["ok"] = len(report.get("errors") or []) == 0
+    report["can_install"] = report["ok"]
+    return report
+
+
+def install_validated_cpp_module(module_root: Path, module_data: dict, collect_dependencies: bool = True) -> dict:
+    module_id = str(module_data.get("id") or "").strip()
+    if not module_id:
+        raise HTTPException(status_code=400, detail="module.json 缺少 id")
+
+    target_dir = INSTALLED_MODULES_DIR / module_id
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    shutil.copytree(module_root, target_dir)
+
+    executable = str(module_data.get("executable") or module_data.get("entry") or "").strip()
+    if executable:
+        exe_path = resolve_packaged_module_path(
+            raw_value=executable,
+            module_id=module_id,
+            target_dir=target_dir,
+            default_path=target_dir,
+        )
+        module_data["executable"] = to_project_relative_path(exe_path)
+
+        if collect_dependencies and module_data.get("auto_collect_deps", True) is not False:
+            dep_report = collect_cpp_runtime_dependencies(target_dir, exe_path, module_data, copy_files=True)
+            if dep_report.get("copied"):
+                dependency_dirs = module_data.get("dependency_dirs") or ["deps"]
+                if isinstance(dependency_dirs, list) and "deps/auto" not in dependency_dirs:
+                    dependency_dirs.append("deps/auto")
+                    module_data["dependency_dirs"] = dependency_dirs
+
+    working_dir = str(module_data.get("working_dir") or ".").strip()
+    wd_path = resolve_packaged_module_path(
+        raw_value=working_dir,
+        module_id=module_id,
+        target_dir=target_dir,
+        default_path=target_dir,
+    )
+    module_data["working_dir"] = to_project_relative_path(wd_path)
+    module_data["runtime"] = module_data.get("runtime") or "cpp_native"
+
+    upsert_module(module_data)
+    return module_data
+
+
+def install_uploaded_zip(zip_path: Path, tool_type: str | None = None, collect_dependencies: bool = True) -> dict:
+    """安装 module_drop 中投放的 C++/本地可执行模块 zip，并先做完整规范校验。"""
     temp_dir = Path(tempfile.mkdtemp(prefix="module_zip_"))
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(temp_dir)
 
-        module_json_candidates = list(temp_dir.rglob("module.json"))
-        if not module_json_candidates:
-            raise HTTPException(status_code=400, detail="压缩包中未找到 module.json")
+        validation = validate_cpp_module_folder(
+            temp_dir,
+            tool_type=tool_type,
+            collect_dependencies=True,
+            copy_dependencies=False,
+        )
+        if not validation.get("can_install"):
+            raise_cpp_validation_error(validation)
 
-        module_json_path = module_json_candidates[0]
-        module_root = module_json_path.parent
-
-        module_data = json.loads(module_json_path.read_text(encoding="utf-8"))
-
+        module_data = validation["module"]
+        module_root = Path(validation["module_root"])
         selected_tool_type = (
             normalize_tool_key(tool_type or module_data.get("tool_type") or "")
             or guess_module_tool_type(module_data)
@@ -2542,49 +2960,293 @@ def install_uploaded_zip(zip_path: Path, tool_type: str | None = None) -> dict:
         module_data["tool_type"] = selected_tool_type
         ensure_toolbar_exists(selected_tool_type)
 
-        module_id = str(module_data.get("id") or "").strip()
-        if not module_id:
-            raise HTTPException(status_code=400, detail="module.json 缺少 id")
-
-        target_dir = INSTALLED_MODULES_DIR / module_id
-
-        if target_dir.exists():
-            safe_rmtree(target_dir)
-
-        shutil.copytree(module_root, target_dir)
-
-        # executable 保存为项目相对路径，不再保存 D:/... 这种绝对路径
-        executable = str(module_data.get("executable") or "").strip()
-        if executable:
-            exe_path = resolve_packaged_module_path(
-                raw_value=executable,
-                module_id=module_id,
-                target_dir=target_dir,
-                default_path=target_dir,
-            )
-
-            module_data["executable"] = to_project_relative_path(exe_path)
-
-        # working_dir 保存为项目相对路径
-        working_dir = str(module_data.get("working_dir") or ".").strip()
-        wd_path = resolve_packaged_module_path(
-            raw_value=working_dir,
-            module_id=module_id,
-            target_dir=target_dir,
-            default_path=target_dir,
+        return install_validated_cpp_module(
+            module_root=module_root,
+            module_data=module_data,
+            collect_dependencies=collect_dependencies,
         )
-
-        module_data["working_dir"] = to_project_relative_path(wd_path)
-
-        upsert_module(module_data)
-        return module_data
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-# ========================
-# 认证接口
+
+
 # =========================
+# Python 源码模块配置 JSON 校验
+# =========================
+def make_python_validation_report(config_path: str | Path) -> dict:
+    return {
+        "ok": False,
+        "can_install": False,
+        "config_path": str(config_path or ""),
+        "config_dir": "",
+        "module": None,
+        "inputs": [],
+        "count": 0,
+        "errors": [],
+        "warnings": [],
+        "missing_files": [],
+        "suggestions": [],
+    }
+
+
+def _python_validation_error_detail(report: dict) -> dict:
+    _dedupe_report_items(report)
+    report["ok"] = False
+    report["can_install"] = False
+    return {
+        "message": "Python 模块配置 JSON 校验失败，请按下面提示修改后再安装。",
+        **report,
+    }
+
+
+def raise_python_validation_error(report: dict):
+    raise HTTPException(status_code=400, detail=_python_validation_error_detail(report))
+
+
+def _resolve_validation_path(raw_path: str, base_dir: Path | None = None) -> Path:
+    raw = str(raw_path or "").strip()
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = ((base_dir or PROJECT_ROOT) / p).resolve()
+    else:
+        p = p.resolve()
+    return p
+
+
+def _load_json_for_validation(json_path: Path, report: dict, display_name: str) -> dict | None:
+    try:
+        text, encoding = _read_text_with_encoding(json_path)
+    except Exception as exc:
+        _add_error(
+            report,
+            display_name,
+            f"读取 {display_name} 失败：{type(exc).__name__}: {exc}",
+            "确认文件没有被其他程序占用，并建议保存为 UTF-8 编码。",
+        )
+        return None
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        snippet = _json_error_snippet(text, exc.lineno, exc.colno)
+        _add_error(
+            report,
+            f"{display_name} 第 {exc.lineno} 行，第 {exc.colno} 列",
+            f"JSON 语法错误：{exc.msg}",
+            "按箭头位置检查：常见问题是少逗号、多逗号、用了中文引号、字符串没有双引号、数组或对象括号没有闭合。JSON 不能写注释。",
+            line=exc.lineno,
+            column=exc.colno,
+            char=exc.pos,
+            encoding=encoding,
+            snippet=snippet,
+        )
+        return None
+    except Exception as exc:
+        _add_error(
+            report,
+            display_name,
+            f"JSON 解析失败：{type(exc).__name__}: {exc}",
+            "用 JSON 校验工具检查该文件，注意不能有注释、尾随逗号或非法引号。",
+        )
+        return None
+
+    if not isinstance(data, dict):
+        _add_error(report, display_name, "顶层必须是 JSON 对象", f"{display_name} 顶层应写成 {{ ... }}，不能是数组、字符串或数字。")
+        return None
+
+    return data
+
+
+def _first_present_key(data: dict, keys: list[str]) -> str:
+    for key in keys:
+        if key in data:
+            return key
+    return ""
+
+
+def _get_python_cfg_value(module_cfg: dict, keys: list[str], default: Any = "") -> Any:
+    for key in keys:
+        if key in module_cfg and module_cfg.get(key) not in (None, ""):
+            return module_cfg.get(key)
+    return default
+
+
+def validate_python_module_config_file(raw_path: str) -> dict:
+    raw = str(raw_path or "").strip()
+    report = make_python_validation_report(raw)
+
+    if not raw:
+        _add_error(report, "path", "请选择 Python 模块配置 JSON", "点击“浏览并检查”，选择类似 python_module.json 的配置文件。")
+        _dedupe_report_items(report)
+        return report
+
+    config_path = _resolve_validation_path(raw)
+    report["config_path"] = str(config_path)
+    report["config_dir"] = str(config_path.parent)
+
+    if not config_path.exists() or not config_path.is_file():
+        _add_error(report, "path", f"Python 模块配置 JSON 不存在：{config_path}", "重新选择真实存在的 python_module.json 文件。")
+        _add_missing(report, config_path, "缺少 Python 模块配置 JSON", "新建或选择 python_module.json。")
+        _dedupe_report_items(report)
+        return report
+
+    if config_path.suffix.lower() != ".json":
+        _add_error(report, "path", "Python 模块配置文件必须是 .json", "请把配置保存为 .json 文件，例如 python_module.json。")
+
+    data = _load_json_for_validation(config_path, report, "python_module.json")
+    if data is None:
+        _dedupe_report_items(report)
+        return report
+
+    if "module" in data:
+        if isinstance(data.get("module"), dict):
+            module_cfg = data["module"]
+        else:
+            _add_error(report, "module", "module 字段必须是对象", "如果使用嵌套写法，应写成：{\"module\": { ... }}。也可以直接使用平铺字段 module_id/source_dir/entry_file。")
+            _dedupe_report_items(report)
+            return report
+    else:
+        module_cfg = data
+
+    module_id_key = _first_present_key(module_cfg, ["module_id", "id"])
+    module_name_key = _first_present_key(module_cfg, ["module_name", "name"])
+    source_dir_key = _first_present_key(module_cfg, ["source_dir", "python_source_dir"])
+    entry_file_key = _first_present_key(module_cfg, ["entry_file"])
+    param_json_key = _first_present_key(module_cfg, ["param_json_path", "config_json"])
+
+    module_id = str(_get_python_cfg_value(module_cfg, ["module_id", "id"], "")).strip()
+    module_name = str(_get_python_cfg_value(module_cfg, ["module_name", "name"], "")).strip()
+    tool_type = str(_get_python_cfg_value(module_cfg, ["tool_type"], "")).strip()
+    description = str(_get_python_cfg_value(module_cfg, ["description"], "")).strip()
+    source_dir_raw = str(_get_python_cfg_value(module_cfg, ["source_dir", "python_source_dir"], "")).strip()
+    entry_file = str(_get_python_cfg_value(module_cfg, ["entry_file"], "main.py")).strip() or "main.py"
+    python_executable_raw = str(_get_python_cfg_value(module_cfg, ["python_executable", "python", "python_path"], "")).strip()
+    python_env_mode = str(_get_python_cfg_value(module_cfg, ["python_env_mode", "env_mode"], "create_venv")).strip().lower() or "create_venv"
+
+    if module_id_key == "id":
+        _add_warning(report, "id", "检测到使用 id 字段，系统兼容该写法", "Python 配置 JSON 建议使用 module_id，便于和 C++ module.json 的 id 区分。")
+    if module_name_key == "name":
+        _add_warning(report, "name", "检测到使用 name 字段，系统兼容该写法", "Python 配置 JSON 建议使用 module_name。")
+
+    if not module_id:
+        _add_error(report, "module_id", "缺少 module_id", "添加例如：\"module_id\": \"H8_CLOUD_TYPE\"。")
+    elif not re.match(r"^[A-Za-z0-9_\-\.]+$", module_id):
+        _add_error(report, "module_id", f"module_id 不建议包含空格、中文或特殊符号：{module_id}", "建议只使用英文、数字、下划线、中划线或点，例如 H8_CLOUD_TYPE。")
+
+    if not module_name:
+        _add_error(report, "module_name", "缺少 module_name", "添加例如：\"module_name\": \"葵花8号云类型反演\"。")
+
+    if not tool_type:
+        _add_warning(report, "tool_type", "未填写 tool_type，系统会尝试根据模块名称和标签推断工具栏", "建议填写已存在的工具栏 key，例如 cloud 或 aerosol。")
+
+    if not source_dir_raw:
+        _add_error(report, "source_dir", "缺少 source_dir", "添加源码目录，例如：\"source_dir\": \".\"。相对路径按 python_module.json 所在目录计算。")
+        source_dir = None
+    else:
+        source_dir = _resolve_validation_path(source_dir_raw, config_path.parent)
+        if not source_dir.exists() or not source_dir.is_dir():
+            _add_error(report, "source_dir", f"Python 源码文件夹不存在：{source_dir}", "检查 source_dir 是否写错；如果源码和 python_module.json 在同一目录，source_dir 写 \".\"。")
+            _add_missing(report, source_dir, "缺少 Python 源码文件夹", "把源码文件夹放到该位置，或修改 source_dir。")
+    
+    if not entry_file_key:
+        _add_warning(report, "entry_file", "未填写 entry_file，系统会默认使用 main.py", "建议明确填写入口脚本，例如 \"entry_file\": \"CM_CTH.py\"。")
+
+    entry_path = None
+    if source_dir and source_dir.exists() and source_dir.is_dir():
+        entry_path = (source_dir / entry_file).resolve()
+        if not entry_path.exists() or not entry_path.is_file():
+            candidates = list(source_dir.rglob(Path(entry_file).name))
+            candidates = [p for p in candidates if p.is_file()]
+            if candidates:
+                _add_warning(
+                    report,
+                    "entry_file",
+                    f"入口脚本没有在 source_dir 根部找到，但在子目录中找到：{candidates[0]}",
+                    f"建议把 entry_file 改成相对 source_dir 的路径，例如：\"{candidates[0].relative_to(source_dir).as_posix()}\"。",
+                )
+                entry_path = candidates[0]
+            else:
+                _add_error(report, "entry_file", f"未找到 Python 入口脚本：{entry_file}", "确认入口 .py 文件名是否正确，并且它位于 source_dir 下。")
+                _add_missing(report, source_dir / entry_file, "缺少 Python 入口脚本", "修改 entry_file，或把入口脚本放到该位置。")
+
+    if python_env_mode not in {"create_venv", "existing"}:
+        _add_error(report, "python_env_mode", f"python_env_mode 不支持：{python_env_mode}", "只能填写 create_venv 或 existing。create_venv 表示系统创建独立环境；existing 表示使用已有 Python 环境。")
+
+    python_executable = ""
+    if python_executable_raw:
+        python_exe_path = _resolve_validation_path(python_executable_raw, config_path.parent)
+        python_executable = str(python_exe_path)
+        if not python_exe_path.exists() or not python_exe_path.is_file():
+            _add_error(report, "python_executable", f"指定的 Python 解释器不存在：{python_exe_path}", "检查 python_executable 路径是否正确，例如 D:/Python/Python38/python.exe 或 D:/envs/fy4/python.exe。")
+            _add_missing(report, python_exe_path, "缺少指定 Python 解释器", "安装该 Python 环境，或修改 python_executable。")
+    elif python_env_mode == "existing":
+        _add_error(report, "python_executable", "existing 模式必须指定 python_executable", "添加已有环境的 python.exe 路径，例如：\"python_executable\": \"D:/envs/fy4/python.exe\"。")
+    else:
+        _add_warning(report, "python_executable", "未指定 python_executable，create_venv 模式会使用后端当前 Python 创建虚拟环境", "如果需要固定 Python 版本，可以填写基础 Python 路径。")
+
+    param_json = None
+    param_json_path_str = ""
+    param_template = module_cfg.get("param_template")
+    if isinstance(param_template, dict):
+        param_json = param_template
+        _add_warning(report, "param_template", "使用了内嵌 param_template，将不会读取单独的参数 JSON 文件", "如果希望参数模板单独维护，可以改用 param_json_path。")
+    elif "param_template" in module_cfg and not isinstance(param_template, dict):
+        _add_error(report, "param_template", "param_template 必须是对象", "要么删除 param_template 并填写 param_json_path，要么写成 JSON 对象。")
+    else:
+        param_json_raw = str(_get_python_cfg_value(module_cfg, ["param_json_path", "config_json"], "")).strip()
+        if not param_json_raw:
+            if source_dir and source_dir.exists() and source_dir.is_dir():
+                param_json_path = (source_dir / "config.json").resolve()
+                _add_warning(report, "param_json_path", "未填写 param_json_path，系统会默认读取源码目录下的 config.json", "建议明确填写：\"param_json_path\": \"config.json\"。")
+            else:
+                param_json_path = _resolve_validation_path("config.json", config_path.parent)
+        else:
+            param_json_path = _resolve_validation_path(param_json_raw, config_path.parent)
+        param_json_path_str = str(param_json_path)
+        if not param_json_path.exists() or not param_json_path.is_file():
+            _add_error(report, "param_json_path", f"参数 JSON 文件不存在：{param_json_path}", "检查 param_json_path 是否写错；相对路径按 python_module.json 所在目录计算。")
+            _add_missing(report, param_json_path, "缺少参数 JSON 文件", "把 config.json 放到该位置，或修改 param_json_path。")
+        else:
+            param_json = _load_json_for_validation(param_json_path, report, "参数 JSON")
+            if param_json is not None and not isinstance(param_json, dict):
+                _add_error(report, "param_json_path", "参数 JSON 顶层必须是对象", "参数 JSON 应写成键值对对象，例如 {\"input_dir\": \"...\", \"output_dir\": \"...\"}。")
+                param_json = None
+
+    if source_dir and source_dir.exists() and source_dir.is_dir():
+        req = source_dir / "requirements.txt"
+        if python_env_mode == "create_venv" and not req.exists():
+            _add_warning(report, "requirements.txt", "源码目录中未找到 requirements.txt", "如果模块依赖第三方库，建议在源码目录放 requirements.txt，系统创建环境时会自动安装。")
+        if python_env_mode == "existing" and req.exists():
+            _add_warning(report, "python_env_mode", "当前使用 existing 模式，系统不会自动给已有 Python 环境安装 requirements.txt", "请提前在该环境中安装 requirements.txt 里的依赖，或改为 create_venv。")
+
+    inputs: list[dict] = []
+    if isinstance(param_json, dict):
+        try:
+            inputs = infer_inputs_from_param_json(param_json)
+        except Exception as exc:
+            _add_warning(report, "param_json_path", f"参数自动识别失败：{type(exc).__name__}: {exc}", "检查参数 JSON 中的值是否能被序列化；也可以先简化参数 JSON。")
+
+    report["module"] = {
+        "module_id": module_id,
+        "module_name": module_name,
+        "tool_type": tool_type,
+        "entry_file": entry_file,
+        "entry_path": str(entry_path) if entry_path else "",
+        "source_dir": str(source_dir) if source_dir else "",
+        "param_json_path": param_json_path_str,
+        "description": description,
+        "python_executable": python_executable or python_executable_raw,
+        "python_env_mode": python_env_mode,
+    }
+    report["inputs"] = inputs
+    report["count"] = len(inputs)
+
+    _dedupe_report_items(report)
+    report["ok"] = len(report.get("errors") or []) == 0
+    report["can_install"] = report["ok"] and len(report.get("missing_files") or []) == 0
+    return report
+
 @app.post("/api/auth/login")
 def api_login(payload: LoginRequest):
     user = verify_user(payload.username, payload.password, payload.role)
@@ -2610,60 +3272,70 @@ def api_register(payload: RegisterRequest):
         return {"ok": True, "user": sanitize_user(user)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-def install_module_from_folder(folder_path: Path, tool_type: str | None = None) -> dict:
-    if not folder_path.exists() or not folder_path.is_dir():
-        raise HTTPException(status_code=400, detail=f"模块文件夹不存在: {folder_path}")
 
-    module_json_path = folder_path / "module.json"
-    if not module_json_path.exists():
-        candidates = list(folder_path.rglob("module.json"))
-        if not candidates:
-            raise HTTPException(status_code=400, detail="模块文件夹中未找到 module.json")
-        module_json_path = candidates[0]
+def install_module_from_folder(
+    folder_path: Path,
+    tool_type: str | None = None,
+    collect_dependencies: bool = True,
+) -> dict:
+    """安装本地 C++/可执行模块文件夹，并在复制前校验 module.json 和缺失文件。"""
+    validation = validate_cpp_module_folder(
+        folder_path,
+        tool_type=tool_type,
+        collect_dependencies=True,
+        copy_dependencies=False,
+    )
+    if not validation.get("can_install"):
+        raise_cpp_validation_error(validation)
 
-    module_root = module_json_path.parent
-    module_data = json.loads(module_json_path.read_text(encoding="utf-8"))
-
+    module_data = validation["module"]
+    module_root = Path(validation["module_root"])
     selected_tool_type = (
         normalize_tool_key(tool_type or module_data.get("tool_type") or "")
         or guess_module_tool_type(module_data)
     )
-
     module_data["tool_type"] = selected_tool_type
     ensure_toolbar_exists(selected_tool_type)
 
-    module_id = str(module_data.get("id") or "").strip()
-    if not module_id:
-        raise HTTPException(status_code=400, detail="module.json 缺少 id")
-
-    target_dir = INSTALLED_MODULES_DIR / module_id
-
-    if target_dir.exists():
-        safe_rmtree(target_dir)
-
-    shutil.copytree(module_root, target_dir)
-
-    executable = str(module_data.get("executable") or "").strip()
-    if executable:
-        exe_path = resolve_packaged_module_path(
-            raw_value=executable,
-            module_id=module_id,
-            target_dir=target_dir,
-            default_path=target_dir,
-        )
-        module_data["executable"] = to_project_relative_path(exe_path)
-
-    working_dir = str(module_data.get("working_dir") or ".").strip()
-    wd_path = resolve_packaged_module_path(
-        raw_value=working_dir,
-        module_id=module_id,
-        target_dir=target_dir,
-        default_path=target_dir,
+    return install_validated_cpp_module(
+        module_root=module_root,
+        module_data=module_data,
+        collect_dependencies=collect_dependencies,
     )
-    module_data["working_dir"] = to_project_relative_path(wd_path)
 
-    upsert_module(module_data)
-    return module_data
+@app.post("/api/admin/modules/validate-cpp-folder")
+def api_validate_cpp_module_folder(
+    payload: InstallModuleFolderRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+
+    folder_path = Path(payload.folder_path).expanduser().resolve()
+    try:
+        report = validate_cpp_module_folder(
+            folder_path,
+            tool_type=payload.tool_type,
+            collect_dependencies=payload.auto_collect_dependencies,
+            copy_dependencies=False,
+        )
+    except Exception as exc:
+        # 校验接口不能只给前端一个 500 / Failed to fetch。
+        # 任何未预料的异常都转换成结构化报告，前端可以直接显示“哪里错了”。
+        report = make_cpp_validation_report(folder_path)
+        _add_error(
+            report,
+            "backend.validate_cpp_module_folder",
+            f"后端校验过程异常：{type(exc).__name__}: {exc}",
+            "查看后端控制台日志；也可以先检查 module.json 是否存在、JSON 是否合法、executable 指向的 exe 是否存在。",
+            traceback="".join(traceback.format_exception_only(type(exc), exc)).strip(),
+        )
+        _dedupe_report_items(report)
+
+    return {
+        "ok": bool(report.get("ok")),
+        "message": "C++ 可执行模块校验通过" if report.get("ok") else "C++ 可执行模块校验未通过",
+        **report,
+    }
 
 
 @app.post("/api/admin/modules/install-folder")
@@ -2673,14 +3345,28 @@ def api_install_module_folder(
 ):
     require_admin(authorization)
 
-    module_data = install_module_from_folder(
-        Path(payload.folder_path).expanduser().resolve(),
-        payload.tool_type,
-    )
+    try:
+        module_data = install_module_from_folder(
+            Path(payload.folder_path).expanduser().resolve(),
+            payload.tool_type,
+            collect_dependencies=payload.auto_collect_dependencies,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        report = make_cpp_validation_report(payload.folder_path)
+        _add_error(
+            report,
+            "backend.install_folder",
+            f"安装过程异常：{type(exc).__name__}: {exc}",
+            "先点“检查模块规范”，按错误提示修正后再安装；如果检查通过但安装失败，请查看后端控制台日志。",
+            traceback="".join(traceback.format_exception_only(type(exc), exc)).strip(),
+        )
+        raise_cpp_validation_error(report)
 
     return {
         "ok": True,
-        "message": "模块文件夹安装成功",
+        "message": "C++ 模块文件夹安装成功",
         "module": module_data,
     }
 """新增 /api/admin/modules/upload-python
@@ -2728,7 +3414,7 @@ def api_upload_python_module(
 
         target_dir = INSTALLED_MODULES_DIR / safe_module_id
         if target_dir.exists():
-            safe_rmtree(target_dir)
+            shutil.rmtree(target_dir)
 
         target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3011,11 +3697,9 @@ def api_delete_module(module_id: str, authorization: str | None = Header(default
     if not result.get("removed"):
         raise HTTPException(status_code=404, detail="模块不存在")
 
-    warnings = result.get("cleanup_warnings") or []
-
     return {
         "ok": True,
-        "message": "模块记录已删除" if warnings else "模块及本地文件已删除",
+        "message": "模块及本地文件已删除",
         **result,
     }
 
@@ -3043,6 +3727,28 @@ def api_upload_module_zip(
         if temp_zip.exists():
             temp_zip.unlink(missing_ok=True)
 
+
+@app.post("/api/admin/modules/validate-python-module-config")
+def api_validate_python_module_config(
+    payload: PythonModuleConfigRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+
+    try:
+        return validate_python_module_config_file(payload.path)
+    except Exception as exc:
+        report = make_python_validation_report(payload.path)
+        _add_error(
+            report,
+            "backend.validate_python_module_config_file",
+            f"后端校验过程异常：{type(exc).__name__}: {exc}",
+            "查看后端控制台日志；也可以先检查 python_module.json 是否存在、JSON 是否合法、source_dir/entry_file/param_json_path 是否正确。",
+            traceback="".join(traceback.format_exception_only(type(exc), exc)).strip(),
+        )
+        _dedupe_report_items(report)
+        return report
+
 @app.post("/api/admin/modules/parse-python-module-config")
 def api_parse_python_module_config(
     payload: PythonModuleConfigRequest,
@@ -3050,12 +3756,17 @@ def api_parse_python_module_config(
 ):
     require_admin(authorization)
 
+    validation = validate_python_module_config_file(payload.path)
+    if not validation.get("can_install"):
+        raise_python_validation_error(validation)
+
     config, config_path = load_python_module_config(payload.path)
     inputs = infer_inputs_from_param_json(config["param_json"])
 
     return {
         "ok": True,
         "config_path": str(config_path),
+        "validation": validation,
         "module": {
             "module_id": config["module_id"],
             "module_name": config["module_name"],
@@ -3078,6 +3789,10 @@ def api_upload_python_config_module(
     authorization: str | None = Header(default=None),
 ):
     require_admin(authorization)
+
+    validation = validate_python_module_config_file(payload.path)
+    if not validation.get("can_install"):
+        raise_python_validation_error(validation)
 
     config, _ = load_python_module_config(payload.path)
 
@@ -3151,6 +3866,8 @@ def api_install_modules_from_local_drop(
             module_data = install_uploaded_zip(zip_path, selected_tool_type)
             installed.append(module_data)
             archive_installed_zip(zip_path)
+        except HTTPException as e:
+            failed.append({"name": zip_path.name, "error": e.detail})
         except Exception as e:
             failed.append({"name": zip_path.name, "error": str(e)})
 

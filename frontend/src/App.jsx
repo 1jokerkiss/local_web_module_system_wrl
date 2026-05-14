@@ -28,6 +28,7 @@ import {
   uploadPythonFolderModule,
   parseModuleParamJson,
   parsePythonModuleConfig,
+  validatePythonModuleConfig,
   uploadPythonModuleConfig,
   listDropZips,
   installLocalDropModules,
@@ -131,6 +132,23 @@ const cppExecutableModuleTemplate = {
 
 function getCppExecutableModuleTemplateText() {
   return JSON.stringify(cppExecutableModuleTemplate, null, 2);
+}
+
+
+const pythonModuleConfigTemplate = {
+  module_id: 'H8_CLOUD_TYPE',
+  module_name: '葵花8号云类型反演',
+  tool_type: 'cloud',
+  entry_file: 'CM_CTH.py',
+  source_dir: '.',
+  param_json_path: 'config.json',
+  description: '葵花8号卫星云类型反演 Python 源码模块',
+  python_env_mode: 'existing',
+  python_executable: 'D:/Python/Python38/python.exe',
+};
+
+function getPythonModuleConfigTemplateText() {
+  return JSON.stringify(pythonModuleConfigTemplate, null, 2);
 }
 
 function downloadTextFile(filename, text) {
@@ -1487,6 +1505,8 @@ export default function App() {
   const [pythonModuleConfigPreview, setPythonModuleConfigPreview] = useState(null);
   const [pythonParamInputs, setPythonParamInputs] = useState([]);
   const [pythonUploadMsg, setPythonUploadMsg] = useState('');
+  const [pythonValidation, setPythonValidation] = useState(null);
+  const [pythonValidationLoading, setPythonValidationLoading] = useState(false);
   const [newToolbarForm, setNewToolbarForm] = useState({ key: '', label: '' });
   const [editingToolbarKey, setEditingToolbarKey] = useState('');
   const [toolbarEditForm, setToolbarEditForm] = useState({ key: '', label: '' });
@@ -1863,20 +1883,80 @@ async function browsePythonModuleConfigJson() {
     if (!result?.path) return;
 
     setPythonModuleConfigPath(result.path);
-    setPythonUploadMsg('正在解析 Python 模块配置 JSON...');
-
-    const data = await parsePythonModuleConfig(result.path);
-
-    setPythonModuleConfigPreview(data?.module || null);
-    setPythonParamInputs(Array.isArray(data?.inputs) ? data.inputs : []);
-    setPythonUploadMsg(`已识别 ${Array.isArray(data?.inputs) ? data.inputs.length : 0} 个参数`);
+    await validatePythonModuleConfigPath(result.path, { silent: false });
   } catch (e) {
-    setPythonModuleConfigPath('');
-    setPythonModuleConfigPreview(null);
-    setPythonParamInputs([]);
-    setPythonUploadMsg(e?.message || '解析 Python 模块配置 JSON 失败');
+    setPythonUploadMsg(e?.message || '选择 Python 模块配置 JSON 失败');
   }
 }
+
+async function validatePythonModuleConfigPath(pathValue = pythonModuleConfigPath, options = {}) {
+  const path = String(pathValue || '').trim();
+  if (!path) {
+    setPythonUploadMsg('请选择 Python 模块配置 JSON');
+    setPythonValidation(null);
+    setPythonModuleConfigPreview(null);
+    setPythonParamInputs([]);
+    return null;
+  }
+
+  setPythonValidationLoading(true);
+  if (!options.silent) setPythonUploadMsg('正在检查 Python 模块配置 JSON...');
+
+  try {
+    const data = await validatePythonModuleConfig(path);
+    setPythonValidation(data);
+    setPythonModuleConfigPreview(data?.module || null);
+    setPythonParamInputs(Array.isArray(data?.inputs) ? data.inputs : []);
+
+    const errorCount = Array.isArray(data?.errors) ? data.errors.length : 0;
+    const warningCount = Array.isArray(data?.warnings) ? data.warnings.length : 0;
+    const missingCount = Array.isArray(data?.missing_files) ? data.missing_files.length : 0;
+    const inputCount = Array.isArray(data?.inputs) ? data.inputs.length : 0;
+
+    if (data?.can_install) {
+      setPythonUploadMsg(`Python 配置检查通过：错误 0 个，警告 ${warningCount} 个，缺失 ${missingCount} 个，已识别 ${inputCount} 个参数。可以安装。`);
+    } else {
+      setPythonUploadMsg(`Python 配置检查未通过：错误 ${errorCount} 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。请先按下方提示修改。`);
+    }
+
+    return data;
+  } catch (e) {
+    setPythonValidation(null);
+    setPythonModuleConfigPreview(null);
+    setPythonParamInputs([]);
+    setPythonUploadMsg(e?.message || 'Python 模块配置 JSON 检查失败');
+    return null;
+  } finally {
+    setPythonValidationLoading(false);
+  }
+}
+function looksLikeCppValidationReport(value) {
+  return !!(
+    value &&
+    typeof value === 'object' &&
+    (Array.isArray(value.errors) || Array.isArray(value.missing_files) || Array.isArray(value.warnings))
+  );
+}
+
+function getCppValidationReportFromError(error) {
+  const detail = error?.detail;
+  if (looksLikeCppValidationReport(detail)) return detail;
+  if (looksLikeCppValidationReport(detail?.detail)) return detail.detail;
+  return null;
+}
+
+function buildFetchFailedUploadMessage(error) {
+  const msg = String(error?.message || '请求失败');
+  if (msg.includes('Failed to fetch') || error?.status === 0) {
+    return [
+      '请求没有到达后端，所以前端拿不到 module.json 的具体错误。',
+      '请确认：1）后端服务正在运行；2）已经用新版 main.py 重启后端；3）前端请求地址和后端端口一致；4）浏览器控制台 Network 里 /api/admin/modules/validate-cpp-folder 不是红色网络失败。',
+      `原始错误：${msg}`,
+    ].join('\n');
+  }
+  return msg;
+}
+
 async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options = {}) {
   const path = String(pathValue || '').trim();
   if (!path) {
@@ -1913,8 +1993,14 @@ async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options
 
     return data;
   } catch (e) {
+    const detailReport = getCppValidationReportFromError(e);
+    if (detailReport) {
+      setCppValidation(detailReport);
+      setUploadMsg(detailReport.message || 'C++ 模块检查未通过，请按下方提示修改。');
+      return detailReport;
+    }
     setCppValidation(null);
-    setUploadMsg(e?.message || 'C++ 模块检查失败');
+    setUploadMsg(buildFetchFailedUploadMessage(e));
     return null;
   } finally {
     setCppValidationLoading(false);
@@ -1954,7 +2040,13 @@ async function installModuleFolder() {
 
     await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
   } catch (e) {
-    setUploadMsg(e?.message || 'C++ 可执行模块安装失败');
+    const detailReport = getCppValidationReportFromError(e);
+    if (detailReport) {
+      setCppValidation(detailReport);
+      setUploadMsg(detailReport.message || 'C++ 可执行模块安装失败，请按下方提示修改。');
+      return;
+    }
+    setUploadMsg(buildFetchFailedUploadMessage(e));
   }
 }
 
@@ -2267,7 +2359,41 @@ function renderValidationItems(title, items, color = '#4f6682') {
               <>
                 <div><strong>{item.field || item.path || `第 ${idx + 1} 项`}</strong></div>
                 <div>{item.message || item.reason || ''}</div>
+                {(item.line || item.column) && (
+                  <div style={{ color: '#b45309' }}>位置：第 {item.line || '-'} 行，第 {item.column || '-'} 列</div>
+                )}
+                {item.encoding && <div style={{ color: '#64748b' }}>文件编码：{item.encoding}</div>}
                 {item.suggestion && <div style={{ color: '#64748b' }}>建议：{item.suggestion}</div>}
+                {item.snippet && (
+                  <pre
+                    style={{
+                      marginTop: 6,
+                      background: '#0f172a',
+                      color: '#e2e8f0',
+                      borderRadius: 8,
+                      padding: 10,
+                      overflow: 'auto',
+                      whiteSpace: 'pre-wrap',
+                    }}
+                  >
+                    {item.snippet}
+                  </pre>
+                )}
+                {item.traceback && (
+                  <pre
+                    style={{
+                      marginTop: 6,
+                      background: '#fff7ed',
+                      color: '#9a3412',
+                      borderRadius: 8,
+                      padding: 10,
+                      overflow: 'auto',
+                      whiteSpace: 'pre-wrap',
+                    }}
+                  >
+                    {item.traceback}
+                  </pre>
+                )}
               </>
             ) : (
               <div>{String(item)}</div>
@@ -2275,6 +2401,64 @@ function renderValidationItems(title, items, color = '#4f6682') {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+
+
+function renderPythonValidationReport() {
+  if (!pythonValidation) return null;
+  const canInstall = !!pythonValidation.can_install;
+  const module = pythonValidation.module || {};
+
+  return (
+    <div
+      style={{
+        border: '1px solid #d7e3f0',
+        borderRadius: 14,
+        background: canInstall ? 'rgba(34,197,94,0.06)' : 'rgba(239,68,68,0.06)',
+        padding: 14,
+        color: '#173353',
+        lineHeight: 1.75,
+      }}
+    >
+      <div style={{ fontWeight: 900, color: canInstall ? '#1f7f36' : '#b42318', marginBottom: 6 }}>
+        {canInstall ? 'Python 配置检查通过，可以安装' : 'Python 配置检查未通过，请先修改'}
+      </div>
+      <div style={{ fontSize: 13, color: '#4f6682', wordBreak: 'break-all' }}>
+        配置 JSON：{pythonValidation.config_path || '-'}
+      </div>
+      <div style={{ fontSize: 13, color: '#4f6682', wordBreak: 'break-all' }}>
+        源码目录：{module.source_dir || '-'}
+      </div>
+
+      {module && (
+        <div style={{ marginTop: 8, fontSize: 13 }}>
+          <div><strong>识别模块：</strong>{module.module_name || '-'}（{module.module_id || '-'}）</div>
+          <div>所属工具栏：{module.tool_type || '未填写，安装时会尝试推断'}</div>
+          <div>入口脚本：{module.entry_file || '-'}</div>
+          <div style={{ wordBreak: 'break-all' }}>参数 JSON：{module.param_json_path || '使用 param_template 或默认 config.json'}</div>
+          <div>Python 环境模式：{module.python_env_mode || 'create_venv'}</div>
+          <div style={{ wordBreak: 'break-all' }}>Python 解释器：{module.python_executable || '未指定'}</div>
+        </div>
+      )}
+
+      {renderValidationItems('错误', pythonValidation.errors, '#b42318')}
+      {renderValidationItems('缺少文件/文件夹', pythonValidation.missing_files, '#b45309')}
+      {renderValidationItems('警告', pythonValidation.warnings, '#815b00')}
+      {renderValidationItems('修改建议', pythonValidation.suggestions, '#235ed8')}
+
+      {Array.isArray(pythonValidation.inputs) && pythonValidation.inputs.length > 0 && (
+        <div style={{ marginTop: 12, borderTop: '1px solid #d7e3f0', paddingTop: 10 }}>
+          <div style={{ fontWeight: 900, color: '#12385f', marginBottom: 6 }}>
+            参数识别：{pythonValidation.inputs.length} 个
+          </div>
+          <div style={{ fontSize: 13, color: '#4f6682' }}>
+            系统会根据参数 JSON 自动生成运行表单；路径类字段会按 key 和默认值自动判断。
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2411,6 +2595,12 @@ async function uploadPythonConfigJson() {
     return;
   }
 
+  const validation = await validatePythonModuleConfigPath(pythonModuleConfigPath, { silent: true });
+  if (!validation?.can_install) {
+    setPythonUploadMsg('Python 配置 JSON 没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
+    return;
+  }
+
   setPythonUploadMsg('正在读取配置 JSON、创建独立 Python 环境并安装模块，请稍等...');
 
   try {
@@ -2419,6 +2609,7 @@ async function uploadPythonConfigJson() {
     setPythonModuleConfigPath('');
     setPythonModuleConfigPreview(null);
     setPythonParamInputs([]);
+    setPythonValidation(null);
     setPythonUploadMsg('');
 
     await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
@@ -3504,11 +3695,13 @@ function renderTaskManagementPage() {
                             readOnly
                             placeholder="请选择 python_module.json"
                           />
-                          <button style={styles.whiteBtn} onClick={browsePythonModuleConfigJson}>
-                            浏览并识别
+                          <button style={styles.whiteBtn} onClick={browsePythonModuleConfigJson} disabled={pythonValidationLoading}>
+                            {pythonValidationLoading ? '检查中...' : '浏览并检查'}
                           </button>
                         </div>
                       </div>
+
+                      {renderPythonValidationReport()}
 
                       {pythonModuleConfigPreview && (
                         <div
@@ -3570,7 +3763,36 @@ function renderTaskManagementPage() {
                       )}
 
                       <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                        <button style={styles.blueBtn} onClick={uploadPythonConfigJson}>
+                        <button
+                          style={styles.whiteBtn}
+                          onClick={() => downloadTextFile('python_module.json', getPythonModuleConfigTemplateText())}
+                        >
+                          下载 Python JSON 模板
+                        </button>
+
+                        <button
+                          style={styles.whiteBtn}
+                          onClick={async () => {
+                            try {
+                              await navigator.clipboard.writeText(getPythonModuleConfigTemplateText());
+                              setPythonUploadMsg('已复制 Python 模块配置 JSON 模板。用户需要按自己的源码目录、入口脚本、参数 JSON 和 Python 环境路径修改。');
+                            } catch {
+                              setPythonUploadMsg(getPythonModuleConfigTemplateText());
+                            }
+                          }}
+                        >
+                          复制模板内容
+                        </button>
+
+                        <button
+                          style={styles.whiteBtn}
+                          onClick={() => validatePythonModuleConfigPath(pythonModuleConfigPath)}
+                          disabled={pythonValidationLoading}
+                        >
+                          {pythonValidationLoading ? '检查中...' : '检查 JSON 规范'}
+                        </button>
+
+                        <button style={styles.blueBtn} onClick={uploadPythonConfigJson} disabled={pythonValidationLoading}>
                           根据配置 JSON 安装模块
                         </button>
 
@@ -3580,6 +3802,7 @@ function renderTaskManagementPage() {
                             setPythonModuleConfigPath('');
                             setPythonModuleConfigPreview(null);
                             setPythonParamInputs([]);
+                            setPythonValidation(null);
                             setPythonUploadMsg('');
                           }}
                         >
