@@ -103,6 +103,18 @@ function formatApiErrorDetail(detail, fallback) {
   return String(detail);
 }
 
+function makeApiError(message, status, detail) {
+  const err = new Error(message);
+  err.status = status || 0;
+  err.detail = detail;
+  return err;
+}
+
+function isLikelyNetworkError(error) {
+  const text = String(error?.message || error || '').toLowerCase();
+  return text.includes('failed to fetch') || text.includes('networkerror') || text.includes('load failed');
+}
+
 function getToken() {
   return localStorage.getItem('token') || '';
 }
@@ -134,18 +146,28 @@ async function requestBlob(url, options = {}) {
     headers['Content-Type'] = 'application/json';
   }
 
-  const resp = await fetch(`${API_BASE}${url}`, {
-    ...options,
-    headers,
-  });
+  let resp;
+  try {
+    resp = await fetch(`${API_BASE}${url}`, {
+      ...options,
+      headers,
+    });
+  } catch (error) {
+    const baseMsg = isLikelyNetworkError(error)
+      ? '请求没有到达后端：请确认后端服务正在运行、前端代理正确，并且已经重启加载新版 main.py。原始错误：Failed to fetch'
+      : `网络请求失败：${error?.message || error}`;
+    throw makeApiError(baseMsg, 0, null);
+  }
 
   if (!resp.ok) {
     let msg = `请求失败: ${resp.status}`;
+    let detail = null;
     try {
       const data = await resp.json();
-      msg = formatApiErrorDetail(data.detail, msg);
+      detail = data.detail ?? data;
+      msg = formatApiErrorDetail(detail, msg);
     } catch {}
-    throw new Error(msg);
+    throw makeApiError(msg, resp.status, detail);
   }
 
   return resp.blob();
@@ -165,18 +187,28 @@ async function request(url, options = {}) {
     headers['Content-Type'] = 'application/json';
   }
 
-  const resp = await fetch(`${API_BASE}${url}`, {
-    ...options,
-    headers,
-  });
+  let resp;
+  try {
+    resp = await fetch(`${API_BASE}${url}`, {
+      ...options,
+      headers,
+    });
+  } catch (error) {
+    const baseMsg = isLikelyNetworkError(error)
+      ? '请求没有到达后端：请确认后端服务正在运行、前端代理正确，并且已经重启加载新版 main.py。原始错误：Failed to fetch'
+      : `网络请求失败：${error?.message || error}`;
+    throw makeApiError(baseMsg, 0, null);
+  }
 
   if (!resp.ok) {
     let msg = `请求失败: ${resp.status}`;
+    let detail = null;
     try {
       const data = await resp.json();
-      msg = formatApiErrorDetail(data.detail, msg);
+      detail = data.detail ?? data;
+      msg = formatApiErrorDetail(detail, msg);
     } catch {}
-    throw new Error(msg);
+    throw makeApiError(msg, resp.status, detail);
   }
 
   const contentType = resp.headers.get('content-type') || '';
@@ -185,6 +217,7 @@ async function request(url, options = {}) {
   }
   return resp.text();
 }
+
 
 export async function login(username, password, role) {
   return request('/api/auth/login', {
@@ -477,6 +510,13 @@ export async function validateCppModuleFolder(payload) {
       tool_type: payload.tool_type || '',
       auto_collect_dependencies: payload.auto_collect_dependencies !== false,
     }),
+  });
+}
+
+export async function validatePythonModuleConfig(path) {
+  return request('/api/admin/modules/validate-python-module-config', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
   });
 }
 
