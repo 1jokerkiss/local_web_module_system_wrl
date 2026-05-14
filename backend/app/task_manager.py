@@ -587,12 +587,15 @@ class TaskManager:
             if pipe is None:
                 return
 
-            for raw in iter(pipe.readline, ""):
+            for raw in iter(pipe.readline, b""):
                 if not raw:
                     break
-                line = raw.rstrip("\r\n")
+
+                line = self.decode_process_output(raw).rstrip("\r\n")
+
                 if line:
                     self.append_log(task_id, f"[{prefix}] {line}")
+
         except Exception as e:
             self.append_log(task_id, f"[PYTHON-LOG-ERROR] {prefix}: {repr(e)}")
         finally:
@@ -657,6 +660,24 @@ class TaskManager:
         }
         return hints.get(return_code)
 
+    @staticmethod
+    def decode_process_output(raw: bytes) -> str:
+        """
+        子进程日志解码：
+        1. Python 模块优先 UTF-8；
+        2. Windows C++/exe 模块可能是 GBK/CP936；
+        3. 最后兜底 replacement，避免接口崩溃。
+        """
+        if raw is None:
+            return ""
+
+        for encoding in ("utf-8", "gbk", "cp936"):
+            try:
+                return raw.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+
+        return raw.decode("utf-8", errors="replace")
     def _run_process_task(
         self,
         task_id: str,
@@ -681,9 +702,8 @@ class TaskManager:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                text=False,
+                bufsize=0,
                 env=merged_env,
                 creationflags=creationflags,
             )

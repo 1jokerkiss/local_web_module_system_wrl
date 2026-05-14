@@ -1590,6 +1590,14 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
     runtime_env["OPENBLAS_NUM_THREADS"] = "1"
     runtime_env["OMP_NUM_THREADS"] = "1"
     runtime_env["GOTO_NUM_THREADS"] = "1"
+    # 统一 Python 子进程输出编码，避免中文路径、tqdm 进度条在日志窗口乱码
+    runtime_env["PYTHONIOENCODING"] = "utf-8"
+    runtime_env["PYTHONUTF8"] = "1"
+    runtime_env["PYTHONUNBUFFERED"] = "1"
+
+    # tqdm 默认会输出 unicode 进度条块字符，在 Windows 日志管道里容易乱码；
+    # 让 tqdm 使用 ASCII 进度条，例如 ####，避免出现 ��。
+    runtime_env["TQDM_ASCII"] = "1"
 
     # 便于排查 DLL 搜索路径
     runtime_env["MODULE_DLL_DIRS"] = ";".join(ordered_dirs)

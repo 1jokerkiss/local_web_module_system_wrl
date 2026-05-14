@@ -690,6 +690,8 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
               overflow: 'auto',
               fontSize: 12,
               whiteSpace: 'pre-wrap',
+              fontFamily: 'Consolas, "Microsoft YaHei UI", monospace',
+              lineHeight: 1.45,
             }}
           >
             {taskLogs.length ? taskLogs.join('\n') : '暂无日志'}
