@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import subprocess
 import threading
 import traceback
@@ -609,37 +608,14 @@ class TaskManager:
             if pipe is None:
                 return
 
-            buffer = bytearray()
-            last_line = {}
-
-            while True:
-                chunk = pipe.read(256)
-
-                if not chunk:
+            for raw in iter(pipe.readline, b""):
+                if not raw:
                     break
 
-                for b in chunk:
-                    # tqdm 使用 \r 原地刷新，普通 print 使用 \n 换行；
-                    # 两种都应该立刻刷到前端。
-                    if b in (10, 13):  # \n or \r
-                        if buffer:
-                            self._append_stream_bytes(
-                                task_id,
-                                prefix,
-                                bytes(buffer),
-                                last_line,
-                            )
-                            buffer.clear()
-                    else:
-                        buffer.append(b)
+                line = self.decode_process_output(raw).rstrip("\r\n")
 
-            if buffer:
-                self._append_stream_bytes(
-                    task_id,
-                    prefix,
-                    bytes(buffer),
-                    last_line,
-                )
+                if line:
+                    self.append_log(task_id, f"[{prefix}] {line}")
 
         except Exception as e:
             self.append_log(task_id, f"[PYTHON-LOG-ERROR] {prefix}: {repr(e)}")
@@ -680,25 +656,40 @@ class TaskManager:
             f"[INFO] GOTO_NUM_THREADS = {merged_env.get('GOTO_NUM_THREADS', '')}",
         )
 
-        linked_files = merged_env.get("RUNTIME_SHARED_LINKED_FILES")
-        copied_small_files = merged_env.get("RUNTIME_COPIED_SMALL_FILES")
-        shared_bytes = merged_env.get("RUNTIME_SHARED_BYTES")
-        if linked_files is not None:
-            try:
-                shared_gb = int(shared_bytes or "0") / 1024 / 1024 / 1024
-                self.append_log(
-                    task_id,
-                    (
-                        f"[INFO] runtime/source 创建完成：固定大文件链接 {linked_files} 个，"
-                        f"普通小文件复制 {copied_small_files or 0} 个，"
-                        f"避免重复复制约 {shared_gb:.2f} GB"
-                    ),
-                )
-            except Exception:
-                self.append_log(
-                    task_id,
-                    f"[INFO] runtime/source 创建完成：固定大文件链接 {linked_files} 个，普通小文件复制 {copied_small_files or 0} 个",
-                )
+        runtime_source_mode = merged_env.get("RUNTIME_SOURCE_MODE")
+        if runtime_source_mode == "shared_no_copy":
+            self.append_log(
+                task_id,
+                (
+                    "[INFO] Python runtime 使用 shared_no_copy 模式："
+                    "不复制源码目录、models、resources 或 pkl 文件；"
+                    "入口脚本和固定资源直接从已安装模块目录读取"
+                ),
+            )
+            if merged_env.get("RUNTIME_SHARED_SOURCE_DIR"):
+                self.append_log(task_id, f"[INFO] 已安装模块源码目录 = {merged_env.get('RUNTIME_SHARED_SOURCE_DIR')}")
+            if merged_env.get("RUNTIME_CONFIG_ONLY_DIR"):
+                self.append_log(task_id, f"[INFO] 本任务只生成独立配置目录 = {merged_env.get('RUNTIME_CONFIG_ONLY_DIR')}")
+        else:
+            linked_files = merged_env.get("RUNTIME_SHARED_LINKED_FILES")
+            copied_small_files = merged_env.get("RUNTIME_COPIED_SMALL_FILES")
+            shared_bytes = merged_env.get("RUNTIME_SHARED_BYTES")
+            if linked_files is not None:
+                try:
+                    shared_gb = int(shared_bytes or "0") / 1024 / 1024 / 1024
+                    self.append_log(
+                        task_id,
+                        (
+                            f"[INFO] runtime/source 创建完成：固定大文件链接 {linked_files} 个，"
+                            f"普通小文件复制 {copied_small_files or 0} 个，"
+                            f"避免重复复制约 {shared_gb:.2f} GB"
+                        ),
+                    )
+                except Exception:
+                    self.append_log(
+                        task_id,
+                        f"[INFO] runtime/source 创建完成：固定大文件链接 {linked_files} 个，普通小文件复制 {copied_small_files or 0} 个",
+                    )
 
         config_arg = None
 
@@ -750,37 +741,6 @@ class TaskManager:
                 continue
 
         return raw.decode("utf-8", errors="replace")
-
-    @staticmethod
-    def clean_process_line(text: str) -> str:
-        """
-        清理子进程输出：
-        1. 去掉 ANSI 控制符；
-        2. 去掉 Unicode replacement character，避免出现 ��；
-        3. 去掉其它不可见控制符，但保留普通文本。
-        """
-        text = str(text or "")
-        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
-        text = text.replace("\ufffd", "").replace("�", "")
-        text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
-        return text.strip()
-
-    def _append_stream_bytes(self, task_id: str, prefix: str, raw: bytes, last_line: dict):
-        if not raw:
-            return
-
-        line = self.clean_process_line(self.decode_process_output(raw))
-
-        if not line:
-            return
-
-        # tqdm 会频繁刷新同一行，重复内容不反复写入，避免 tasks.json 暴涨。
-        key = f"{prefix}_last"
-        if last_line.get(key) == line:
-            return
-
-        last_line[key] = line
-        self.append_log(task_id, f"[{prefix}] {line}")
     def _run_process_task(
         self,
         task_id: str,
