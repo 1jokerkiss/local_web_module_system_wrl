@@ -19,7 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
-
+import stat
+import time
 from .auth import (
     admin_reset_password,
     create_token,
@@ -98,6 +99,7 @@ task_manager = TaskManager(TASKS_FILE)
 def api_system_resources(authorization: str | None = Header(default=None)):
     """返回本机 CPU 核数、建议进程数、上限进程数和当前任务资源占用。"""
     get_current_user(authorization)
+    task_manager.kick_scheduler()
     return task_manager.get_system_resource_info()
 
 
@@ -2021,6 +2023,99 @@ def load_python_module_config(raw_path: str) -> tuple[dict, Path]:
         "python_executable": python_executable,
         "python_env_mode": python_env_mode,
     }, config_path
+def make_python_install_release_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def remove_tree_windows_safe(path: Path, title: str = "删除目录"):
+    path = Path(path)
+
+    if not path.exists():
+        return
+
+    def on_rm_error(func, p, exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:
+            pass
+
+    last_error = None
+
+    for _ in range(6):
+        try:
+            shutil.rmtree(path, onerror=on_rm_error)
+            return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.4)
+
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"{title}失败：{path}\n"
+            f"原因：{last_error}\n\n"
+            "通常是文件正在被 Python、GDAL、GIS 软件或资源管理器预览占用。"
+        ),
+    )
+
+
+def copy_or_link_python_module_file(src: str, dst: str):
+    """
+    安装 Python 模块源码时：
+    - 普通 .py/.json/.txt 直接复制；
+    - 大模型、tif、pkl 等优先硬链接，减少磁盘占用；
+    - 硬链接失败再复制。
+    """
+    src_path = Path(src)
+    dst_path = Path(dst)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    link_suffixes = {
+        ".pkl", ".joblib", ".model", ".onnx",
+        ".h5", ".hdf5", ".npy", ".npz",
+        ".pt", ".pth", ".tif", ".tiff", ".nc", ".hdf",
+    }
+
+    try:
+        should_link = (
+            src_path.suffix.lower() in link_suffixes
+            or src_path.stat().st_size >= 20 * 1024 * 1024
+        )
+    except Exception:
+        should_link = False
+
+    if should_link:
+        try:
+            if dst_path.exists():
+                dst_path.unlink()
+            os.link(src_path, dst_path)
+            return str(dst_path)
+        except OSError:
+            pass
+
+    return shutil.copy2(src_path, dst_path)
+
+
+def copy_python_module_source_folder(source_root: Path, source_target_dir: Path):
+    shutil.copytree(
+        source_root,
+        source_target_dir,
+        dirs_exist_ok=True,
+        copy_function=copy_or_link_python_module_file,
+        ignore=shutil.ignore_patterns(
+            "__pycache__",
+            "*.pyc",
+            ".git",
+            ".idea",
+            ".vscode",
+            ".venv",
+            "venv",
+            "env",
+            "module_envs",
+            "runtime",
+        ),
+    )
 def install_python_venv_module_from_values(
     module_id: str,
     module_name: str,
@@ -2036,6 +2131,10 @@ def install_python_venv_module_from_values(
     safe_module_id = sanitize_filename(module_id).strip()
     if not safe_module_id:
         raise HTTPException(status_code=400, detail="模块 ID 不能为空")
+
+    python_env_mode = str(python_env_mode or "create_venv").strip().lower()
+    if python_env_mode not in {"create_venv", "existing"}:
+        raise HTTPException(status_code=400, detail="python_env_mode 只支持 create_venv 或 existing")
 
     source_root = Path(source_dir or "").expanduser()
     if not source_root.is_absolute():
@@ -2066,37 +2165,46 @@ def install_python_venv_module_from_values(
     if not entry_candidate.exists() or not entry_candidate.is_file():
         raise HTTPException(status_code=400, detail=f"未找到 Python 入口文件: {entry_name}")
 
-    target_dir = INSTALLED_MODULES_DIR / safe_module_id
-    if target_dir.exists():
-        shutil.rmtree(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    release_id = make_python_install_release_id()
 
-    source_target_dir = target_dir / "source"
-    shutil.copytree(source_root, source_target_dir, dirs_exist_ok=True)
+    module_root = INSTALLED_MODULES_DIR / safe_module_id
+    releases_root = module_root / "releases"
+    release_dir = releases_root / release_id
+    source_target_dir = release_dir / "source"
 
-    # 保存参数模板
-    param_template_path = target_dir / "param_template.json"
-    param_template_path.write_text(
-        json.dumps(param_json, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    env_dir = PYTHON_MODULE_ENVS_DIR / f"{safe_module_id}_{release_id}"
 
-    rel_entry = entry_candidate.resolve().relative_to(source_root.resolve())
-    installed_entry_script = source_target_dir / rel_entry
+    created_release = False
+    created_env = False
 
-    if python_env_mode == "existing":
-        python_exe = resolve_existing_python_executable(python_executable)
-    else:
-        python_exe = create_python_module_env(
-            safe_module_id,
-            source_target_dir,
-            base_python_executable=python_executable,
+    try:
+        release_dir.mkdir(parents=True, exist_ok=False)
+        created_release = True
+
+        copy_python_module_source_folder(source_root, source_target_dir)
+
+        param_template_path = release_dir / "param_template.json"
+        param_template_path.write_text(
+            json.dumps(param_json, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
 
-    module_json_candidates = list(source_target_dir.rglob("module.json"))
-    if module_json_candidates:
-        module_data = json.loads(module_json_candidates[0].read_text(encoding="utf-8"))
-    else:
+        rel_entry = entry_candidate.resolve().relative_to(source_root.resolve())
+        installed_entry_script = source_target_dir / rel_entry
+
+        if python_env_mode == "existing":
+            python_exe = resolve_existing_python_executable(python_executable)
+            actual_env_dir = python_exe.parent.parent
+        else:
+            python_exe = create_python_module_env(
+                safe_module_id,
+                source_target_dir,
+                base_python_executable=python_executable,
+                env_dir=env_dir,
+            )
+            created_env = True
+            actual_env_dir = env_dir
+
         module_data = {
             "id": safe_module_id,
             "name": module_name or safe_module_id,
@@ -2104,41 +2212,75 @@ def install_python_venv_module_from_values(
             "enabled": True,
         }
 
-    selected_tool_type = (
-        normalize_tool_key(tool_type or module_data.get("tool_type") or "")
-        or guess_module_tool_type(module_data)
-    )
+        selected_tool_type = (
+            normalize_tool_key(tool_type or "")
+            or guess_module_tool_type(module_data)
+        )
 
-    module_data["id"] = safe_module_id
-    module_data["name"] = module_name or module_data.get("name") or safe_module_id
-    module_data["description"] = description or module_data.get("description") or "Python 源码独立环境运行模块"
-    module_data["tool_type"] = selected_tool_type
-    module_data["enabled"] = module_data.get("enabled", True)
-    module_data["runtime_type"] = "python_venv"
-    module_data["python_env_mode"] = python_env_mode
-    module_data["base_python_executable"] = python_executable
-    module_data["config_mode"] = "config_json"
-    module_data["command_template"] = ["{executable}", "{entry_script}", "{config_json}"]
-    module_data["inputs"] = inferred_inputs
-    module_data["param_template"] = to_project_relative_path(param_template_path)
-    module_data["source_dir"] = to_project_relative_path(source_target_dir)
-    module_data["entry_file"] = rel_entry.as_posix()
-    module_data["entry_script"] = to_project_relative_path(installed_entry_script)
-    module_data["python_env_dir"] = to_project_relative_path(PYTHON_MODULE_ENVS_DIR / safe_module_id)
+        module_data["tool_type"] = selected_tool_type
+        module_data["runtime_type"] = "python_venv"
+        module_data["python_env_mode"] = python_env_mode
+        module_data["base_python_executable"] = python_executable
+        module_data["install_release"] = release_id
 
-    module_data["executable"] = to_project_relative_path(python_exe)
-    if python_env_mode == "existing":
-        module_data["python_env_dir"] = str(python_exe.parent.parent)
-    else:
-        module_data["python_env_dir"] = to_project_relative_path(PYTHON_MODULE_ENVS_DIR / safe_module_id)
+        module_data["config_mode"] = "config_json"
+        module_data["command_template"] = ["{executable}", "{entry_script}", "{config_json}"]
+        module_data["inputs"] = inferred_inputs
 
-    module_data["executable"] = to_project_relative_path(python_exe)
-    module_data["working_dir"] = to_project_relative_path(source_target_dir)
+        module_data["param_template"] = to_project_relative_path(param_template_path)
+        module_data["source_dir"] = to_project_relative_path(source_target_dir)
+        module_data["entry_file"] = rel_entry.as_posix()
+        module_data["entry_script"] = to_project_relative_path(installed_entry_script)
 
-    ensure_toolbar_exists(selected_tool_type)
-    upsert_module(module_data)
+        module_data["python_env_dir"] = (
+            str(actual_env_dir)
+            if python_env_mode == "existing"
+            else to_project_relative_path(actual_env_dir)
+        )
+        module_data["executable"] = to_project_relative_path(python_exe)
+        module_data["working_dir"] = to_project_relative_path(source_target_dir)
 
-    return module_data
+        ensure_toolbar_exists(selected_tool_type)
+        upsert_module(module_data)
+
+        return module_data
+
+    except HTTPException:
+        if created_env and env_dir.exists():
+            try:
+                remove_tree_windows_safe(env_dir, title="清理失败的 Python 虚拟环境")
+            except Exception:
+                pass
+
+        if created_release and release_dir.exists():
+            try:
+                remove_tree_windows_safe(release_dir, title="清理失败的 Python 模块版本目录")
+            except Exception:
+                pass
+
+        raise
+
+    except Exception as exc:
+        if created_env and env_dir.exists():
+            try:
+                remove_tree_windows_safe(env_dir, title="清理失败的 Python 虚拟环境")
+            except Exception:
+                pass
+
+        if created_release and release_dir.exists():
+            try:
+                remove_tree_windows_safe(release_dir, title="清理失败的 Python 模块版本目录")
+            except Exception:
+                pass
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Python 模块安装失败：\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                + traceback.format_exc()
+            ),
+        )
 
 def infer_param_input_type(key: str, value: Any) -> str:
     k = str(key or "").lower()
@@ -2465,12 +2607,13 @@ def create_python_module_env(
     module_id: str,
     source_dir: Path,
     base_python_executable: str = "",
+    env_dir: Path | None = None,
 ) -> Path:
     """为 Python 源码模块创建独立 venv，并安装 requirements.txt。"""
-    env_dir = PYTHON_MODULE_ENVS_DIR / module_id
+    env_dir = Path(env_dir) if env_dir else PYTHON_MODULE_ENVS_DIR / module_id
 
     if env_dir.exists():
-        shutil.rmtree(env_dir)
+        remove_tree_windows_safe(env_dir, title="删除旧 Python 虚拟环境")
 
     # 用 --clear 明确创建干净环境，--copies 在 Windows 上比软链接更稳
     base_python = (
@@ -5254,12 +5397,14 @@ def require_own_task(task_id: str, user) -> dict:
 def api_list_tasks(authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
     username = get_username_from_user(user)
+    task_manager.kick_scheduler()
     return task_manager.list_tasks(owner_username=username)
 
 
 @app.get("/api/tasks/{task_id}")
 def api_get_task(task_id: str, authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
+    task_manager.kick_scheduler()
     return require_own_task(task_id, user)
 
 
