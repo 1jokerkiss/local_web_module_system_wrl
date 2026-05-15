@@ -23,13 +23,14 @@ import {
   runModule,
   saveModule,
   deleteModule as deleteModuleApi,
-    uploadModuleFolder,
+  uploadModuleFolder,
   validateCppModuleFolder,
-  uploadPythonFolderModule,
   parseModuleParamJson,
   parsePythonModuleConfig,
   validatePythonModuleConfig,
   uploadPythonModuleConfig,
+  validatePythonModuleFolder,
+  uploadPythonFolderModule,
   listDropZips,
   installLocalDropModules,
   getTask,
@@ -41,7 +42,7 @@ import {
   setAuthToken,
   clearAuthToken,
   getAuthToken,
-    listDataFiles,
+  listDataFiles,
   previewDataFile,
   revealDataFile,
   deleteDataFile,
@@ -143,7 +144,7 @@ const pythonModuleConfigTemplate = {
   source_dir: '.',
   param_json_path: 'config.json',
   description: '葵花8号卫星云类型反演 Python 源码模块',
-  python_env_mode: 'existing',
+  python_env_mode: 'create_venv',
   python_executable: 'D:/Python/Python38/python.exe',
 };
 
@@ -1900,7 +1901,25 @@ async function browsePythonModuleConfigJson() {
     setPythonUploadMsg(e?.message || '选择 Python 模块配置 JSON 失败');
   }
 }
+async function browsePythonModuleFolder() {
+  try {
+    const result = await chooseLocalDir({
+      title: '选择 Python 模块文件夹',
+    });
 
+    if (!result?.path) return;
+
+    setPythonSourceDir(result.path);
+    setPythonModuleConfigPath('');
+    setPythonModuleConfigPreview(null);
+    setPythonParamInputs([]);
+    setPythonValidation(null);
+
+    await validatePythonModuleFolderPath(result.path, { silent: false });
+  } catch (e) {
+    setPythonUploadMsg(e?.message || '选择 Python 模块文件夹失败');
+  }
+}
 async function validatePythonModuleConfigPath(pathValue = pythonModuleConfigPath, options = {}) {
   const path = String(pathValue || '').trim();
   if (!path) {
@@ -1937,6 +1956,55 @@ async function validatePythonModuleConfigPath(pathValue = pythonModuleConfigPath
     setPythonModuleConfigPreview(null);
     setPythonParamInputs([]);
     setPythonUploadMsg(e?.message || 'Python 模块配置 JSON 检查失败');
+    return null;
+  } finally {
+    setPythonValidationLoading(false);
+  }
+}
+async function validatePythonModuleFolderPath(pathValue = pythonSourceDir, options = {}) {
+  const folderPath = String(pathValue || '').trim();
+
+  if (!folderPath) {
+    setPythonUploadMsg('请选择 Python 模块文件夹');
+    setPythonValidation(null);
+    setPythonModuleConfigPreview(null);
+    setPythonParamInputs([]);
+    return null;
+  }
+
+  setPythonValidationLoading(true);
+  if (!options.silent) {
+    setPythonUploadMsg('正在检查 Python 模块文件夹...');
+  }
+
+  try {
+    const data = await validatePythonModuleFolder(folderPath);
+
+    setPythonValidation(data);
+    setPythonModuleConfigPreview(data?.module || null);
+    setPythonParamInputs(Array.isArray(data?.inputs) ? data.inputs : []);
+
+    const errorCount = Array.isArray(data?.errors) ? data.errors.length : 0;
+    const warningCount = Array.isArray(data?.warnings) ? data.warnings.length : 0;
+    const missingCount = Array.isArray(data?.missing_files) ? data.missing_files.length : 0;
+    const inputCount = Array.isArray(data?.inputs) ? data.inputs.length : 0;
+
+    if (data?.can_install) {
+      setPythonUploadMsg(
+        `Python 模块文件夹检查通过：错误 0 个，警告 ${warningCount} 个，缺失 ${missingCount} 个，已识别 ${inputCount} 个参数。可以安装。`
+      );
+    } else {
+      setPythonUploadMsg(
+        `Python 模块文件夹检查未通过：错误 ${errorCount} 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。请先按下方提示修改。`
+      );
+    }
+
+    return data;
+  } catch (e) {
+    setPythonValidation(null);
+    setPythonModuleConfigPreview(null);
+    setPythonParamInputs([]);
+    setPythonUploadMsg(e?.message || 'Python 模块文件夹检查失败');
     return null;
   } finally {
     setPythonValidationLoading(false);
@@ -2601,6 +2669,7 @@ function renderModuleMgmtButton(key, title, desc, onClick) {
       setUploadMsg(e?.message || '本地目录安装失败');
     }
   }
+
 async function uploadPythonConfigJson() {
   if (!pythonModuleConfigPath.trim()) {
     setPythonUploadMsg('请选择 Python 模块配置 JSON');
@@ -2629,6 +2698,39 @@ async function uploadPythonConfigJson() {
     alert('Python 模块已根据配置 JSON 安装成功');
   } catch (e) {
     setPythonUploadMsg(e?.message || 'Python 模块配置 JSON 安装失败');
+  }
+}
+async function uploadPythonFolder() {
+  const folderPath = String(pythonSourceDir || '').trim();
+
+  if (!folderPath) {
+    setPythonUploadMsg('请选择 Python 模块文件夹');
+    return;
+  }
+
+  const validation = await validatePythonModuleFolderPath(folderPath, { silent: true });
+  if (!validation?.can_install) {
+    setPythonUploadMsg('Python 模块文件夹没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
+    return;
+  }
+
+  setPythonUploadMsg('正在根据 python_module.json、config.json、requirements.txt 安装 Python 模块，请稍等...');
+
+  try {
+    await uploadPythonFolderModule(folderPath);
+
+    setPythonSourceDir('');
+    setPythonModuleConfigPath('');
+    setPythonModuleConfigPreview(null);
+    setPythonParamInputs([]);
+    setPythonValidation(null);
+    setPythonUploadMsg('');
+
+    await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
+
+    alert('Python 模块文件夹安装成功');
+  } catch (e) {
+    setPythonUploadMsg(e?.message || 'Python 模块文件夹安装失败');
   }
 }
   async function handleAddToolbar() {
@@ -3693,23 +3795,25 @@ function renderTaskManagementPage() {
                       Python 源代码环境上传
                     </div>
 
-                    <div style={{ color: '#6a7f96', lineHeight: 1.8, marginBottom: 18 }}>
-                      选择一个 Python 模块配置 JSON。该 JSON 用来指向 Python 源码文件夹、入口文件和参数 JSON，
-                      系统会自动识别参数、创建独立 Python 环境，并注册成可运行模块。
+                    <div style={{color: '#6a7f96', lineHeight: 1.8, marginBottom: 18}}>
+                      选择 Python 模块文件夹。该文件夹应包含 python_module.json、config.json、requirements.txt 和入口 .py
+                      文件。
+                      系统会自动读取配置、识别参数、创建独立 Python 环境，并注册成可运行模块。
                     </div>
 
-                    <div style={{ display: 'grid', gap: 16, maxWidth: 960 }}>
+                    <div style={{display: 'grid', gap: 16, maxWidth: 960}}>
                       <div>
-                        <div style={labelStyle}>Python 模块配置 JSON</div>
-                        <div style={{ display: 'flex', gap: 10 }}>
+                        <div style={labelStyle}>Python 模块文件夹</div>
+                        <div style={{display: 'flex', gap: 10}}>
                           <input
-                            style={{ ...styles.input, flex: 1 }}
-                            value={pythonModuleConfigPath}
-                            readOnly
-                            placeholder="请选择 python_module.json"
+                              style={{...styles.input, flex: 1}}
+                              value={pythonSourceDir}
+                              readOnly
+                              placeholder="请选择包含 python_module.json、config.json、requirements.txt 和入口 .py 的文件夹"
                           />
-                          <button style={styles.whiteBtn} onClick={browsePythonModuleConfigJson} disabled={pythonValidationLoading}>
-                            {pythonValidationLoading ? '检查中...' : '浏览并检查'}
+                          <button style={styles.whiteBtn} onClick={browsePythonModuleFolder}
+                                  disabled={pythonValidationLoading}>
+                            {pythonValidationLoading ? '检查中...' : '浏览文件夹并检查'}
                           </button>
                         </div>
                       </div>
@@ -3798,37 +3902,38 @@ function renderTaskManagementPage() {
                         </button>
 
                         <button
-                          style={styles.whiteBtn}
-                          onClick={() => validatePythonModuleConfigPath(pythonModuleConfigPath)}
-                          disabled={pythonValidationLoading}
+                            style={styles.whiteBtn}
+                            onClick={() => validatePythonModuleFolderPath(pythonSourceDir)}
+                            disabled={pythonValidationLoading}
                         >
-                          {pythonValidationLoading ? '检查中...' : '检查 JSON 规范'}
+                          {pythonValidationLoading ? '检查中...' : '检查文件夹规范'}
                         </button>
 
-                        <button style={styles.blueBtn} onClick={uploadPythonConfigJson} disabled={pythonValidationLoading}>
-                          根据配置 JSON 安装模块
+                        <button style={styles.blueBtn} onClick={uploadPythonFolder} disabled={pythonValidationLoading}>
+                          根据模块文件夹安装模块
                         </button>
 
                         <button
-                          style={styles.whiteBtn}
-                          onClick={() => {
-                            setPythonModuleConfigPath('');
-                            setPythonModuleConfigPreview(null);
-                            setPythonParamInputs([]);
-                            setPythonValidation(null);
-                            setPythonUploadMsg('');
-                          }}
+                            style={styles.whiteBtn}
+                            onClick={() => {
+                              setPythonSourceDir('');
+                              setPythonModuleConfigPath('');
+                              setPythonModuleConfigPreview(null);
+                              setPythonParamInputs([]);
+                              setPythonValidation(null);
+                              setPythonUploadMsg('');
+                            }}
                         >
                           清空
                         </button>
                       </div>
 
                       {pythonUploadMsg && (
-                        <div
-                          style={{
-                            whiteSpace: 'pre-wrap',
-                            color:
-                              pythonUploadMsg.includes('失败') ||
+                          <div
+                              style={{
+                                whiteSpace: 'pre-wrap',
+                                color:
+                                    pythonUploadMsg.includes('失败') ||
                               pythonUploadMsg.includes('错误')
                                 ? '#bb2c2c'
                                 : '#4f6682',

@@ -64,6 +64,7 @@ STRICT_LOCAL_BINARY_PACKAGES = {
 PREFER_LOCAL_BINARY_PACKAGES = {
     "numpy",
     "h5py",
+    "netcdf4",
 }
 # Python 源码模块的独立运行环境目录。
 # 方案二：不再把 Python 源码打包成 exe，而是为每个 Python 模块创建独立 venv，
@@ -191,10 +192,15 @@ class InstallModuleFolderRequest(BaseModel):
     auto_collect_dependencies: bool = True
 
 class PythonFolderModuleUploadRequest(BaseModel):
-    source_dir: str
-    param_json_path: str
-    module_id: str
-    module_name: str
+    # 新模式：只传 Python 模块文件夹，后端自动找 python_module.json
+    folder_path: str = ""
+    config_filename: str = "python_module.json"
+
+    # 旧模式：保留，避免影响之前的前端调用
+    source_dir: str = ""
+    param_json_path: str = ""
+    module_id: str = ""
+    module_name: str = ""
     entry_file: str = "main.py"
     tool_type: str = ""
     description: str = ""
@@ -1866,7 +1872,33 @@ def _resolve_local_json_path(raw_path: str) -> Path:
     if path.suffix.lower() != ".json":
         raise HTTPException(status_code=400, detail="请选择 .json 参数文件")
     return path
+def resolve_python_module_config_from_folder(folder_path: str, config_filename: str = "python_module.json") -> Path:
+    raw = str(folder_path or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="请选择 Python 模块文件夹")
 
+    folder = Path(raw).expanduser()
+    if not folder.is_absolute():
+        folder = (PROJECT_ROOT / folder).resolve()
+    else:
+        folder = folder.resolve()
+
+    if not folder.exists() or not folder.is_dir():
+        raise HTTPException(status_code=400, detail=f"Python 模块文件夹不存在: {folder}")
+
+    filename = sanitize_filename(config_filename or "python_module.json")
+    config_path = folder / filename
+
+    if not config_path.exists() or not config_path.is_file():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"该文件夹下没有找到 {filename}: {config_path}\n"
+                "请确认 Python 模块文件夹中包含 python_module.json、config.json、requirements.txt 和入口 .py 文件。"
+            ),
+        )
+
+    return config_path
 
 def load_param_json_file(raw_path: str) -> dict:
     path = _resolve_local_json_path(raw_path)
@@ -1920,7 +1952,33 @@ def load_python_module_config(raw_path: str) -> tuple[dict, Path]:
     entry_file = str(module_cfg.get("entry_file") or "main.py").strip()
     tool_type = str(module_cfg.get("tool_type") or "").strip()
     description = str(module_cfg.get("description") or "").strip()
+    python_executable = str(
+        module_cfg.get("python_executable")
+        or module_cfg.get("python")
+        or module_cfg.get("python_path")
+        or ""
+    ).strip()
 
+    python_env_mode = str(
+        module_cfg.get("python_env_mode")
+        or module_cfg.get("env_mode")
+        or "create_venv"
+    ).strip().lower() or "create_venv"
+
+    if python_env_mode not in {"create_venv", "existing"}:
+        raise HTTPException(
+            status_code=400,
+            detail="python_env_mode 只支持 create_venv 或 existing",
+        )
+
+    if python_executable:
+        python_executable = str(_resolve_path_relative_to_config(python_executable, config_path))
+
+    if python_env_mode == "existing" and not python_executable:
+        raise HTTPException(
+            status_code=400,
+            detail="existing 模式必须指定 python_executable",
+        )
     if not module_id:
         raise HTTPException(status_code=400, detail="Python 模块配置 JSON 缺少 module_id")
     if not module_name:
@@ -1960,6 +2018,8 @@ def load_python_module_config(raw_path: str) -> tuple[dict, Path]:
         "description": description,
         "param_json_path": str(param_json_path) if param_json_path else "",
         "param_json": param_json,
+        "python_executable": python_executable,
+        "python_env_mode": python_env_mode,
     }, config_path
 def install_python_venv_module_from_values(
     module_id: str,
@@ -1970,6 +2030,8 @@ def install_python_venv_module_from_values(
     description: str = "",
     param_json_path: str = "",
     param_json: dict | None = None,
+    python_executable: str = "",
+    python_env_mode: str = "create_venv",
 ) -> dict:
     safe_module_id = sanitize_filename(module_id).strip()
     if not safe_module_id:
@@ -2022,7 +2084,14 @@ def install_python_venv_module_from_values(
     rel_entry = entry_candidate.resolve().relative_to(source_root.resolve())
     installed_entry_script = source_target_dir / rel_entry
 
-    python_exe = create_python_module_env(safe_module_id, source_target_dir)
+    if python_env_mode == "existing":
+        python_exe = resolve_existing_python_executable(python_executable)
+    else:
+        python_exe = create_python_module_env(
+            safe_module_id,
+            source_target_dir,
+            base_python_executable=python_executable,
+        )
 
     module_json_candidates = list(source_target_dir.rglob("module.json"))
     if module_json_candidates:
@@ -2046,6 +2115,8 @@ def install_python_venv_module_from_values(
     module_data["tool_type"] = selected_tool_type
     module_data["enabled"] = module_data.get("enabled", True)
     module_data["runtime_type"] = "python_venv"
+    module_data["python_env_mode"] = python_env_mode
+    module_data["base_python_executable"] = python_executable
     module_data["config_mode"] = "config_json"
     module_data["command_template"] = ["{executable}", "{entry_script}", "{config_json}"]
     module_data["inputs"] = inferred_inputs
@@ -2054,6 +2125,13 @@ def install_python_venv_module_from_values(
     module_data["entry_file"] = rel_entry.as_posix()
     module_data["entry_script"] = to_project_relative_path(installed_entry_script)
     module_data["python_env_dir"] = to_project_relative_path(PYTHON_MODULE_ENVS_DIR / safe_module_id)
+
+    module_data["executable"] = to_project_relative_path(python_exe)
+    if python_env_mode == "existing":
+        module_data["python_env_dir"] = str(python_exe.parent.parent)
+    else:
+        module_data["python_env_dir"] = to_project_relative_path(PYTHON_MODULE_ENVS_DIR / safe_module_id)
+
     module_data["executable"] = to_project_relative_path(python_exe)
     module_data["working_dir"] = to_project_relative_path(source_target_dir)
 
@@ -2239,10 +2317,38 @@ def split_requirements_for_local_binary(requirements_path: Path) -> tuple[list[s
             normal_lines.append(raw)
 
     return strict_specs, prefer_specs, normal_lines
+def build_clean_pip_env() -> dict:
+    env = os.environ.copy()
+
+    # 清掉系统代理，避免 pip 走坏掉的代理配置
+    for key in [
+        "http_proxy",
+        "https_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "all_proxy",
+    ]:
+        env.pop(key, None)
+
+    env["NO_PROXY"] = "*"
+    env["no_proxy"] = "*"
+
+    # Windows 下禁用用户级 pip.ini，避免里面写了错误代理
+    if os.name == "nt":
+        env["PIP_CONFIG_FILE"] = "NUL"
+    else:
+        env["PIP_CONFIG_FILE"] = "/dev/null"
+
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    return env
 def run_checked_command(
     cmd: list[str],
     cwd: Path | None = None,
     title: str = "执行命令",
+    env: dict | None = None,
 ) -> subprocess.CompletedProcess:
     result = subprocess.run(
         cmd,
@@ -2251,6 +2357,7 @@ def run_checked_command(
         text=True,
         encoding="utf-8",
         errors="ignore",
+        env=env,
     )
 
     if result.returncode != 0:
@@ -2276,6 +2383,7 @@ def install_requirements_with_local_wheels(
     strict_specs, prefer_specs, normal_lines = split_requirements_for_local_binary(requirements_path)
 
     # numpy / h5py：优先本地 wheel，但不强制本地。
+    # numpy / h5py：当前系统已经提前下载 wheel，必须从本地 python_wheels 安装。
     for spec in prefer_specs:
         run_checked_command(
             [
@@ -2283,13 +2391,16 @@ def install_requirements_with_local_wheels(
                 "-m",
                 "pip",
                 "install",
-                "--prefer-binary",
+                "--no-index",
+                "--only-binary",
+                ":all:",
                 "--find-links",
                 str(PYTHON_WHEELS_DIR),
                 spec,
             ],
             cwd=work_dir,
-            title=f"安装二进制依赖 {spec}",
+            title=f"从本地二进制包安装 {spec}",
+            env=build_clean_pip_env(),
         )
 
     # GDAL / rasterio / pyproj / cartopy：强制从本地 wheel 安装，避免源码编译失败。
@@ -2301,12 +2412,15 @@ def install_requirements_with_local_wheels(
                 "pip",
                 "install",
                 "--no-index",
+                "--only-binary",
+                ":all:",
                 "--find-links",
                 str(PYTHON_WHEELS_DIR),
                 spec,
             ],
             cwd=work_dir,
             title=f"从本地二进制包安装 {spec}",
+            env=build_clean_pip_env(),
         )
 
     normal_req_path = work_dir / "requirements.normal.txt"
@@ -2330,8 +2444,28 @@ def install_requirements_with_local_wheels(
             ],
             cwd=work_dir,
             title="安装普通 Python 依赖",
+            env=build_clean_pip_env(),
         )
-def create_python_module_env(module_id: str, source_dir: Path) -> Path:
+def resolve_existing_python_executable(raw_path: str) -> Path:
+    raw = str(raw_path or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="必须指定 python_executable")
+
+    python_exe = Path(raw).expanduser()
+    if not python_exe.is_absolute():
+        python_exe = (PROJECT_ROOT / python_exe).resolve()
+    else:
+        python_exe = python_exe.resolve()
+
+    if not python_exe.exists() or not python_exe.is_file():
+        raise HTTPException(status_code=400, detail=f"指定的 Python 解释器不存在: {python_exe}")
+
+    return python_exe
+def create_python_module_env(
+    module_id: str,
+    source_dir: Path,
+    base_python_executable: str = "",
+) -> Path:
     """为 Python 源码模块创建独立 venv，并安装 requirements.txt。"""
     env_dir = PYTHON_MODULE_ENVS_DIR / module_id
 
@@ -2339,8 +2473,14 @@ def create_python_module_env(module_id: str, source_dir: Path) -> Path:
         shutil.rmtree(env_dir)
 
     # 用 --clear 明确创建干净环境，--copies 在 Windows 上比软链接更稳
+    base_python = (
+        resolve_existing_python_executable(base_python_executable)
+        if str(base_python_executable or "").strip()
+        else Path(sys.executable)
+    )
+
     run_checked_command(
-        [sys.executable, "-m", "venv", "--clear", "--copies", str(env_dir)],
+        [str(base_python), "-m", "venv", "--clear", "--copies", str(env_dir)],
         cwd=BASE_DIR,
         title="创建 Python 独立环境",
     )
@@ -2362,23 +2502,6 @@ def create_python_module_env(module_id: str, source_dir: Path) -> Path:
         [str(python_exe), "-m", "pip", "--version"],
         cwd=source_dir,
         title="检查 pip",
-    )
-
-    # 再升级基础打包工具。这里不要只升级 pip，也顺带装 setuptools / wheel。
-    run_checked_command(
-        [
-            str(python_exe),
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "--force-reinstall",
-            "pip",
-            "setuptools",
-            "wheel",
-        ],
-        cwd=source_dir,
-        title="升级 pip/setuptools/wheel",
     )
 
     requirements_path = source_dir / "requirements.txt"
@@ -3556,6 +3679,41 @@ def api_upload_python_folder_module(
 ):
     require_admin(authorization)
 
+    # 新模式：用户只选择 Python 模块文件夹
+    if str(payload.folder_path or "").strip():
+        config_path = resolve_python_module_config_from_folder(
+            payload.folder_path,
+            payload.config_filename or "python_module.json",
+        )
+
+        validation = validate_python_module_config_file(str(config_path))
+        if not validation.get("can_install"):
+            raise_python_validation_error(validation)
+
+        config, _ = load_python_module_config(str(config_path))
+
+        module_data = install_python_venv_module_from_values(
+            module_id=config["module_id"],
+            module_name=config["module_name"],
+            source_dir=config["source_dir"],
+            entry_file=config["entry_file"],
+            tool_type=config["tool_type"],
+            description=config["description"],
+            param_json_path=config["param_json_path"],
+            param_json=config["param_json"],
+            python_executable=config.get("python_executable") or "",
+            python_env_mode=config.get("python_env_mode") or "create_venv",
+        )
+
+        return {
+            "ok": True,
+            "message": "Python 模块文件夹安装成功",
+            "module": module_data,
+            "config_path": str(config_path),
+            "validation": validation,
+        }
+
+    # 旧模式：保留原来的 source_dir / module_id / param_json_path 方式
     module_data = install_python_venv_module_from_values(
         module_id=payload.module_id,
         module_name=payload.module_name,
@@ -3808,7 +3966,35 @@ def api_upload_module_zip(
     finally:
         if temp_zip.exists():
             temp_zip.unlink(missing_ok=True)
+class PythonModuleFolderRequest(BaseModel):
+    folder_path: str
+    config_filename: str = "python_module.json"
 
+
+@app.post("/api/admin/modules/validate-python-folder")
+def api_validate_python_module_folder(
+    payload: PythonModuleFolderRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+
+    try:
+        config_path = resolve_python_module_config_from_folder(
+            payload.folder_path,
+            payload.config_filename or "python_module.json",
+        )
+        return validate_python_module_config_file(str(config_path))
+    except Exception as exc:
+        report = make_python_validation_report(str(payload.folder_path or ""))
+        _add_error(
+            report,
+            "python_module_folder",
+            f"Python 模块文件夹检查失败：{type(exc).__name__}: {exc}",
+            "确认该文件夹下存在 python_module.json、config.json、requirements.txt 和入口 .py 文件。",
+            traceback="".join(traceback.format_exception_only(type(exc), exc)).strip(),
+        )
+        _dedupe_report_items(report)
+        return report
 
 @app.post("/api/admin/modules/validate-python-module-config")
 def api_validate_python_module_config(

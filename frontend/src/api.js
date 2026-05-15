@@ -475,17 +475,22 @@ export async function parseModuleParamJson(path) {
   });
 }
 
-export async function uploadPythonFolderModule(options) {
+export async function validatePythonModuleFolder(folderPath) {
+  return request('/api/admin/modules/validate-python-folder', {
+    method: 'POST',
+    body: JSON.stringify({
+      folder_path: folderPath || '',
+      config_filename: 'python_module.json',
+    }),
+  });
+}
+
+export async function uploadPythonFolderModule(folderPath) {
   return request('/api/admin/modules/upload-python-folder', {
     method: 'POST',
     body: JSON.stringify({
-      source_dir: options.source_dir || '',
-      param_json_path: options.param_json_path || '',
-      module_id: options.module_id || '',
-      module_name: options.module_name || '',
-      entry_file: options.entry_file || 'main.py',
-      tool_type: options.tool_type || '',
-      description: options.description || '',
+      folder_path: folderPath || '',
+      config_filename: 'python_module.json',
     }),
   });
 }
