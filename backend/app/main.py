@@ -3671,7 +3671,6 @@ def api_upload_python_module(
     finally:
         shutil.rmtree(upload_tmp, ignore_errors=True)
 
-
 @app.post("/api/admin/modules/upload-python-folder")
 def api_upload_python_folder_module(
     payload: PythonFolderModuleUploadRequest,
@@ -3679,56 +3678,68 @@ def api_upload_python_folder_module(
 ):
     require_admin(authorization)
 
-    # 新模式：用户只选择 Python 模块文件夹
-    if str(payload.folder_path or "").strip():
-        config_path = resolve_python_module_config_from_folder(
-            payload.folder_path,
-            payload.config_filename or "python_module.json",
-        )
+    try:
+        # 新模式：用户只选择 Python 模块文件夹
+        if str(payload.folder_path or "").strip():
+            config_path = resolve_python_module_config_from_folder(
+                payload.folder_path,
+                payload.config_filename or "python_module.json",
+            )
 
-        validation = validate_python_module_config_file(str(config_path))
-        if not validation.get("can_install"):
-            raise_python_validation_error(validation)
+            validation = validate_python_module_config_file(str(config_path))
+            if not validation.get("can_install"):
+                raise_python_validation_error(validation)
 
-        config, _ = load_python_module_config(str(config_path))
+            config, _ = load_python_module_config(str(config_path))
+
+            module_data = install_python_venv_module_from_values(
+                module_id=config["module_id"],
+                module_name=config["module_name"],
+                source_dir=config["source_dir"],
+                entry_file=config["entry_file"],
+                tool_type=config["tool_type"],
+                description=config["description"],
+                param_json_path=config["param_json_path"],
+                param_json=config["param_json"],
+                python_executable=config.get("python_executable") or "",
+                python_env_mode=config.get("python_env_mode") or "create_venv",
+            )
+
+            return {
+                "ok": True,
+                "message": "Python 模块文件夹安装成功",
+                "module": module_data,
+                "config_path": str(config_path),
+                "validation": validation,
+            }
 
         module_data = install_python_venv_module_from_values(
-            module_id=config["module_id"],
-            module_name=config["module_name"],
-            source_dir=config["source_dir"],
-            entry_file=config["entry_file"],
-            tool_type=config["tool_type"],
-            description=config["description"],
-            param_json_path=config["param_json_path"],
-            param_json=config["param_json"],
-            python_executable=config.get("python_executable") or "",
-            python_env_mode=config.get("python_env_mode") or "create_venv",
+            module_id=payload.module_id,
+            module_name=payload.module_name,
+            source_dir=payload.source_dir,
+            entry_file=payload.entry_file or "main.py",
+            tool_type=payload.tool_type,
+            description=payload.description,
+            param_json_path=payload.param_json_path,
         )
 
         return {
             "ok": True,
-            "message": "Python 模块文件夹安装成功",
+            "message": "Python 源码模块已创建独立环境并安装成功",
             "module": module_data,
-            "config_path": str(config_path),
-            "validation": validation,
         }
 
-    # 旧模式：保留原来的 source_dir / module_id / param_json_path 方式
-    module_data = install_python_venv_module_from_values(
-        module_id=payload.module_id,
-        module_name=payload.module_name,
-        source_dir=payload.source_dir,
-        entry_file=payload.entry_file or "main.py",
-        tool_type=payload.tool_type,
-        description=payload.description,
-        param_json_path=payload.param_json_path,
-    )
-
-    return {
-        "ok": True,
-        "message": "Python 源码模块已创建独立环境并安装成功",
-        "module": module_data,
-    }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Python 模块文件夹安装过程异常：\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                + traceback.format_exc()
+            ),
+        )
 @app.get("/api/auth/forgot-password/question")
 def api_forgot_password_question(username: str):
     try:
