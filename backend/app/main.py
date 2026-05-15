@@ -1219,42 +1219,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
         return task
         return task
 
-    # 文件夹型模块的平台级并行：
-    # 有些 Python 模块本身只接收一个文件夹，然后在算法内部 for 循环逐个文件处理。
-    # 这种情况下，单纯把 parallel_workers 写进 config.json 不会自动产生多个进程，
-    # 需要平台先把输入文件夹拆成多个 worker_xx 子文件夹，再同时启动多个 Python 进程。
-    if parallel_workers > 1:
-        parallel_mode = str(normalize_parallel_config(module).get("mode") or "auto").strip() or "auto"
-        if parallel_mode != "module_internal":
-            parallel_jobs = prepare_parallel_jobs(module, inputs, parallel_workers)
-            if len(parallel_jobs) > 1:
-                task_inputs = dict(inputs)
-                task_inputs["parallel_workers"] = parallel_workers
-                task_inputs["_parallel_workers"] = parallel_workers
-                task_inputs["_parallel_job_count"] = len(parallel_jobs)
-                task_inputs["_parallel_mode"] = parallel_mode
-
-                task = task_manager.submit_parallel_module_task(
-                    module_id=module["id"],
-                    module_name=module.get("name", module["id"]),
-                    jobs=parallel_jobs,
-                    inputs=task_inputs,
-                    max_workers=parallel_workers,
-                    owner_username=username,
-                )
-
-                output_paths = collect_output_paths_from_inputs(module, inputs)
-                if output_paths:
-                    start_data_file_scan_after_task(
-                        task["id"],
-                        module,
-                        output_paths,
-                        owner_username=username,
-                    )
-                return task
-
     # 非批处理模块：如果模块内部自己处理并行，则把并行数传给模块。
-    # 注意：这里只是把数值写入 config.json，并不会自动创建多个进程。
     if parallel_workers > 1:
         inputs = dict(inputs)
         inputs["parallel_workers"] = parallel_workers
@@ -1483,153 +1448,6 @@ def merge_admin_fixed_inputs(module: dict, inputs: Dict[str, Any]) -> Dict[str, 
 
 
 
-# Python 源码模块运行时复制策略：
-# 每个任务仍然需要独立的 runtime/source/config.json，避免并行任务互相覆盖配置；
-# 但 models、weights 等固定大文件不能重复真实复制，否则并行 20 个任务会占用 20 份磁盘空间。
-# 因此 runtime/source 里对大模型、固定资源优先创建硬链接，失败时尝试符号链接；
-# 只有普通小文件才复制。硬链接在同一磁盘分区内不额外占用数据空间。
-RUNTIME_SHARED_FILE_SUFFIXES = {
-    ".pkl", ".pickle", ".joblib", ".model", ".onnx",
-    ".h5", ".hdf5", ".npy", ".npz",
-    ".pt", ".pth", ".ckpt", ".bin", ".weights",
-    ".tif", ".tiff", ".img", ".nc", ".nc4", ".hdf",
-}
-
-RUNTIME_SHARED_DIR_NAMES = {
-    "model", "models", "weight", "weights", "checkpoint", "checkpoints",
-    "ckpt", "pretrained", "resource", "resources", "lut", "luts",
-}
-
-try:
-    RUNTIME_SHARED_LINK_MIN_BYTES = max(1, int(os.environ.get("LOCAL_WEB_RUNTIME_LINK_MIN_MB", "16"))) * 1024 * 1024
-except Exception:
-    RUNTIME_SHARED_LINK_MIN_BYTES = 16 * 1024 * 1024
-
-
-def _runtime_file_should_be_shared(src_path: Path, source_root: Path) -> bool:
-    """判断 runtime/source 中应该链接而不是复制的固定资源文件。"""
-    try:
-        suffix = src_path.suffix.lower()
-        if suffix in RUNTIME_SHARED_FILE_SUFFIXES:
-            return True
-
-        try:
-            rel_parts = [part.lower() for part in src_path.resolve().relative_to(source_root.resolve()).parts]
-            if any(part in RUNTIME_SHARED_DIR_NAMES for part in rel_parts[:-1]):
-                return True
-        except Exception:
-            pass
-
-        if src_path.stat().st_size >= RUNTIME_SHARED_LINK_MIN_BYTES:
-            return True
-    except Exception:
-        return False
-    return False
-
-
-def _link_shared_runtime_file(src_path: Path, dst_path: Path) -> str:
-    """对固定大文件创建链接，不允许悄悄退化成复制。"""
-    dst_path.parent.mkdir(parents=True, exist_ok=True)
-    if dst_path.exists() or dst_path.is_symlink():
-        dst_path.unlink()
-
-    hardlink_error = None
-    symlink_error = None
-
-    try:
-        os.link(str(src_path), str(dst_path))
-        return "hardlink"
-    except Exception as exc:
-        hardlink_error = exc
-
-    try:
-        if hasattr(os, "symlink"):
-            os.symlink(str(src_path), str(dst_path))
-            return "symlink"
-    except Exception as exc:
-        symlink_error = exc
-
-    raise RuntimeError(
-        "固定大文件不能复制到每个并行任务目录，且创建硬链接/符号链接失败。"
-        f"\n源文件: {src_path}"
-        f"\n目标: {dst_path}"
-        f"\n硬链接错误: {hardlink_error!r}"
-        f"\n符号链接错误: {symlink_error!r}"
-        "\n建议：确保 backend/installed_modules 和 backend/runtime 在同一个磁盘分区；"
-        "Windows 下可开启开发者模式或用管理员权限运行后端以支持符号链接。"
-    )
-
-
-def copy_python_runtime_source(source_dir: Path, run_source_dir: Path) -> dict:
-    """
-    创建 Python 模块单次运行目录。
-
-    普通 .py/.json 小文件复制到 runtime/source，保证每个任务有独立 config.json；
-    模型、权重、LUT、resources 里的大文件用硬链接/符号链接指向安装目录的同一份文件，
-    避免并行进程池启动多个任务时把 1GB 模型复制几十份。
-    """
-    stats = {
-        "copied_files": 0,
-        "linked_files": 0,
-        "hardlinked_files": 0,
-        "symlinked_files": 0,
-        "shared_bytes": 0,
-    }
-
-    def copy_function(src: str, dst: str):
-        src_path = Path(src)
-        dst_path = Path(dst)
-        if _runtime_file_should_be_shared(src_path, source_dir):
-            method = _link_shared_runtime_file(src_path, dst_path)
-            stats["linked_files"] += 1
-            if method == "hardlink":
-                stats["hardlinked_files"] += 1
-            elif method == "symlink":
-                stats["symlinked_files"] += 1
-            try:
-                stats["shared_bytes"] += int(src_path.stat().st_size)
-            except Exception:
-                pass
-            return str(dst_path)
-
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-        result = shutil.copy2(src, dst)
-        stats["copied_files"] += 1
-        return result
-
-    try:
-        shutil.copytree(
-            source_dir,
-            run_source_dir,
-            ignore=shutil.ignore_patterns(
-                "__pycache__",
-                "*.pyc",
-                ".venv",
-                "venv",
-                ".git",
-            ),
-            copy_function=copy_function,
-        )
-    except shutil.Error as exc:
-        text = str(exc)
-        if "WinError 112" in text or "磁盘空间不足" in text:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "创建 Python 模块运行目录失败：磁盘空间不足。\n"
-                    "原因通常是并行任务重复复制大模型或固定资源。\n"
-                    "新版逻辑会对模型/权重/resources 中的大文件创建硬链接，不再真实复制。\n"
-                    "请先清理 backend/runtime/job_* 后重试。\n\n"
-                    f"原始错误：{text}"
-                ),
-            )
-        raise HTTPException(status_code=400, detail=f"创建 Python 模块运行目录失败：{text}")
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    return stats
-
-
 def coerce_json_marked_inputs(module: dict, inputs: Dict[str, Any]) -> Dict[str, Any]:
     """把自动识别出的复杂 JSON 参数从字符串还原成 dict/list/number/bool。"""
     result = dict(inputs or {})
@@ -1801,33 +1619,26 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
             if not source_dir.exists() or not source_dir.is_dir():
                 raise HTTPException(status_code=400, detail=f"Python 源码目录不存在: {source_dir}")
 
-            # 强制 shared_no_copy：Python 模块运行时绝对不再复制 source 目录。
-            # 入口脚本、pkl 模型、resources、LUT、requirements 等固定文件都直接从
-            # backend/installed_modules/<模块>/source 读取。
-            # 每个并行子任务只在 backend/runtime/job_xxx 下生成独立 config.json。
-            # 这样 27 个输入文件并行时，不会再生成 27 份 FY4_CTH_model.pkl。
-            entry_name = str(module.get("entry_file") or "main.py")
-
+            # 关键修改：运行时绝对不再复制 Python 源码目录，也不复制任何固定资源。
+            # 以前这里会创建 runtime/job_xxx/source 并 copytree(source_dir, run_source_dir)，
+            # 导致 models/resources/LUT/pkl 等固定文件被每个并行子任务复制一份。
+            # 新策略：
+            # 1. entry_script 直接指向 installed_modules/<模块>/source 里的入口脚本；
+            # 2. cwd 直接设置为 installed_modules/<模块>/source，算法相对读取 pkl/resources 时读原始那一份；
+            # 3. 每个任务只在 runtime/job_xxx 下生成独立 config.json，避免并行参数互相覆盖；
+            # 4. 不创建 runtime/job_xxx/source，不创建硬链接，不创建符号链接，更不复制固定资源。
             config_path = runtime_task_dir / "config.json"
             config_path.write_text(
                 json.dumps(module_config, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
 
+            entry_name = str(module.get("entry_file") or "main.py")
             entry_path = source_dir / entry_name
             if not entry_path.exists():
                 candidates = list(source_dir.rglob(entry_name))
                 if candidates:
                     entry_path = candidates[0]
-
-            module_dir = source_dir
-            runtime_env["RUNTIME_SOURCE_MODE"] = "shared_no_copy_forced"
-            runtime_env["RUNTIME_SHARED_SOURCE_DIR"] = str(source_dir)
-            runtime_env["RUNTIME_CONFIG_ONLY_DIR"] = str(runtime_task_dir)
-            runtime_env["RUNTIME_SHARED_MODEL_POLICY"] = "installed_module_only"
-            runtime_env["RUNTIME_SHARED_LINKED_FILES"] = "0"
-            runtime_env["RUNTIME_COPIED_SMALL_FILES"] = "0"
-            runtime_env["RUNTIME_SHARED_BYTES"] = "0"
 
             if not entry_path.exists():
                 raise HTTPException(status_code=400, detail=f"Python 入口脚本不存在: {entry_name}")
@@ -1837,8 +1648,17 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
             values["runtime_dir"] = str(runtime_task_dir)
             values["entry_script"] = str(entry_path)
             values["source_dir"] = str(source_dir)
+            values["module_source_dir"] = str(source_dir)
+
+            module_dir = source_dir
+
+            runtime_env["RUNTIME_SOURCE_MODE"] = "installed_source_no_copy"
+            runtime_env["RUNTIME_FIXED_RESOURCE_POLICY"] = "read_from_installed_modules_only"
+            runtime_env["RUNTIME_SHARED_SOURCE_DIR"] = str(source_dir)
+            runtime_env["RUNTIME_CONFIG_ONLY_DIR"] = str(runtime_task_dir)
             runtime_env["LOCAL_WEB_MODULE_SOURCE_DIR"] = str(source_dir)
             runtime_env["LOCAL_WEB_MODULE_RUNTIME_DIR"] = str(runtime_task_dir)
+            runtime_env["LOCAL_WEB_NO_FIXED_RESOURCE_COPY"] = "1"
 
             if not command_template:
                 command_template = ["{executable}", "{entry_script}", "{config_json}"]
@@ -4119,27 +3939,16 @@ def choose_parallel_input_key(module: dict, inputs: dict) -> str:
     input_fields = module.get("inputs", []) or []
     for field in input_fields:
         key = field.get("key")
-        if not key or key not in inputs:
-            continue
-        if field.get("control_only") is True or is_output_field(field):
-            continue
-        if field.get("type") in {"file_path", "dir_path"}:
+        if key in inputs and field.get("type") in {"file_path", "dir_path"}:
             return key
 
-    preferred_words = ["input", "infile", "file", "inpath", "folder", "dir", "path", "数据"]
-    output_like_words = ["out", "output", "result", "save", "输出", "结果", "保存"]
+    preferred_words = ["input", "infile", "file", "inpath", "folder", "dir", "path"]
     for word in preferred_words:
         for key, value in inputs.items():
-            key_text = str(key).lower()
-            if any(x in key_text for x in output_like_words):
-                continue
-            if word in key_text and value not in ("", None):
+            if word in str(key).lower() and value not in ("", None):
                 return key
 
     for key, value in inputs.items():
-        key_text = str(key).lower()
-        if any(x in key_text for x in output_like_words):
-            continue
         if value not in ("", None):
             return key
 
@@ -4322,19 +4131,13 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
         chunks = split_evenly(files, workers)
         chunk_root = RUNTIME_DIR / "parallel_chunks" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         chunk_root.mkdir(parents=True, exist_ok=True)
-        source_root = Path(str(input_value)).expanduser().resolve()
 
         for idx, chunk in enumerate(chunks, start=1):
             chunk_dir = chunk_root / f"worker_{idx:02d}"
             chunk_dir.mkdir(parents=True, exist_ok=True)
             used_names: set[str] = set()
             for src in chunk:
-                # 尽量保留输入目录下的相对层级，避免算法依赖子目录结构时被打平。
-                try:
-                    rel = src.resolve().relative_to(source_root)
-                    dst = chunk_dir / rel
-                except Exception:
-                    dst = chunk_dir / unique_chunk_filename(src, used_names)
+                dst = chunk_dir / unique_chunk_filename(src, used_names)
                 link_or_copy_file(src, dst)
 
             job_inputs = dict(inputs)

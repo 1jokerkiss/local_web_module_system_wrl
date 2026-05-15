@@ -512,45 +512,24 @@ class TaskManager:
             parallel_total=total,
             parallel_done=0,
             parallel_failed=0,
-            parallel_started=0,
-            parallel_running=0,
         )
         self.append_log(parent_id, f"[INFO] 批处理开始，共 {total} 个子任务")
         self.append_log(parent_id, f"[INFO] 最大并发数 = {max_parallel}")
 
         progress_lock = threading.Lock()
-        progress = {"done": 0, "failed": 0, "started": 0, "running": 0}
+        progress = {"done": 0, "failed": 0}
 
         def _worker(child_id: str, job: Dict[str, Any]):
             child_snapshot = self.get_task(child_id) or {}
             if parent_id in self.cancel_flags or child_snapshot.get("status") == "cancelled":
                 self.update_task(child_id, status="cancelled", ended_at=now_iso())
                 return child_id
-
-            with progress_lock:
-                progress["started"] += 1
-                progress["running"] += 1
-                self.update_task(
-                    parent_id,
-                    parallel_started=progress["started"],
-                    parallel_running=progress["running"],
-                )
-                self.append_log(
-                    parent_id,
-                    f"[INFO] 当前已启动 {progress['started']}/{total} 个子任务，正在运行 {progress['running']} 个，子任务ID={child_id}",
-                )
-
-            try:
-                self._run_process_task(
-                    child_id,
-                    job["command"],
-                    job.get("working_dir"),
-                    job.get("env"),
-                )
-            finally:
-                with progress_lock:
-                    progress["running"] = max(0, progress["running"] - 1)
-                    self.update_task(parent_id, parallel_running=progress["running"])
+            self._run_process_task(
+                child_id,
+                job["command"],
+                job.get("working_dir"),
+                job.get("env"),
+            )
             return child_id
 
         failures = 0
@@ -637,6 +616,23 @@ class TaskManager:
         self.append_log(task_id, f"[INFO] cwd = {working_dir or os.getcwd()}")
         self.append_log(task_id, f"[INFO] command = {' '.join(command)}")
 
+        runtime_source_mode = merged_env.get("RUNTIME_SOURCE_MODE", "")
+        fixed_resource_policy = merged_env.get("RUNTIME_FIXED_RESOURCE_POLICY", "")
+        if runtime_source_mode or fixed_resource_policy:
+            self.append_log(
+                task_id,
+                f"[INFO] runtime_source_mode = {runtime_source_mode or '-'}；fixed_resource_policy = {fixed_resource_policy or '-'}",
+            )
+        if merged_env.get("LOCAL_WEB_NO_FIXED_RESOURCE_COPY") == "1":
+            self.append_log(
+                task_id,
+                "[INFO] 固定资源不复制：模型、pkl、resources、LUT 等固定文件直接从 installed_modules 模块目录读取；本任务只生成独立 config.json。",
+            )
+            if merged_env.get("RUNTIME_SHARED_SOURCE_DIR"):
+                self.append_log(task_id, f"[INFO] 固定资源读取目录 = {merged_env.get('RUNTIME_SHARED_SOURCE_DIR')}")
+            if merged_env.get("RUNTIME_CONFIG_ONLY_DIR"):
+                self.append_log(task_id, f"[INFO] 本任务配置目录 = {merged_env.get('RUNTIME_CONFIG_ONLY_DIR')}")
+
         path_value = merged_env.get("PATH", "")
         path_parts = path_value.split(";") if path_value else []
         self.append_log(task_id, "[INFO] PATH 前 10 项如下：")
@@ -655,43 +651,6 @@ class TaskManager:
             task_id,
             f"[INFO] GOTO_NUM_THREADS = {merged_env.get('GOTO_NUM_THREADS', '')}",
         )
-
-        runtime_source_mode = merged_env.get("RUNTIME_SOURCE_MODE")
-        if runtime_source_mode in {"shared_no_copy", "shared_no_copy_forced"}:
-            self.append_log(
-                task_id,
-                (
-                    "[INFO] Python runtime 使用 shared_no_copy_forced 模式："
-                    "不复制源码目录、models、resources 或 pkl 文件；"
-                    "入口脚本、pkl 模型和固定资源直接从已安装模块目录读取"
-                ),
-            )
-            if merged_env.get("RUNTIME_SHARED_SOURCE_DIR"):
-                self.append_log(task_id, f"[INFO] 已安装模块源码目录 = {merged_env.get('RUNTIME_SHARED_SOURCE_DIR')}")
-            if merged_env.get("RUNTIME_CONFIG_ONLY_DIR"):
-                self.append_log(task_id, f"[INFO] 本任务只生成独立配置目录 = {merged_env.get('RUNTIME_CONFIG_ONLY_DIR')}")
-            if merged_env.get("RUNTIME_SHARED_MODEL_POLICY") == "installed_module_only":
-                self.append_log(task_id, "[INFO] 固定模型读取策略：只读取 installed_modules 中已上传的模型文件，不在 runtime/job_xxx/source 中创建副本")
-        else:
-            linked_files = merged_env.get("RUNTIME_SHARED_LINKED_FILES")
-            copied_small_files = merged_env.get("RUNTIME_COPIED_SMALL_FILES")
-            shared_bytes = merged_env.get("RUNTIME_SHARED_BYTES")
-            if linked_files is not None:
-                try:
-                    shared_gb = int(shared_bytes or "0") / 1024 / 1024 / 1024
-                    self.append_log(
-                        task_id,
-                        (
-                            f"[INFO] runtime/source 创建完成：固定大文件链接 {linked_files} 个，"
-                            f"普通小文件复制 {copied_small_files or 0} 个，"
-                            f"避免重复复制约 {shared_gb:.2f} GB"
-                        ),
-                    )
-                except Exception:
-                    self.append_log(
-                        task_id,
-                        f"[INFO] runtime/source 创建完成：固定大文件链接 {linked_files} 个，普通小文件复制 {copied_small_files or 0} 个",
-                    )
 
         config_arg = None
 
@@ -851,15 +810,13 @@ class TaskManager:
             parallel_total=total,
             parallel_done=0,
             parallel_failed=0,
-            parallel_started=0,
-            parallel_running=0,
         )
         self.append_log(parent_id, f"[PARALLEL] 并行任务启动，总任务数={total}，并行数={max_workers}")
 
         index_lock = threading.Lock()
         progress_lock = threading.Lock()
         next_index = {"value": 0}
-        progress = {"done": 0, "failed": 0, "started": 0, "running": 0}
+        progress = {"done": 0, "failed": 0}
 
         def next_job() -> tuple[int, Dict[str, Any]] | None:
             with index_lock:
@@ -900,44 +857,28 @@ class TaskManager:
                         parent.setdefault("children", []).append(child["id"])
                 self._save_tasks()
 
+                self.append_log(parent_id, f"[PARALLEL] Worker-{worker_no} 启动 {idx + 1}/{total}: {label}")
+                self._run_process_task(
+                    child["id"],
+                    spec.get("command") or [],
+                    spec.get("working_dir"),
+                    spec.get("env"),
+                )
+                child_task = self.get_task(child["id"]) or {}
+                child_status = child_task.get("status")
                 with progress_lock:
-                    progress["started"] += 1
-                    progress["running"] += 1
+                    progress["done"] += 1
+                    if child_status != "success":
+                        progress["failed"] += 1
                     self.update_task(
                         parent_id,
-                        parallel_started=progress["started"],
-                        parallel_running=progress["running"],
+                        parallel_done=progress["done"],
+                        parallel_failed=progress["failed"],
                     )
-                    self.append_log(
-                        parent_id,
-                        f"[PARALLEL] 当前已启动 {progress['started']}/{total} 个任务，正在运行 {progress['running']} 个；Worker-{worker_no} 启动 {idx + 1}/{total}: {label}，子任务ID={child['id']}",
-                    )
-
-                try:
-                    self._run_process_task(
-                        child["id"],
-                        spec.get("command") or [],
-                        spec.get("working_dir"),
-                        spec.get("env"),
-                    )
-                finally:
-                    child_task = self.get_task(child["id"]) or {}
-                    child_status = child_task.get("status")
-                    with progress_lock:
-                        progress["done"] += 1
-                        progress["running"] = max(0, progress["running"] - 1)
-                        if child_status != "success":
-                            progress["failed"] += 1
-                        self.update_task(
-                            parent_id,
-                            parallel_done=progress["done"],
-                            parallel_failed=progress["failed"],
-                            parallel_running=progress["running"],
-                        )
-                    self.append_log(
-                        parent_id,
-                        f"[PARALLEL] 完成 {progress['done']}/{total}: {label}，状态={child_status}，当前仍在运行 {progress['running']} 个",
-                    )
+                self.append_log(
+                    parent_id,
+                    f"[PARALLEL] 完成 {progress['done']}/{total}: {label}，状态={child_status}",
+                )
 
         thread_count = max(1, min(max_workers, total))
         workers = [
