@@ -1162,7 +1162,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
     # 直接使用前端传来的用户选择路径；管理员固定输入在这里补齐。
     inputs = merge_admin_fixed_inputs(module, payload.inputs or {})
     inputs = coerce_json_marked_inputs(module, inputs)
-    parallel_workers = clamp_parallel_workers(payload.parallel_workers, task_manager.max_process_slots)
+    requested_parallel_workers = clamp_parallel_workers(payload.parallel_workers, task_manager.max_process_slots)
 
     # 必填校验。
     for field in module.get("inputs", []) or []:
@@ -1199,6 +1199,10 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
         elif field_type == "file_path" and p.parent:
             p.parent.mkdir(parents=True, exist_ok=True)
 
+    # 自动安全调整：用户可以选进程数，但最终启动前会根据 CPU/内存/磁盘/模型大小降低到安全值。
+    parallel_workers, adjust_report = auto_adjust_parallel_workers(module, inputs, requested_parallel_workers)
+    inputs = apply_parallel_adjustment_to_inputs(inputs, adjust_report)
+
     # 旧系统进程池批处理：只要识别到批处理目录，就算进程数是 1，也先拆成具体文件 job。
     if _is_batch_request(module, inputs):
         jobs, output_paths = build_batch_jobs_for_module(module, inputs, parallel_workers)
@@ -1217,12 +1221,8 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
                 owner_username=username,
             )
         return task
-        return task
 
-    # 文件夹型模块的平台级并行：
-    # 有些 Python 模块本身只接收一个文件夹，然后在算法内部 for 循环逐个文件处理。
-    # 这种情况下，单纯把 parallel_workers 写进 config.json 不会自动产生多个进程，
-    # 需要平台先把输入文件夹拆成多个 worker_xx 子文件夹，再同时启动多个 Python 进程。
+    # 文件夹型模块的平台级并行：模块本身只接收一个文件夹时，平台拆分为多个 worker_xx 文件夹。
     if parallel_workers > 1:
         parallel_mode = str(normalize_parallel_config(module).get("mode") or "auto").strip() or "auto"
         if parallel_mode != "module_internal":
@@ -1253,13 +1253,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
                     )
                 return task
 
-    # 非批处理模块：如果模块内部自己处理并行，则把并行数传给模块。
-    # 注意：这里只是把数值写入 config.json，并不会自动创建多个进程。
-    if parallel_workers > 1:
-        inputs = dict(inputs)
-        inputs["parallel_workers"] = parallel_workers
-        inputs["_parallel_workers"] = parallel_workers
-
+    # 非批处理模块：如果模块内部自己处理并行，则把安全调整后的进程数传给模块。
     output_paths = collect_output_paths_from_inputs(module, inputs)
 
     command, working_dir, runtime_env = build_runtime_for_module(module, inputs)
@@ -1483,6 +1477,67 @@ def merge_admin_fixed_inputs(module: dict, inputs: Dict[str, Any]) -> Dict[str, 
 
 
 
+
+def _resolve_runtime_path_no_copy(raw_value: str | Path, project_root: Path | None = None) -> Path:
+    project_root = project_root or PROJECT_ROOT
+    p = Path(str(raw_value or ""))
+    if not p.is_absolute():
+        p = (project_root / p).resolve()
+    else:
+        p = p.resolve()
+    return p
+
+
+def is_python_source_runtime_module(module: dict, exe_path: Path) -> bool:
+    """判断是否应按 Python 源码模块运行。
+
+    兼容旧模块：有些历史模块没有 runtime_type=python_venv，
+    但有 source_dir / entry_file / python_env_dir / entry_script。
+    这类模块运行时一律不能复制 source，只能直接读取 installed_modules 里的源码和固定资源。
+    """
+    runtime_type = str(module.get("runtime_type") or "").lower()
+    if runtime_type == "python_venv":
+        return True
+    if module.get("python_env_dir"):
+        return True
+    if module.get("source_dir") and (module.get("entry_file") or module.get("entry_script")):
+        return True
+    try:
+        name = exe_path.name.lower()
+        if name in {"python.exe", "python", "python3", "python3.exe"} and (module.get("source_dir") or module.get("entry_script")):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def resolve_python_source_dir_no_copy(module: dict, project_root: Path) -> Path:
+    source_raw = module.get("source_dir") or module.get("working_dir") or ""
+    if not source_raw and module.get("entry_script"):
+        return _resolve_runtime_path_no_copy(module.get("entry_script"), project_root).parent
+    source_dir = _resolve_runtime_path_no_copy(source_raw, project_root)
+    if not source_dir.exists() or not source_dir.is_dir():
+        raise HTTPException(status_code=400, detail=f"Python 源码目录不存在: {source_dir}")
+    return source_dir
+
+
+def resolve_python_entry_no_copy(module: dict, source_dir: Path, project_root: Path) -> Path:
+    entry_script_raw = str(module.get("entry_script") or "").strip()
+    if entry_script_raw:
+        entry_path = _resolve_runtime_path_no_copy(entry_script_raw, project_root)
+        if entry_path.exists() and entry_path.is_file():
+            return entry_path
+
+    entry_name = str(module.get("entry_file") or "main.py").strip() or "main.py"
+    entry_path = source_dir / entry_name
+    if not entry_path.exists():
+        candidates = list(source_dir.rglob(Path(entry_name).name))
+        if candidates:
+            entry_path = candidates[0]
+    if not entry_path.exists() or not entry_path.is_file():
+        raise HTTPException(status_code=400, detail=f"Python 入口脚本不存在: {entry_name}")
+    return entry_path
+
 def coerce_json_marked_inputs(module: dict, inputs: Dict[str, Any]) -> Dict[str, Any]:
     """把自动识别出的复杂 JSON 参数从字符串还原成 dict/list/number/bool。"""
     result = dict(inputs or {})
@@ -1643,54 +1698,38 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
 
         runtime_type = str(module.get("runtime_type") or "").lower()
 
-        if runtime_type == "python_venv":
-            source_dir = Path(str(module.get("source_dir") or module.get("working_dir") or ""))
+        if is_python_source_runtime_module(module, exe_path):
+            source_dir = resolve_python_source_dir_no_copy(module, project_root)
+            entry_path = resolve_python_entry_no_copy(module, source_dir, project_root)
 
-            if not source_dir.is_absolute():
-                source_dir = (project_root / source_dir).resolve()
-            else:
-                source_dir = source_dir.resolve()
-
-            if not source_dir.exists() or not source_dir.is_dir():
-                raise HTTPException(status_code=400, detail=f"Python 源码目录不存在: {source_dir}")
-
-            run_source_dir = runtime_task_dir / "source"
-            shutil.copytree(
-                source_dir,
-                run_source_dir,
-                ignore=shutil.ignore_patterns(
-                    "__pycache__",
-                    "*.pyc",
-                    ".venv",
-                    "venv",
-                    ".git",
-                ),
-            )
-
-            config_path = run_source_dir / "config.json"
+            # 绝对禁止复制固定资源：不创建 runtime/job_xxx/source。
+            # pkl/model/resources/LUT 等固定文件只保留在 installed_modules/<模块>/source 中。
+            # 每个任务只生成自己的 config.json，入口脚本直接从 source_dir 读取。
+            config_path = runtime_task_dir / "config.json"
             config_path.write_text(
                 json.dumps(module_config, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
 
-            entry_name = str(module.get("entry_file") or "main.py")
-            entry_path = run_source_dir / entry_name
-            if not entry_path.exists():
-                candidates = list(run_source_dir.rglob(entry_name))
-                if candidates:
-                    entry_path = candidates[0]
-
-            if not entry_path.exists():
-                raise HTTPException(status_code=400, detail=f"Python 入口脚本不存在: {entry_name}")
-
             values["config_json"] = str(config_path)
             values["config_path"] = str(config_path)
             values["runtime_dir"] = str(runtime_task_dir)
             values["entry_script"] = str(entry_path)
+            values["source_dir"] = str(source_dir)
+            values["module_source_dir"] = str(source_dir)
 
-            module_dir = run_source_dir
+            module_dir = source_dir
 
-            if not command_template:
+            runtime_env["RUNTIME_SOURCE_MODE"] = "installed_source_no_copy_forced"
+            runtime_env["RUNTIME_FIXED_RESOURCE_POLICY"] = "read_from_installed_modules_only"
+            runtime_env["RUNTIME_SHARED_SOURCE_DIR"] = str(source_dir)
+            runtime_env["RUNTIME_CONFIG_ONLY_DIR"] = str(runtime_task_dir)
+            runtime_env["LOCAL_WEB_MODULE_SOURCE_DIR"] = str(source_dir)
+            runtime_env["LOCAL_WEB_MODULE_RUNTIME_DIR"] = str(runtime_task_dir)
+            runtime_env["LOCAL_WEB_NO_FIXED_RESOURCE_COPY"] = "1"
+
+            template_text = " ".join(str(x) for x in (command_template or []))
+            if (not command_template) or ("{entry_script}" not in template_text and "entry_script" not in template_text):
                 command_template = ["{executable}", "{entry_script}", "{config_json}"]
 
         else:
@@ -3944,6 +3983,306 @@ def clamp_parallel_workers(value: int | str | None, max_workers: int | None = No
     return max(1, min(n, limit))
 
 
+
+
+# 固定资源/模型文件的安全并行估算：这些文件不会复制，但每个子进程通常会各自加载到内存。
+# 因此不能只按 CPU 核数给进程数，需要同时看 CPU、内存、磁盘余量和模型大小。
+FIXED_RESOURCE_SUFFIXES = {
+    ".pkl", ".pickle", ".joblib", ".model", ".onnx", ".h5", ".hdf5",
+    ".npy", ".npz", ".pt", ".pth", ".ckpt", ".bin",
+    ".lut", ".tif", ".tiff", ".hdf", ".nc", ".nc4",
+}
+FIXED_RESOURCE_DIR_HINTS = {"models", "model", "weights", "weight", "resources", "resource", "lut", "luts", "data"}
+
+
+def _gb(num_bytes: int | float | None) -> float:
+    try:
+        return float(num_bytes or 0) / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def _resolve_module_path_for_safety(raw_value: str | None) -> Path | None:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    try:
+        if not p.is_absolute():
+            p = (PROJECT_ROOT / p).resolve()
+        else:
+            p = p.resolve()
+        return p
+    except Exception:
+        return None
+
+
+def estimate_fixed_resource_bytes(module: dict) -> tuple[int, list[str]]:
+    """估算模块固定资源体积。固定资源不复制，但并发进程可能各自加载，所以用于限制安全并发数。"""
+    roots: list[Path] = []
+    for key in ["source_dir", "working_dir"]:
+        p = _resolve_module_path_for_safety(str(module.get(key) or ""))
+        if p and p.exists() and p.is_dir():
+            roots.append(p)
+
+    executable = _resolve_module_path_for_safety(str(module.get("executable") or module.get("entry") or ""))
+    if executable and executable.exists():
+        roots.append(executable.parent)
+
+    # 去重，避免同一个目录重复扫描。
+    uniq_roots: list[Path] = []
+    seen_roots = set()
+    for root in roots:
+        try:
+            key = str(root.resolve()).lower()
+        except Exception:
+            key = str(root).lower()
+        if key not in seen_roots:
+            seen_roots.add(key)
+            uniq_roots.append(root)
+
+    total = 0
+    examples: list[str] = []
+    seen_files = set()
+    for root in uniq_roots:
+        try:
+            for item in root.rglob("*"):
+                if not item.is_file():
+                    continue
+                try:
+                    resolved = str(item.resolve()).lower()
+                    if resolved in seen_files:
+                        continue
+                    seen_files.add(resolved)
+                    suffix = item.suffix.lower()
+                    parts_lower = {part.lower() for part in item.parts}
+                    size = item.stat().st_size
+                    is_fixed = suffix in FIXED_RESOURCE_SUFFIXES or bool(parts_lower & FIXED_RESOURCE_DIR_HINTS)
+                    if not is_fixed:
+                        continue
+                    # 小配置文件不参与内存估算，避免 resources 里 1KB json 把模块误判为重资源。
+                    if size < 10 * 1024 * 1024 and suffix not in {".pkl", ".pt", ".pth", ".onnx", ".h5", ".hdf5"}:
+                        continue
+                    total += int(size)
+                    if len(examples) < 5:
+                        try:
+                            examples.append(f"{item.relative_to(root)} ({_gb(size):.2f}GB)")
+                        except Exception:
+                            examples.append(f"{item.name} ({_gb(size):.2f}GB)")
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return total, examples
+
+
+def get_runtime_pressure_snapshot(path_for_disk: str | Path | None = None) -> dict:
+    """读取当前 CPU/内存/磁盘状态。psutil 不存在时退化为磁盘余量检查。"""
+    snapshot = {
+        "cpu_percent": None,
+        "memory_percent": None,
+        "memory_available_gb": None,
+        "disk_percent": None,
+        "disk_free_gb": None,
+        "disk_path": "",
+    }
+
+    try:
+        import psutil  # type: ignore
+        snapshot["cpu_percent"] = float(psutil.cpu_percent(interval=0.35))
+        mem = psutil.virtual_memory()
+        snapshot["memory_percent"] = float(mem.percent)
+        snapshot["memory_available_gb"] = _gb(mem.available)
+    except Exception:
+        # 没有 psutil 时，Windows 下用 wmic 兜底，保证前端 CPU/内存不会一直显示为 -。
+        if os.name == "nt":
+            try:
+                result = subprocess.run(
+                    ["wmic", "cpu", "get", "loadpercentage", "/value"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    timeout=3,
+                    shell=False,
+                )
+                vals = []
+                for line in (result.stdout or "").splitlines():
+                    line = line.strip()
+                    if line.lower().startswith("loadpercentage="):
+                        vals.append(float(line.split("=", 1)[1].strip()))
+                if vals:
+                    snapshot["cpu_percent"] = max(0.0, min(100.0, sum(vals) / len(vals)))
+            except Exception:
+                pass
+            try:
+                result = subprocess.run(
+                    ["wmic", "OS", "get", "FreePhysicalMemory,TotalVisibleMemorySize", "/value"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    timeout=3,
+                    shell=False,
+                )
+                vals = {}
+                for line in (result.stdout or "").splitlines():
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        vals[k.strip().lower()] = float(v.strip() or 0)
+                free_kb = vals.get("freephysicalmemory")
+                total_kb = vals.get("totalvisiblememorysize")
+                if free_kb and total_kb:
+                    snapshot["memory_percent"] = max(0.0, min(100.0, (1.0 - free_kb / total_kb) * 100.0))
+                    snapshot["memory_available_gb"] = free_kb / 1024.0 / 1024.0
+            except Exception:
+                pass
+
+    disk_path = Path(path_for_disk or RUNTIME_DIR)
+    try:
+        disk_path = disk_path.resolve()
+        if disk_path.is_file():
+            disk_path = disk_path.parent
+    except Exception:
+        disk_path = Path(RUNTIME_DIR)
+
+    try:
+        import psutil  # type: ignore
+        usage = psutil.disk_usage(str(disk_path))
+        snapshot["disk_percent"] = float(usage.percent)
+        snapshot["disk_free_gb"] = _gb(usage.free)
+        snapshot["disk_path"] = str(disk_path)
+    except Exception:
+        try:
+            usage = shutil.disk_usage(str(disk_path))
+            total = float(usage.total or 1)
+            used = float(usage.used)
+            snapshot["disk_percent"] = used / total * 100.0
+            snapshot["disk_free_gb"] = _gb(usage.free)
+            snapshot["disk_path"] = str(disk_path)
+        except Exception:
+            pass
+
+    return snapshot
+
+
+def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: int) -> tuple[int, dict]:
+    """根据当前电脑负载和模块固定资源大小自动降低并行进程数，防止卡死/崩溃。"""
+    requested = clamp_parallel_workers(requested_workers, task_manager.max_process_slots)
+    safe = requested
+    reasons: list[str] = []
+
+    # 找一个输出目录或 runtime 所在盘用于磁盘余量判断。
+    disk_probe = RUNTIME_DIR
+    try:
+        for field in module.get("inputs", []) or []:
+            key = field.get("key")
+            if key and is_output_field(field) and inputs.get(key):
+                disk_probe = Path(str(inputs.get(key)))
+                break
+    except Exception:
+        pass
+
+    pressure = get_runtime_pressure_snapshot(disk_probe)
+    cpu = pressure.get("cpu_percent")
+    mem_percent = pressure.get("memory_percent")
+    mem_avail = pressure.get("memory_available_gb")
+    disk_percent = pressure.get("disk_percent")
+    disk_free = pressure.get("disk_free_gb")
+
+    # CPU 已经较忙时，少开新进程；否则会直接把电脑打满。
+    if cpu is not None:
+        if cpu >= 80:
+            safe = min(safe, 1)
+            reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 已很高")
+        elif cpu >= 58:
+            safe = min(safe, 2)
+            reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 偏高")
+        elif cpu >= 58:
+            safe = min(safe, max(2, min(task_manager.suggested_process_slots, 4)))
+            reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 较高")
+
+    # 内存是重模型遥感任务最容易卡死的原因。
+    if mem_percent is not None and mem_avail is not None:
+        if mem_percent >= 85 or mem_avail <= 4.0:
+            safe = min(safe, 1)
+            reasons.append(f"内存压力过高：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
+        elif mem_percent >= 76 or mem_avail <= 8.0:
+            safe = min(safe, 2)
+            reasons.append(f"内存压力偏高：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
+        elif mem_percent >= 68 or mem_avail <= 12.0:
+            safe = min(safe, 3)
+            reasons.append(f"内存余量有限：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
+
+    # 固定模型虽然不再复制，但每个进程通常会各加载一份到内存。
+    resource_bytes, resource_examples = estimate_fixed_resource_bytes(module)
+    resource_gb = _gb(resource_bytes)
+    if resource_gb >= 0.5 and mem_avail is not None:
+        per_worker_gb = max(2.5, resource_gb * 2.0 + 0.5)
+        by_memory = max(1, int((mem_avail * 0.60) // per_worker_gb))
+        if by_memory < safe:
+            safe = min(safe, by_memory)
+            examples = "；".join(resource_examples[:3]) if resource_examples else f"约 {resource_gb:.1f}GB"
+            reasons.append(
+                f"检测到固定模型/资源约 {resource_gb:.1f}GB（{examples}），"
+                f"按可用内存估算安全并发为 {by_memory}"
+            )
+
+    if resource_gb >= 1.0:
+        try:
+            heavy_cap = int(os.environ.get("LOCAL_WEB_HEAVY_MODEL_MAX_WORKERS", "2") or 2)
+        except Exception:
+            heavy_cap = 3
+        heavy_cap = max(1, heavy_cap)
+        if safe > heavy_cap:
+            safe = min(safe, heavy_cap)
+            reasons.append(f"该模块属于大模型/大资源任务，默认安全上限为 {heavy_cap}")
+
+    # 磁盘空间/使用率保护。即使不复制固定资源，输出文件和日志也需要空间。
+    if disk_percent is not None and disk_free is not None:
+        if disk_percent >= 92 or disk_free <= 8.0:
+            safe = min(safe, 1)
+            reasons.append(f"磁盘空间不足：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
+        elif disk_percent >= 86 or disk_free <= 15.0:
+            safe = min(safe, 2)
+            reasons.append(f"磁盘空间偏紧：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
+        elif disk_percent >= 80 or disk_free <= 25.0:
+            safe = min(safe, max(2, min(safe, 3)))
+            reasons.append(f"磁盘余量有限：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
+
+    safe = max(1, min(requested, safe))
+    adjusted = safe < requested
+    report = {
+        "requested_workers": requested,
+        "effective_workers": safe,
+        "adjusted": adjusted,
+        "reasons": reasons,
+        "cpu_percent": cpu,
+        "memory_percent": mem_percent,
+        "memory_available_gb": mem_avail,
+        "disk_percent": disk_percent,
+        "disk_free_gb": disk_free,
+        "fixed_resource_gb": resource_gb,
+        "fixed_resource_examples": resource_examples,
+    }
+    return safe, report
+
+
+def apply_parallel_adjustment_to_inputs(inputs: dict, report: dict) -> dict:
+    new_inputs = dict(inputs or {})
+    requested = int(report.get("requested_workers") or 1)
+    effective = int(report.get("effective_workers") or requested)
+    new_inputs["parallel_workers"] = effective
+    new_inputs["_parallel_workers"] = effective
+    new_inputs["_requested_parallel_workers"] = requested
+    new_inputs["_effective_parallel_workers"] = effective
+    new_inputs["_parallel_auto_adjusted"] = bool(report.get("adjusted"))
+    if report.get("adjusted"):
+        reason_text = "；".join(report.get("reasons") or []) or "系统负载保护"
+        new_inputs["_parallel_adjust_reason"] = reason_text
+    return new_inputs
+
+
 def parse_parallel_patterns(pattern_text: str | None) -> list[str]:
     raw = str(pattern_text or DEFAULT_PARALLEL_PATTERNS)
     parts = []
@@ -3969,27 +4308,16 @@ def choose_parallel_input_key(module: dict, inputs: dict) -> str:
     input_fields = module.get("inputs", []) or []
     for field in input_fields:
         key = field.get("key")
-        if not key or key not in inputs:
-            continue
-        if field.get("control_only") is True or is_output_field(field):
-            continue
-        if field.get("type") in {"file_path", "dir_path"}:
+        if key in inputs and field.get("type") in {"file_path", "dir_path"}:
             return key
 
-    preferred_words = ["input", "infile", "file", "inpath", "folder", "dir", "path", "数据"]
-    output_like_words = ["out", "output", "result", "save", "输出", "结果", "保存"]
+    preferred_words = ["input", "infile", "file", "inpath", "folder", "dir", "path"]
     for word in preferred_words:
         for key, value in inputs.items():
-            key_text = str(key).lower()
-            if any(x in key_text for x in output_like_words):
-                continue
-            if word in key_text and value not in ("", None):
+            if word in str(key).lower() and value not in ("", None):
                 return key
 
     for key, value in inputs.items():
-        key_text = str(key).lower()
-        if any(x in key_text for x in output_like_words):
-            continue
         if value not in ("", None):
             return key
 
@@ -4172,19 +4500,13 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
         chunks = split_evenly(files, workers)
         chunk_root = RUNTIME_DIR / "parallel_chunks" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         chunk_root.mkdir(parents=True, exist_ok=True)
-        source_root = Path(str(input_value)).expanduser().resolve()
 
         for idx, chunk in enumerate(chunks, start=1):
             chunk_dir = chunk_root / f"worker_{idx:02d}"
             chunk_dir.mkdir(parents=True, exist_ok=True)
             used_names: set[str] = set()
             for src in chunk:
-                # 尽量保留输入目录下的相对层级，避免算法依赖子目录结构时被打平。
-                try:
-                    rel = src.resolve().relative_to(source_root)
-                    dst = chunk_dir / rel
-                except Exception:
-                    dst = chunk_dir / unique_chunk_filename(src, used_names)
+                dst = chunk_dir / unique_chunk_filename(src, used_names)
                 link_or_copy_file(src, dst)
 
             job_inputs = dict(inputs)
