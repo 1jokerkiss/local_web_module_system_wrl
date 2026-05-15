@@ -27,15 +27,15 @@ class TaskManager:
         self.cancel_flags: set[str] = set()
 
         # 运行调度器：根据本机 CPU 核数控制同时运行的模块进程数。
-        # 这里按“内存较重的遥感模块”做保守默认值：
-        # - 建议值约为 CPU 核数的 1/3，最高 8；24 核时建议 8。
-        # - 上限值约为 CPU 核数的 1/2，最高 12；24 核时上限 12。
+        # 遥感反演通常会加载大模型/大数组，CPU 核数不能直接等于安全并发。
+        # 这版采用保守默认值：
+        # - 建议值最高 2；16 核/24 核机器也默认建议 2。
+        # - 上限值最高 4；用户可以选更高，但后端仍会按 CPU/内存/磁盘压力自动降级或排队。
         # 如需手动覆盖，可设置环境变量：
         # LOCAL_WEB_SUGGESTED_PROCESS_SLOTS / LOCAL_WEB_MAX_PROCESS_SLOTS。
-        # queued 状态的任务会留在队列里；有空闲槽位后自动启动。
         self.cpu_count = max(1, int(os.cpu_count() or 1))
-        default_suggested_slots = max(1, min(8, (self.cpu_count + 2) // 3))
-        default_max_slots = max(default_suggested_slots, min(12, max(1, self.cpu_count // 2)))
+        default_suggested_slots = max(1, min(2, (self.cpu_count + 7) // 8))
+        default_max_slots = max(default_suggested_slots, min(4, max(1, (self.cpu_count + 3) // 4)))
 
         try:
             env_suggested_slots = int(os.environ.get("LOCAL_WEB_SUGGESTED_PROCESS_SLOTS", "") or default_suggested_slots)
@@ -49,17 +49,17 @@ class TaskManager:
 
         self.max_process_slots = max(1, min(self.cpu_count, env_max_slots))
         self.suggested_process_slots = max(1, min(self.max_process_slots, env_suggested_slots))
-        self.cpu_busy_threshold = float(os.environ.get("LOCAL_WEB_CPU_QUEUE_THRESHOLD", "85"))
+        self.cpu_busy_threshold = float(os.environ.get("LOCAL_WEB_CPU_QUEUE_THRESHOLD", "72"))
         self.scheduler_queue: list[Dict[str, Any]] = []
         self.active_slots: Dict[str, int] = {}
         self.drain_lock = threading.Lock()
         # 运行中保护：批处理/并行任务启动子进程前会检查 CPU、内存和磁盘压力，压力过高时暂停启动新子任务。
-        self.child_launch_cpu_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_CPU_THRESHOLD", "88"))
-        self.child_launch_memory_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_MEMORY_THRESHOLD", "88"))
-        self.child_launch_min_memory_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_MEMORY_GB", "2.5"))
-        self.child_launch_disk_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_DISK_THRESHOLD", "94"))
-        self.child_launch_min_disk_free_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_DISK_FREE_GB", "3"))
-        self.child_launch_wait_seconds = float(os.environ.get("LOCAL_WEB_CHILD_START_WAIT_SECONDS", "5"))
+        self.child_launch_cpu_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_CPU_THRESHOLD", "72"))
+        self.child_launch_memory_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_MEMORY_THRESHOLD", "82"))
+        self.child_launch_min_memory_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_MEMORY_GB", "6"))
+        self.child_launch_disk_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_DISK_THRESHOLD", "90"))
+        self.child_launch_min_disk_free_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_DISK_FREE_GB", "15"))
+        self.child_launch_wait_seconds = float(os.environ.get("LOCAL_WEB_CHILD_START_WAIT_SECONDS", "8"))
         self._last_pressure_log_at: Dict[str, float] = {}
 
         self._load_tasks()
@@ -99,12 +99,57 @@ class TaskManager:
             self._save_tasks()
 
     def _system_cpu_percent(self) -> float | None:
-        """读取本机 CPU 使用率；优先用 psutil，没有安装时用 load average 粗略估算。"""
+        """读取本机 CPU 使用率。
+
+        优先使用 psutil；没有 psutil 时，在 Windows 下用 wmic/typeperf 兜底，
+        避免前端一直显示 “-”。
+        """
         try:
             import psutil  # type: ignore
-            return float(psutil.cpu_percent(interval=0.0))
+            return float(psutil.cpu_percent(interval=0.35))
         except Exception:
             pass
+
+        if os.name == "nt":
+            # 方式 1：wmic，很多 Windows 仍可用。
+            try:
+                result = subprocess.run(
+                    ["wmic", "cpu", "get", "loadpercentage", "/value"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    timeout=3,
+                    shell=False,
+                )
+                text = (result.stdout or "") + "\n" + (result.stderr or "")
+                values = []
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line.lower().startswith("loadpercentage="):
+                        values.append(float(line.split("=", 1)[1].strip()))
+                if values:
+                    return max(0.0, min(100.0, sum(values) / len(values)))
+            except Exception:
+                pass
+
+            # 方式 2：typeperf。
+            try:
+                result = subprocess.run(
+                    ["typeperf", r"\\Processor(_Total)\\% Processor Time", "-sc", "1"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    timeout=5,
+                    shell=False,
+                )
+                import re
+                nums = re.findall(r'"[^"]+","([0-9.]+)"', result.stdout or "")
+                if nums:
+                    return max(0.0, min(100.0, float(nums[-1])))
+            except Exception:
+                pass
 
         try:
             if hasattr(os, "getloadavg"):
@@ -172,7 +217,36 @@ class TaskManager:
                 "available_gb": float(mem.available or 0) / (1024 ** 3),
             }
         except Exception:
-            return {"percent": None, "available_gb": None}
+            pass
+
+        if os.name == "nt":
+            # wmic: FreePhysicalMemory/TotalVisibleMemorySize 单位是 KB。
+            try:
+                result = subprocess.run(
+                    ["wmic", "OS", "get", "FreePhysicalMemory,TotalVisibleMemorySize", "/value"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    timeout=3,
+                    shell=False,
+                )
+                vals = {}
+                for line in (result.stdout or "").splitlines():
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        vals[k.strip().lower()] = float(v.strip() or 0)
+                free_kb = vals.get("freephysicalmemory")
+                total_kb = vals.get("totalvisiblememorysize")
+                if free_kb and total_kb:
+                    used_percent = max(0.0, min(100.0, (1.0 - free_kb / total_kb) * 100.0))
+                    return {
+                        "percent": used_percent,
+                        "available_gb": free_kb / 1024.0 / 1024.0,
+                    }
+            except Exception:
+                pass
+        return {"percent": None, "available_gb": None}
 
     def _disk_usage_snapshot(self) -> Dict[str, Any]:
         try:
@@ -222,14 +296,25 @@ class TaskManager:
         return ""
 
     def _wait_until_safe_to_start_child(self, parent_id: str, label: str):
-        """父并行任务运行期间，系统压力过高时不再启动新子进程，等压力下降再继续。"""
+        """父并行任务运行期间，系统压力过高时不再启动新子进程，等压力下降再继续。
+
+        需要连续两次采样都安全才放行，避免刚启动几个进程时 CPU 还没来得及升高，
+        后续进程又被瞬间全部拉起导致电脑卡死。
+        """
+        safe_samples = 0
         while parent_id not in self.cancel_flags:
             reason = self._runtime_pressure_reason()
             if not reason:
-                return
+                safe_samples += 1
+                if safe_samples >= 2:
+                    return
+                time.sleep(max(1.0, min(self.child_launch_wait_seconds, 3.0)))
+                continue
+
+            safe_samples = 0
             now = time.time()
             last = self._last_pressure_log_at.get(parent_id, 0.0)
-            if now - last >= 15:
+            if now - last >= 12:
                 self._last_pressure_log_at[parent_id] = now
                 self.append_log(
                     parent_id,
@@ -282,11 +367,11 @@ class TaskManager:
         requested = self._normalize_requested_slots(item.get("requested_slots"))
         used = self._used_slots_locked()
         if used + requested > self.max_process_slots:
-            return False, f"进程数超过本机 CPU 上限：当前 {used}/{self.max_process_slots}，本任务需要 {requested}"
+            return False, f"进程数超过本机安全上限：当前 {used}/{self.max_process_slots}，本任务需要 {requested}"
 
-        cpu_percent = self._system_cpu_percent()
-        if used > 0 and cpu_percent is not None and cpu_percent >= self.cpu_busy_threshold:
-            return False, f"当前 CPU 使用率 {cpu_percent:.1f}% 已超过阈值 {self.cpu_busy_threshold:.0f}%"
+        reason = self._runtime_pressure_reason()
+        if reason:
+            return False, f"系统负载过高，暂不启动新任务：{reason}"
 
         return True, ""
 

@@ -1477,6 +1477,67 @@ def merge_admin_fixed_inputs(module: dict, inputs: Dict[str, Any]) -> Dict[str, 
 
 
 
+
+def _resolve_runtime_path_no_copy(raw_value: str | Path, project_root: Path | None = None) -> Path:
+    project_root = project_root or PROJECT_ROOT
+    p = Path(str(raw_value or ""))
+    if not p.is_absolute():
+        p = (project_root / p).resolve()
+    else:
+        p = p.resolve()
+    return p
+
+
+def is_python_source_runtime_module(module: dict, exe_path: Path) -> bool:
+    """判断是否应按 Python 源码模块运行。
+
+    兼容旧模块：有些历史模块没有 runtime_type=python_venv，
+    但有 source_dir / entry_file / python_env_dir / entry_script。
+    这类模块运行时一律不能复制 source，只能直接读取 installed_modules 里的源码和固定资源。
+    """
+    runtime_type = str(module.get("runtime_type") or "").lower()
+    if runtime_type == "python_venv":
+        return True
+    if module.get("python_env_dir"):
+        return True
+    if module.get("source_dir") and (module.get("entry_file") or module.get("entry_script")):
+        return True
+    try:
+        name = exe_path.name.lower()
+        if name in {"python.exe", "python", "python3", "python3.exe"} and (module.get("source_dir") or module.get("entry_script")):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def resolve_python_source_dir_no_copy(module: dict, project_root: Path) -> Path:
+    source_raw = module.get("source_dir") or module.get("working_dir") or ""
+    if not source_raw and module.get("entry_script"):
+        return _resolve_runtime_path_no_copy(module.get("entry_script"), project_root).parent
+    source_dir = _resolve_runtime_path_no_copy(source_raw, project_root)
+    if not source_dir.exists() or not source_dir.is_dir():
+        raise HTTPException(status_code=400, detail=f"Python 源码目录不存在: {source_dir}")
+    return source_dir
+
+
+def resolve_python_entry_no_copy(module: dict, source_dir: Path, project_root: Path) -> Path:
+    entry_script_raw = str(module.get("entry_script") or "").strip()
+    if entry_script_raw:
+        entry_path = _resolve_runtime_path_no_copy(entry_script_raw, project_root)
+        if entry_path.exists() and entry_path.is_file():
+            return entry_path
+
+    entry_name = str(module.get("entry_file") or "main.py").strip() or "main.py"
+    entry_path = source_dir / entry_name
+    if not entry_path.exists():
+        candidates = list(source_dir.rglob(Path(entry_name).name))
+        if candidates:
+            entry_path = candidates[0]
+    if not entry_path.exists() or not entry_path.is_file():
+        raise HTTPException(status_code=400, detail=f"Python 入口脚本不存在: {entry_name}")
+    return entry_path
+
 def coerce_json_marked_inputs(module: dict, inputs: Dict[str, Any]) -> Dict[str, Any]:
     """把自动识别出的复杂 JSON 参数从字符串还原成 dict/list/number/bool。"""
     result = dict(inputs or {})
@@ -1637,40 +1698,18 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
 
         runtime_type = str(module.get("runtime_type") or "").lower()
 
-        if runtime_type == "python_venv":
-            source_dir = Path(str(module.get("source_dir") or module.get("working_dir") or ""))
+        if is_python_source_runtime_module(module, exe_path):
+            source_dir = resolve_python_source_dir_no_copy(module, project_root)
+            entry_path = resolve_python_entry_no_copy(module, source_dir, project_root)
 
-            if not source_dir.is_absolute():
-                source_dir = (project_root / source_dir).resolve()
-            else:
-                source_dir = source_dir.resolve()
-
-            if not source_dir.exists() or not source_dir.is_dir():
-                raise HTTPException(status_code=400, detail=f"Python 源码目录不存在: {source_dir}")
-
-            # 关键修改：运行时绝对不再复制 Python 源码目录，也不复制任何固定资源。
-            # 以前这里会创建 runtime/job_xxx/source 并 copytree(source_dir, run_source_dir)，
-            # 导致 models/resources/LUT/pkl 等固定文件被每个并行子任务复制一份。
-            # 新策略：
-            # 1. entry_script 直接指向 installed_modules/<模块>/source 里的入口脚本；
-            # 2. cwd 直接设置为 installed_modules/<模块>/source，算法相对读取 pkl/resources 时读原始那一份；
-            # 3. 每个任务只在 runtime/job_xxx 下生成独立 config.json，避免并行参数互相覆盖；
-            # 4. 不创建 runtime/job_xxx/source，不创建硬链接，不创建符号链接，更不复制固定资源。
+            # 绝对禁止复制固定资源：不创建 runtime/job_xxx/source。
+            # pkl/model/resources/LUT 等固定文件只保留在 installed_modules/<模块>/source 中。
+            # 每个任务只生成自己的 config.json，入口脚本直接从 source_dir 读取。
             config_path = runtime_task_dir / "config.json"
             config_path.write_text(
                 json.dumps(module_config, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-
-            entry_name = str(module.get("entry_file") or "main.py")
-            entry_path = source_dir / entry_name
-            if not entry_path.exists():
-                candidates = list(source_dir.rglob(entry_name))
-                if candidates:
-                    entry_path = candidates[0]
-
-            if not entry_path.exists():
-                raise HTTPException(status_code=400, detail=f"Python 入口脚本不存在: {entry_name}")
 
             values["config_json"] = str(config_path)
             values["config_path"] = str(config_path)
@@ -1681,7 +1720,7 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
 
             module_dir = source_dir
 
-            runtime_env["RUNTIME_SOURCE_MODE"] = "installed_source_no_copy"
+            runtime_env["RUNTIME_SOURCE_MODE"] = "installed_source_no_copy_forced"
             runtime_env["RUNTIME_FIXED_RESOURCE_POLICY"] = "read_from_installed_modules_only"
             runtime_env["RUNTIME_SHARED_SOURCE_DIR"] = str(source_dir)
             runtime_env["RUNTIME_CONFIG_ONLY_DIR"] = str(runtime_task_dir)
@@ -1689,7 +1728,8 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
             runtime_env["LOCAL_WEB_MODULE_RUNTIME_DIR"] = str(runtime_task_dir)
             runtime_env["LOCAL_WEB_NO_FIXED_RESOURCE_COPY"] = "1"
 
-            if not command_template:
+            template_text = " ".join(str(x) for x in (command_template or []))
+            if (not command_template) or ("{entry_script}" not in template_text and "entry_script" not in template_text):
                 command_template = ["{executable}", "{entry_script}", "{config_json}"]
 
         else:
@@ -4049,12 +4089,54 @@ def get_runtime_pressure_snapshot(path_for_disk: str | Path | None = None) -> di
 
     try:
         import psutil  # type: ignore
-        snapshot["cpu_percent"] = float(psutil.cpu_percent(interval=0.25))
+        snapshot["cpu_percent"] = float(psutil.cpu_percent(interval=0.35))
         mem = psutil.virtual_memory()
         snapshot["memory_percent"] = float(mem.percent)
         snapshot["memory_available_gb"] = _gb(mem.available)
     except Exception:
-        pass
+        # 没有 psutil 时，Windows 下用 wmic 兜底，保证前端 CPU/内存不会一直显示为 -。
+        if os.name == "nt":
+            try:
+                result = subprocess.run(
+                    ["wmic", "cpu", "get", "loadpercentage", "/value"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    timeout=3,
+                    shell=False,
+                )
+                vals = []
+                for line in (result.stdout or "").splitlines():
+                    line = line.strip()
+                    if line.lower().startswith("loadpercentage="):
+                        vals.append(float(line.split("=", 1)[1].strip()))
+                if vals:
+                    snapshot["cpu_percent"] = max(0.0, min(100.0, sum(vals) / len(vals)))
+            except Exception:
+                pass
+            try:
+                result = subprocess.run(
+                    ["wmic", "OS", "get", "FreePhysicalMemory,TotalVisibleMemorySize", "/value"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    timeout=3,
+                    shell=False,
+                )
+                vals = {}
+                for line in (result.stdout or "").splitlines():
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        vals[k.strip().lower()] = float(v.strip() or 0)
+                free_kb = vals.get("freephysicalmemory")
+                total_kb = vals.get("totalvisiblememorysize")
+                if free_kb and total_kb:
+                    snapshot["memory_percent"] = max(0.0, min(100.0, (1.0 - free_kb / total_kb) * 100.0))
+                    snapshot["memory_available_gb"] = free_kb / 1024.0 / 1024.0
+            except Exception:
+                pass
 
     disk_path = Path(path_for_disk or RUNTIME_DIR)
     try:
@@ -4110,25 +4192,25 @@ def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: 
 
     # CPU 已经较忙时，少开新进程；否则会直接把电脑打满。
     if cpu is not None:
-        if cpu >= 88:
+        if cpu >= 80:
             safe = min(safe, 1)
             reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 已很高")
-        elif cpu >= 78:
+        elif cpu >= 58:
             safe = min(safe, 2)
             reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 偏高")
-        elif cpu >= 68:
+        elif cpu >= 58:
             safe = min(safe, max(2, min(task_manager.suggested_process_slots, 4)))
             reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 较高")
 
     # 内存是重模型遥感任务最容易卡死的原因。
     if mem_percent is not None and mem_avail is not None:
-        if mem_percent >= 90 or mem_avail <= 2.0:
+        if mem_percent >= 85 or mem_avail <= 4.0:
             safe = min(safe, 1)
             reasons.append(f"内存压力过高：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
-        elif mem_percent >= 82 or mem_avail <= 4.0:
+        elif mem_percent >= 76 or mem_avail <= 8.0:
             safe = min(safe, 2)
             reasons.append(f"内存压力偏高：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
-        elif mem_percent >= 72 or mem_avail <= 8.0:
+        elif mem_percent >= 68 or mem_avail <= 12.0:
             safe = min(safe, 3)
             reasons.append(f"内存余量有限：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
 
@@ -4148,7 +4230,7 @@ def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: 
 
     if resource_gb >= 1.0:
         try:
-            heavy_cap = int(os.environ.get("LOCAL_WEB_HEAVY_MODEL_MAX_WORKERS", "3") or 3)
+            heavy_cap = int(os.environ.get("LOCAL_WEB_HEAVY_MODEL_MAX_WORKERS", "2") or 2)
         except Exception:
             heavy_cap = 3
         heavy_cap = max(1, heavy_cap)
@@ -4158,13 +4240,13 @@ def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: 
 
     # 磁盘空间/使用率保护。即使不复制固定资源，输出文件和日志也需要空间。
     if disk_percent is not None and disk_free is not None:
-        if disk_percent >= 95 or disk_free <= 3.0:
+        if disk_percent >= 92 or disk_free <= 8.0:
             safe = min(safe, 1)
             reasons.append(f"磁盘空间不足：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
-        elif disk_percent >= 90 or disk_free <= 8.0:
+        elif disk_percent >= 86 or disk_free <= 15.0:
             safe = min(safe, 2)
             reasons.append(f"磁盘空间偏紧：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
-        elif disk_percent >= 85 or disk_free <= 15.0:
+        elif disk_percent >= 80 or disk_free <= 25.0:
             safe = min(safe, max(2, min(safe, 3)))
             reasons.append(f"磁盘余量有限：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
 
