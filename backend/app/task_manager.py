@@ -657,19 +657,21 @@ class TaskManager:
         )
 
         runtime_source_mode = merged_env.get("RUNTIME_SOURCE_MODE")
-        if runtime_source_mode == "shared_no_copy":
+        if runtime_source_mode in {"shared_no_copy", "shared_no_copy_forced"}:
             self.append_log(
                 task_id,
                 (
-                    "[INFO] Python runtime 使用 shared_no_copy 模式："
+                    "[INFO] Python runtime 使用 shared_no_copy_forced 模式："
                     "不复制源码目录、models、resources 或 pkl 文件；"
-                    "入口脚本和固定资源直接从已安装模块目录读取"
+                    "入口脚本、pkl 模型和固定资源直接从已安装模块目录读取"
                 ),
             )
             if merged_env.get("RUNTIME_SHARED_SOURCE_DIR"):
                 self.append_log(task_id, f"[INFO] 已安装模块源码目录 = {merged_env.get('RUNTIME_SHARED_SOURCE_DIR')}")
             if merged_env.get("RUNTIME_CONFIG_ONLY_DIR"):
                 self.append_log(task_id, f"[INFO] 本任务只生成独立配置目录 = {merged_env.get('RUNTIME_CONFIG_ONLY_DIR')}")
+            if merged_env.get("RUNTIME_SHARED_MODEL_POLICY") == "installed_module_only":
+                self.append_log(task_id, "[INFO] 固定模型读取策略：只读取 installed_modules 中已上传的模型文件，不在 runtime/job_xxx/source 中创建副本")
         else:
             linked_files = merged_env.get("RUNTIME_SHARED_LINKED_FILES")
             copied_small_files = merged_env.get("RUNTIME_COPIED_SMALL_FILES")

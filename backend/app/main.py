@@ -1801,66 +1801,33 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
             if not source_dir.exists() or not source_dir.is_dir():
                 raise HTTPException(status_code=400, detail=f"Python 源码目录不存在: {source_dir}")
 
-            # 默认不再复制 Python 源码目录。
-            # 旧逻辑会把 installed_modules/<module>/source 整个复制到每个 runtime/job_xxx/source，
-            # 当源码目录中包含 1GB+ 的 pkl/模型/resources 文件时，并行 20 多个任务会复制出几十份，
-            # 迅速占满磁盘。现在默认直接从系统已安装目录读取入口脚本和固定资源，
-            # 每个任务只在 runtime/job_xxx 下生成自己独立的 config.json。
-            # 如极少数模块确实需要隔离源码目录，可在模块记录中显式配置：
-            #   "runtime_source_mode": "copy"
-            runtime_source_mode = str(
-                module.get("runtime_source_mode")
-                or module.get("source_runtime_mode")
-                or os.environ.get("LOCAL_WEB_PYTHON_RUNTIME_SOURCE_MODE", "shared")
-            ).strip().lower()
-
+            # 强制 shared_no_copy：Python 模块运行时绝对不再复制 source 目录。
+            # 入口脚本、pkl 模型、resources、LUT、requirements 等固定文件都直接从
+            # backend/installed_modules/<模块>/source 读取。
+            # 每个并行子任务只在 backend/runtime/job_xxx 下生成独立 config.json。
+            # 这样 27 个输入文件并行时，不会再生成 27 份 FY4_CTH_model.pkl。
             entry_name = str(module.get("entry_file") or "main.py")
 
-            if runtime_source_mode in {"copy", "copy_source", "isolated"}:
-                run_source_dir = runtime_task_dir / "source"
-                runtime_copy_stats = copy_python_runtime_source(source_dir, run_source_dir)
-                runtime_env["RUNTIME_SOURCE_MODE"] = "copy_with_links"
-                runtime_env["RUNTIME_SHARED_LINKED_FILES"] = str(runtime_copy_stats.get("linked_files", 0))
-                runtime_env["RUNTIME_SHARED_HARDLINKED_FILES"] = str(runtime_copy_stats.get("hardlinked_files", 0))
-                runtime_env["RUNTIME_SHARED_SYMLINKED_FILES"] = str(runtime_copy_stats.get("symlinked_files", 0))
-                runtime_env["RUNTIME_SHARED_BYTES"] = str(runtime_copy_stats.get("shared_bytes", 0))
-                runtime_env["RUNTIME_COPIED_SMALL_FILES"] = str(runtime_copy_stats.get("copied_files", 0))
+            config_path = runtime_task_dir / "config.json"
+            config_path.write_text(
+                json.dumps(module_config, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
-                config_path = runtime_task_dir / "config.json"
-                config_path.write_text(
-                    json.dumps(module_config, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+            entry_path = source_dir / entry_name
+            if not entry_path.exists():
+                candidates = list(source_dir.rglob(entry_name))
+                if candidates:
+                    entry_path = candidates[0]
 
-                entry_path = run_source_dir / entry_name
-                if not entry_path.exists():
-                    candidates = list(run_source_dir.rglob(entry_name))
-                    if candidates:
-                        entry_path = candidates[0]
-
-                module_dir = run_source_dir
-            else:
-                # shared 模式：不复制源码、不复制 models、不复制 resources。
-                # 入口脚本、pkl 模型、LUT、resources 都从 installed_modules 中已上传的那一份读取。
-                config_path = runtime_task_dir / "config.json"
-                config_path.write_text(
-                    json.dumps(module_config, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-
-                entry_path = source_dir / entry_name
-                if not entry_path.exists():
-                    candidates = list(source_dir.rglob(entry_name))
-                    if candidates:
-                        entry_path = candidates[0]
-
-                module_dir = source_dir
-                runtime_env["RUNTIME_SOURCE_MODE"] = "shared_no_copy"
-                runtime_env["RUNTIME_SHARED_SOURCE_DIR"] = str(source_dir)
-                runtime_env["RUNTIME_CONFIG_ONLY_DIR"] = str(runtime_task_dir)
-                runtime_env["RUNTIME_SHARED_LINKED_FILES"] = "0"
-                runtime_env["RUNTIME_COPIED_SMALL_FILES"] = "0"
-                runtime_env["RUNTIME_SHARED_BYTES"] = "0"
+            module_dir = source_dir
+            runtime_env["RUNTIME_SOURCE_MODE"] = "shared_no_copy_forced"
+            runtime_env["RUNTIME_SHARED_SOURCE_DIR"] = str(source_dir)
+            runtime_env["RUNTIME_CONFIG_ONLY_DIR"] = str(runtime_task_dir)
+            runtime_env["RUNTIME_SHARED_MODEL_POLICY"] = "installed_module_only"
+            runtime_env["RUNTIME_SHARED_LINKED_FILES"] = "0"
+            runtime_env["RUNTIME_COPIED_SMALL_FILES"] = "0"
+            runtime_env["RUNTIME_SHARED_BYTES"] = "0"
 
             if not entry_path.exists():
                 raise HTTPException(status_code=400, detail=f"Python 入口脚本不存在: {entry_name}")
