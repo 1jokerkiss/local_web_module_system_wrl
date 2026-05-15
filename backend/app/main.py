@@ -210,7 +210,14 @@ class PythonFolderModuleUploadRequest(BaseModel):
 class PythonModuleConfigRequest(BaseModel):
     path: str
 # 通用辅助函数
-VALID_PARALLEL_MODES = {"none", "auto", "single_file", "folder_chunks", "module_internal"}
+VALID_PARALLEL_MODES = {
+    "none",
+    "auto",
+    "single_file",
+    "folder_chunks",
+    "module_internal",
+    "batch_group",
+}
 DEFAULT_PARALLEL_PATTERNS = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
 
 # 初始默认工具栏。现在云反演 / 气溶胶反演也按普通动态工具栏处理，
@@ -1167,30 +1174,35 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
     if not module.get("enabled", True):
         raise HTTPException(status_code=400, detail="模块已禁用")
 
-    # 直接使用前端传来的用户选择路径；管理员固定输入在这里补齐。
+    # 1. 合并输入参数
     inputs = merge_admin_fixed_inputs(module, payload.inputs or {})
     inputs = coerce_json_marked_inputs(module, inputs)
-    requested_parallel_workers = clamp_parallel_workers(payload.parallel_workers, task_manager.max_process_slots)
 
-    # 必填校验。
+    requested_workers = clamp_parallel_workers(
+        payload.parallel_workers,
+        task_manager.max_process_slots,
+    )
+
+    # 2. 必填校验
     for field in module.get("inputs", []) or []:
         key = field.get("key")
-        required = field.get("required", False)
         if not key:
             continue
         if field.get("control_only") is True:
             continue
+
+        required = bool(field.get("required", False))
         if required and (key not in inputs or inputs.get(key) in ("", None)):
             raise HTTPException(status_code=400, detail=f"缺少必填参数: {key}")
 
-    # control_only 字段不写入 config.json。
+    # 3. control_only 不写入 config
     for field in module.get("inputs", []) or []:
         if field.get("control_only") is True:
             key = field.get("key")
             if key:
                 inputs.pop(key, None)
 
-    # 输出目录只负责创建，不改写用户选择的路径。
+    # 4. 输出目录只创建，不改写用户路径
     for field in module.get("inputs", []) or []:
         key = field.get("key")
         if not key or not is_output_field(field):
@@ -1202,68 +1214,78 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
 
         field_type = str(field.get("type", "")).lower()
         p = Path(value)
+
         if field_type == "dir_path":
             p.mkdir(parents=True, exist_ok=True)
         elif field_type == "file_path" and p.parent:
             p.parent.mkdir(parents=True, exist_ok=True)
 
-    # 自动安全调整：用户可以选进程数，但最终启动前会根据 CPU/内存/磁盘/模型大小降低到安全值。
-    parallel_workers, adjust_report = auto_adjust_parallel_workers(module, inputs, requested_parallel_workers)
+    # 5. 根据 CPU/内存/磁盘/模型大小自动降低进程数
+    workers, adjust_report = auto_adjust_parallel_workers(
+        module,
+        inputs,
+        requested_workers,
+    )
     inputs = apply_parallel_adjustment_to_inputs(inputs, adjust_report)
 
-    # 旧系统进程池批处理：只要识别到批处理目录，就算进程数是 1，也先拆成具体文件 job。
-    if _is_batch_request(module, inputs):
-        jobs, output_paths = build_batch_jobs_for_module(module, inputs, parallel_workers)
+    # 6. 统一决定运行方式
+    run_mode = resolve_run_parallel_mode(module, inputs, workers)
+    output_paths = collect_output_paths_from_inputs(module, inputs)
+
+    # 6.1 C++/多输入目录批处理模式
+    if run_mode == "batch_group":
+        jobs, batch_output_paths = build_batch_jobs_for_module(module, inputs, workers)
         task = task_manager.submit_batch_group(
             module_id=module["id"],
             module_name=module.get("name", module["id"]),
             jobs=jobs,
-            max_parallel=parallel_workers,
+            max_parallel=workers,
             owner_username=username,
         )
-        if output_paths:
+
+        scan_paths = batch_output_paths or output_paths
+        if scan_paths:
             start_data_file_scan_after_task(
                 task["id"],
                 module,
-                output_paths,
+                scan_paths,
                 owner_username=username,
             )
+
         return task
 
-    # 文件夹型模块的平台级并行：模块本身只接收一个文件夹时，平台拆分为多个 worker_xx 文件夹。
-    if parallel_workers > 1:
-        parallel_mode = str(normalize_parallel_config(module).get("mode") or "auto").strip() or "auto"
-        if parallel_mode != "module_internal":
-            parallel_jobs = prepare_parallel_jobs(module, inputs, parallel_workers)
-            if len(parallel_jobs) > 1:
-                task_inputs = dict(inputs)
-                task_inputs["parallel_workers"] = parallel_workers
-                task_inputs["_parallel_workers"] = parallel_workers
-                task_inputs["_parallel_job_count"] = len(parallel_jobs)
-                task_inputs["_parallel_mode"] = parallel_mode
+    # 6.2 平台级并行拆分
+    if run_mode == "platform_split":
+        jobs = prepare_parallel_jobs(module, inputs, workers)
 
-                task = task_manager.submit_parallel_module_task(
-                    module_id=module["id"],
-                    module_name=module.get("name", module["id"]),
-                    jobs=parallel_jobs,
-                    inputs=task_inputs,
-                    max_workers=parallel_workers,
+        if len(jobs) > 1:
+            task_inputs = dict(inputs)
+            task_inputs["parallel_workers"] = workers
+            task_inputs["_parallel_workers"] = workers
+            task_inputs["_parallel_job_count"] = len(jobs)
+            task_inputs["_parallel_mode"] = str(normalize_parallel_config(module).get("mode") or "auto")
+
+            task = task_manager.submit_parallel_module_task(
+                module_id=module["id"],
+                module_name=module.get("name", module["id"]),
+                jobs=jobs,
+                inputs=task_inputs,
+                max_workers=workers,
+                owner_username=username,
+            )
+
+            if output_paths:
+                start_data_file_scan_after_task(
+                    task["id"],
+                    module,
+                    output_paths,
                     owner_username=username,
                 )
 
-                output_paths = collect_output_paths_from_inputs(module, inputs)
-                if output_paths:
-                    start_data_file_scan_after_task(
-                        task["id"],
-                        module,
-                        output_paths,
-                        owner_username=username,
-                    )
-                return task
+            return task
 
-    # 非批处理模块：如果模块内部自己处理并行，则把安全调整后的进程数传给模块。
-    output_paths = collect_output_paths_from_inputs(module, inputs)
-
+    # 6.3 模块内部并行 / 普通单进程
+    # module_internal 不拆任务，只把 parallel_workers 写入 config.json。
     command, working_dir, runtime_env = build_runtime_for_module(module, inputs)
 
     task = task_manager.submit_module_task(
@@ -4505,7 +4527,49 @@ def get_runtime_pressure_snapshot(path_for_disk: str | Path | None = None) -> di
 
     return snapshot
 
+def resolve_run_parallel_mode(module: dict, inputs: dict, workers: int) -> str:
+    """
+    统一决定任务运行方式，避免 batch_group / 平台拆分 / 模块内部并行混在一起。
 
+    返回：
+    - none：普通单进程运行
+    - module_internal：模块自己处理并行，平台不拆任务，只把 parallel_workers 写入 config.json
+    - platform_split：平台按文件/文件夹拆成多个子进程
+    - batch_group：多输入目录按时次匹配，生成批处理子任务
+    """
+    cfg = normalize_parallel_config(module)
+    mode = str(cfg.get("mode") or "auto").strip() or "auto"
+
+    if mode not in VALID_PARALLEL_MODES:
+        mode = "auto"
+
+    # 显式 none：永远不拆。
+    if mode == "none":
+        return "none"
+
+    # 显式模块内部并行：永远不拆。
+    if mode == "module_internal":
+        return "module_internal"
+
+    # 显式批处理：按多输入目录匹配。
+    if mode == "batch_group":
+        return "batch_group"
+
+    # 显式平台拆分。
+    if mode in {"single_file", "folder_chunks"}:
+        return "platform_split" if workers > 1 else "none"
+
+    # auto 模式：
+    # 1. 如果配置了 batch_role，例如 B01/B03/B06/SOLAR，走批处理；
+    # 2. 否则 workers > 1 才走平台拆分；
+    # 3. workers == 1 就普通运行。
+    if _is_batch_request(module, inputs):
+        return "batch_group"
+
+    if workers > 1:
+        return "platform_split"
+
+    return "none"
 def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: int) -> tuple[int, dict]:
     """根据当前电脑负载和模块固定资源大小自动降低并行进程数，防止卡死/崩溃。"""
     requested = clamp_parallel_workers(requested_workers, task_manager.max_process_slots)
@@ -4532,15 +4596,16 @@ def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: 
 
     # CPU 已经较忙时，少开新进程；否则会直接把电脑打满。
     if cpu is not None:
-        if cpu >= 80:
-            safe = min(safe, 1)
-            reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 已很高")
-        elif cpu >= 58:
-            safe = min(safe, 2)
-            reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 偏高")
-        elif cpu >= 58:
-            safe = min(safe, max(2, min(task_manager.suggested_process_slots, 4)))
-            reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 较高")
+        if cpu is not None:
+            if cpu >= 80:
+                safe = min(safe, 1)
+                reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 已很高")
+            elif cpu >= 68:
+                safe = min(safe, 2)
+                reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 较高")
+            elif cpu >= 58:
+                safe = min(safe, max(2, min(task_manager.suggested_process_slots, 3)))
+                reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 偏高")
 
     # 内存是重模型遥感任务最容易卡死的原因。
     if mem_percent is not None and mem_avail is not None:
