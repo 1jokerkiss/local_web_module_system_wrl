@@ -65,7 +65,50 @@ class TaskManager:
 
         self._load_tasks()
         self._mark_interrupted_tasks()
+        self._scheduler_heartbeat_thread = threading.Thread(
+            target=self._scheduler_heartbeat,
+            daemon=True,
+        )
+        self._scheduler_heartbeat_thread.start()
+    def kick_scheduler(self):
+        """
+        外部主动唤醒调度器。
+        前端轮询 /api/tasks 或 /api/system/resources 时调用，
+        防止任务已经 queued 但调度器没有继续 drain。
+        """
+        try:
+            self._drain_scheduler_queue()
+        except Exception as exc:
+            try:
+                with self.lock:
+                    for item in self.scheduler_queue:
+                        task_id = str(item.get("task_id") or "")
+                        task = self.tasks.get(task_id)
+                        if task and task.get("status") == "queued":
+                            task["queue_reason"] = (
+                                f"调度器唤醒失败: {type(exc).__name__}: {exc}"
+                            )
+                self._save_tasks()
+            except Exception:
+                pass
+    def _scheduler_heartbeat(self):
+        """
+        调度器心跳。
+        防止某次 enqueue/drain 因异常或热重载时机导致 queued 任务没有被启动。
+        """
+        while True:
+            time.sleep(1.0)
+            try:
+                with self.lock:
+                    has_queued = any(
+                        (self.tasks.get(str(item.get("task_id") or "")) or {}).get("status") == "queued"
+                        for item in self.scheduler_queue
+                    )
 
+                if has_queued:
+                    self._drain_scheduler_queue()
+            except Exception:
+                pass
     def _load_tasks(self):
         if not self.tasks_file.exists():
             self.tasks = {}
@@ -202,10 +245,16 @@ class TaskManager:
                 continue
             requested = self._normalize_requested_slots(item.get("requested_slots"))
             task["queue_position"] = pos
-            task["queue_reason"] = (
-                f"等待本地 CPU 空闲：当前占用 {used}/{self.max_process_slots}，"
-                f"本任务需要 {requested} 个进程槽"
-            )
+            if used == 0 and requested <= self.max_process_slots:
+                task["queue_reason"] = (
+                    f"调度器等待启动：当前占用 {used}/{self.max_process_slots}，"
+                    f"本任务需要 {requested} 个进程槽。若长时间不启动，请检查后端是否使用 --reload 或调度器是否异常。"
+                )
+            else:
+                task["queue_reason"] = (
+                    f"等待本地 CPU 空闲：当前占用 {used}/{self.max_process_slots}，"
+                    f"本任务需要 {requested} 个进程槽"
+                )
             pos += 1
 
 
