@@ -1333,10 +1333,176 @@ def _is_path_inside(child: Path, parent: Path) -> bool:
         return False
 
 
+def _chmod_and_retry_remove(func, path, exc_info):
+    """Windows 删除模块目录时，部分文件可能是只读属性，先改权限再重试。"""
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    except Exception:
+        pass
+    try:
+        func(path)
+    except Exception:
+        raise
+
+
+def _terminate_process_tree_for_delete(process, timeout: float = 2.0):
+    """删除模块前终止平台启动的子进程，避免 pkl/tif/dll 被进程占用导致 WinError 5。"""
+    if process is None:
+        return
+
+    try:
+        pid = int(getattr(process, "pid", 0) or 0)
+    except Exception:
+        pid = 0
+
+    # psutil 可用时，连同子进程一起停掉；不可用时退化为 Popen.terminate/kill。
+    if pid > 0:
+        try:
+            import psutil  # type: ignore
+
+            root = psutil.Process(pid)
+            procs = root.children(recursive=True) + [root]
+            for p in procs:
+                try:
+                    if p.is_running():
+                        p.terminate()
+                except Exception:
+                    pass
+            gone, alive = psutil.wait_procs(procs, timeout=timeout)
+            for p in alive:
+                try:
+                    if p.is_running():
+                        p.kill()
+                except Exception:
+                    pass
+            psutil.wait_procs(alive, timeout=timeout)
+            return
+        except Exception:
+            pass
+
+    try:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=timeout)
+            except Exception:
+                process.kill()
+                try:
+                    process.wait(timeout=timeout)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _kill_external_processes_using_paths(paths: list[Path], timeout: float = 2.0) -> list[dict]:
+    """服务热重载或手动启动的旧 Python 进程可能不在 task_manager.processes 中。
+
+    这里按命令行中是否包含模块安装目录/模块环境目录进行清理，避免删除模块时文件仍被占用。
+    没有 psutil 时直接跳过，不影响主流程。
+    """
+    killed: list[dict] = []
+    normalized = []
+    for p in paths:
+        try:
+            if p:
+                normalized.append(str(p.resolve()).lower())
+        except Exception:
+            pass
+    if not normalized:
+        return killed
+
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return killed
+
+    current_pid = os.getpid()
+    targets = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            pid = int(proc.info.get("pid") or 0)
+            if pid <= 0 or pid == current_pid:
+                continue
+            cmdline = proc.info.get("cmdline") or []
+            text = " ".join(str(x) for x in cmdline).lower()
+            if not text:
+                continue
+            if any(item in text for item in normalized):
+                targets.append(proc)
+        except Exception:
+            continue
+
+    for proc in targets:
+        try:
+            proc.terminate()
+            killed.append({"pid": proc.pid, "name": proc.name(), "action": "terminate"})
+        except Exception:
+            pass
+    try:
+        _, alive = psutil.wait_procs(targets, timeout=timeout)
+        for proc in alive:
+            try:
+                proc.kill()
+                killed.append({"pid": proc.pid, "name": proc.name(), "action": "kill"})
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return killed
+
+
+def _cancel_module_tasks_before_delete(module_id: str) -> dict:
+    """删除模块前取消该模块相关 running/queued 任务并释放文件句柄。"""
+    cancelled: list[str] = []
+    stopped_processes: list[int] = []
+
+    try:
+        with task_manager.lock:
+            target_ids = []
+            for tid, task in list(task_manager.tasks.items()):
+                if not isinstance(task, dict):
+                    continue
+                if str(task.get("module_id") or "") == str(module_id):
+                    target_ids.append(tid)
+                    for child_id in task.get("children") or []:
+                        if child_id not in target_ids:
+                            target_ids.append(child_id)
+
+            for tid in target_ids:
+                task_manager._remove_from_scheduler_queue_locked(tid)
+                task = task_manager.tasks.get(tid)
+                if task and task.get("status") not in TERMINAL_STATUSES:
+                    task["status"] = "cancelled"
+                    task["ended_at"] = now_iso()
+                    task.setdefault("logs", []).append("[SYSTEM] 删除模块前已自动取消任务，释放模块文件占用")
+                    cancelled.append(tid)
+
+                task_manager.cancel_flags.add(tid)
+                task_manager.active_slots.pop(tid, None)
+
+                process = task_manager.processes.get(tid)
+                if process is not None:
+                    try:
+                        stopped_processes.append(int(process.pid))
+                    except Exception:
+                        pass
+                    _terminate_process_tree_for_delete(process)
+                    task_manager.processes.pop(tid, None)
+
+        task_manager._save_tasks()
+    except Exception:
+        # 删除模块时不要因为任务状态清理失败直接中断，后续 rmtree 仍会给出明确错误。
+        pass
+
+    return {
+        "cancelled_task_ids": cancelled,
+        "stopped_process_pids": stopped_processes,
+    }
+
+
 def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
-    """
-    只允许删除指定安全目录下的文件或文件夹。
-    """
+    """只允许删除指定安全目录下的文件或文件夹；Windows 下自动重试并处理只读属性。"""
     path = path.resolve()
 
     if not path.exists():
@@ -1351,21 +1517,36 @@ def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
             detail=f"拒绝删除非模块目录路径: {path}",
         )
 
-    try:
-        if path.is_dir():
-            shutil.rmtree(path, ignore_errors=False)
-        else:
-            path.unlink()
+    last_exc = None
+    for attempt in range(1, 8):
+        try:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=False, onerror=_chmod_and_retry_remove)
+            else:
+                try:
+                    os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+                except Exception:
+                    pass
+                path.unlink()
 
-        return {
-            "path": str(path),
-            "status": "deleted",
-        }
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"删除模块本地文件失败: {path}，原因: {exc}",
-        )
+            return {
+                "path": str(path),
+                "status": "deleted",
+                "attempts": attempt,
+            }
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(0.35 * attempt)
+
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            f"删除模块本地文件失败: {path}\n"
+            f"原因: {last_exc}\n\n"
+            "通常是模块任务还在运行，或 Python/GDAL 仍占用 pkl/tif/dll 文件。"
+            "请先停止该模块任务，关闭打开该目录的资源管理器/预览窗口，然后再删除。"
+        ),
+    )
 
 
 def remove_module(module_id: str) -> dict:
@@ -1405,6 +1586,12 @@ def remove_module(module_id: str) -> dict:
         PYTHON_MODULE_ENVS_DIR,
     ]
 
+    # 删除模块前，先取消该模块相关任务并终止仍在使用模块目录的 Python 进程。
+    cleanup_report = _cancel_module_tasks_before_delete(module_id)
+    external_killed = _kill_external_processes_using_paths([installed_dir, env_dir])
+    # 给 Windows / GDAL / joblib 一点时间释放文件句柄。
+    time.sleep(0.8)
+
     deleted_paths = []
 
     # 删除模块安装目录：backend/installed_modules/{module_id}
@@ -1424,6 +1611,8 @@ def remove_module(module_id: str) -> dict:
         "removed": True,
         "module_id": module_id,
         "deleted_paths": deleted_paths,
+        "cleanup_report": cleanup_report,
+        "external_killed_processes": external_killed,
     }
 
 
