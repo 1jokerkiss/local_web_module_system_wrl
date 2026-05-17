@@ -4882,12 +4882,29 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
             # 传入单个文件时退化为 single_file。
             return prepare_parallel_jobs({**module, "parallel": {**normalize_parallel_config(module), "mode": "single_file"}}, inputs, workers)
 
-        chunks = split_evenly(files, workers)
+        # 稳定进程池语义：并行进程数 = 同时运行的子任务数，而不是把文件预先切成 workers 份。
+        # 例如目录里有 27 个文件、用户选择 4 个进程，就创建 27 个单文件 job；
+        # TaskManager 始终保持最多 4 个子进程同时运行，一个完成后立即补上下一个。
+        # 如果少数模块确实希望一个 job 处理多个文件，可在 module.json 的 parallel.files_per_job 中显式配置。
+        parallel_cfg = normalize_parallel_config(module)
+        try:
+            files_per_job = int(parallel_cfg.get("files_per_job") or 1)
+        except Exception:
+            files_per_job = 1
+        files_per_job = max(1, files_per_job)
+
+        job_units: list[list[Path]] = []
+        if files_per_job <= 1:
+            job_units = [[f] for f in files]
+        else:
+            for i in range(0, len(files), files_per_job):
+                job_units.append(files[i:i + files_per_job])
+
         chunk_root = RUNTIME_DIR / "parallel_chunks" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         chunk_root.mkdir(parents=True, exist_ok=True)
 
-        for idx, chunk in enumerate(chunks, start=1):
-            chunk_dir = chunk_root / f"worker_{idx:02d}"
+        for idx, chunk in enumerate(job_units, start=1):
+            chunk_dir = chunk_root / f"job_{idx:04d}"
             chunk_dir.mkdir(parents=True, exist_ok=True)
             used_names: set[str] = set()
             for src in chunk:
@@ -4898,13 +4915,18 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
             job_inputs[input_key] = str(chunk_dir.resolve())
             job_inputs["_parallel_workers"] = 1
             job_inputs["_parallel_index"] = idx
-            job_inputs["_parallel_total"] = len(chunks)
+            job_inputs["_parallel_total"] = len(job_units)
             job_inputs["_parallel_chunk_file_count"] = len(chunk)
+            job_inputs["_parallel_pool_size"] = workers
             command, working_dir, runtime_env = build_runtime_for_module(module, job_inputs)
+            if len(chunk) == 1:
+                label = f"{idx}/{len(job_units)} {chunk[0].name}"
+            else:
+                label = f"job_{idx:04d} ({len(chunk)} files)"
             jobs.append({
                 "module_id": module.get("id", ""),
                 "module_name": module.get("name", module.get("id", "")),
-                "label": f"worker_{idx:02d} ({len(chunk)} files)",
+                "label": label,
                 "command": command,
                 "working_dir": working_dir,
                 "env": runtime_env,

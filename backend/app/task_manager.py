@@ -727,11 +727,14 @@ class TaskManager:
         )
 
         self._append_parallel_adjustment_log(parent["id"], inputs)
+        # 并行父任务必须按真实并行数申请进程槽。
+        # 旧版这里写成 requested_slots=1，导致任务日志显示只占 1 个槽，
+        # 但内部却可能启动 4/6/8 个子进程，系统负载统计和排队判断都会失真。
         self._enqueue_task_runner(
             parent["id"],
             self._run_parallel_task,
             (parent["id"], jobs, max_workers),
-            requested_slots=1,
+            requested_slots=max_workers,
         )
         return self.get_task(parent["id"]) or parent
 
@@ -819,7 +822,8 @@ class TaskManager:
         )
         self.append_log(parent_id, f"[INFO] 批处理开始，共 {total} 个子任务")
         self.append_log(parent_id, f"[INFO] 用户选择并发数 = {max_parallel}；系统会逐个启动子进程，负载高时暂停启动新进程")
-        self.append_log(parent_id, "[SAFE] 轻量化调度：不一次性提交全部子任务，只在 CPU/内存/磁盘安全时启动下一个子任务。")
+        self.append_log(parent_id, "[POOL] 稳定进程池：最多同时运行 max_parallel 个子任务；一个完成后补一个；检测到高负载时先等已有子任务完成，再决定是否补位。")
+        self.append_log(parent_id, "[SAFE] 启动新子进程前检查 CPU/内存/磁盘，真正接近危险阈值时才暂停补位。")
 
         job_items = list(child_job_map.items())
         next_index = 0
@@ -841,13 +845,21 @@ class TaskManager:
 
         with ThreadPoolExecutor(max_workers=max_parallel) as executor:
             running: Dict[Any, str] = {}
+            paused_by_pressure = False
             while (next_index < total or running) and parent_id not in self.cancel_flags:
                 launched_any = False
                 while next_index < total and len(running) < max_parallel and parent_id not in self.cancel_flags:
                     child_id, job = job_items[next_index]
                     label = job.get("label") or child_id
+
+                    # 一旦检测到 CPU/内存/磁盘压力，就不要在没有子任务完成的情况下继续补位。
+                    # 这样不会出现“刚提示暂停，马上又把下一个任务提交上去”的情况。
+                    if paused_by_pressure and running:
+                        break
+
                     reason = self._runtime_pressure_reason()
                     if reason:
+                        paused_by_pressure = True
                         now = time.time()
                         last = self._last_pressure_log_at.get(parent_id, 0.0)
                         if now - last >= 8:
@@ -866,6 +878,8 @@ class TaskManager:
                     time.sleep(max(0.0, self.child_start_stagger_seconds))
 
                 if not running:
+                    # 没有运行中的子任务时，即使压力高也需要周期性重试。
+                    paused_by_pressure = False
                     time.sleep(max(1.0, self.child_launch_wait_seconds))
                     continue
 
@@ -873,6 +887,9 @@ class TaskManager:
                 if not done_set and not launched_any:
                     time.sleep(0.5)
                     continue
+
+                if done_set:
+                    paused_by_pressure = False
 
                 for future in done_set:
                     child_id = running.pop(future, "")
@@ -1144,7 +1161,8 @@ class TaskManager:
         )
 
         self.append_log(parent_id, f"[PARALLEL] 并行任务启动：总任务数={total}，用户选择并行数={max_workers}")
-        self.append_log(parent_id, "[SAFE] 轻量化调度：不再按模型文件大小直接降为 1；逐个启动子进程，每次启动前检查 CPU/内存/磁盘，压力高时暂停启动后续子任务。")
+        self.append_log(parent_id, "[POOL] 稳定进程池：最多同时运行 max_workers 个子任务；一个完成后补一个；检测到高负载时先等已有子任务完成，再决定是否补位。")
+        self.append_log(parent_id, "[SAFE] 不再按模型文件大小直接降为 1；启动新子进程前检查 CPU/内存/磁盘，真正接近危险阈值时才暂停补位。")
 
         progress = {"done": 0, "failed": 0}
 
@@ -1193,13 +1211,21 @@ class TaskManager:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             running: Dict[Any, int] = {}
+            paused_by_pressure = False
             while (next_index < total or running) and parent_id not in self.cancel_flags:
                 launched_any = False
                 while next_index < total and len(running) < max_workers and parent_id not in self.cancel_flags:
                     spec = jobs[next_index]
                     label = spec.get("label") or f"子任务 {next_index + 1}"
+
+                    # 一旦检测到 CPU/内存/磁盘压力，就等待至少一个正在运行的子任务结束后再判断是否补位。
+                    # 旧版会在压力短暂波动时继续提交，导致日志里出现“暂停后仍提交第 6 个任务”。
+                    if paused_by_pressure and running:
+                        break
+
                     reason = self._runtime_pressure_reason()
                     if reason:
+                        paused_by_pressure = True
                         now = time.time()
                         last = self._last_pressure_log_at.get(parent_id, 0.0)
                         if now - last >= 8:
@@ -1218,6 +1244,7 @@ class TaskManager:
                     time.sleep(max(0.0, self.child_start_stagger_seconds))
 
                 if not running:
+                    paused_by_pressure = False
                     time.sleep(max(1.0, self.child_launch_wait_seconds))
                     continue
 
@@ -1225,6 +1252,9 @@ class TaskManager:
                 if not done_set and not launched_any:
                     time.sleep(0.5)
                     continue
+
+                if done_set:
+                    paused_by_pressure = False
 
                 for future in done_set:
                     idx = running.pop(future, -1)
