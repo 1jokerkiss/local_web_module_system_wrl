@@ -353,15 +353,15 @@ function clampParallelWorkersValue(value, maxWorkers = 64) {
 
 function getConservativeSuggestedWorkers(cpuCount) {
   const cpu = Math.max(1, Number.parseInt(String(cpuCount || 1), 10) || 1);
-  // 遥感反演通常是内存/磁盘重任务，前端兜底值保守：16/24 核也默认建议 2。
-  return Math.max(1, Math.min(2, Math.ceil(cpu / 8)));
+  // 放宽建议值：16/24 核默认建议 4；不再动不动建议 1 或 2。
+  return Math.max(1, Math.min(4, Math.ceil(cpu / 4)));
 }
 
 function getConservativeMaxWorkers(cpuCount, suggestedWorkers) {
   const cpu = Math.max(1, Number.parseInt(String(cpuCount || 1), 10) || 1);
   const suggested = Math.max(1, Number.parseInt(String(suggestedWorkers || getConservativeSuggestedWorkers(cpu)), 10) || 1);
-  // 上限也降低：16/24 核默认最高 4；后端仍会按 CPU/内存/磁盘/模型大小自动降到更安全值。
-  return Math.max(suggested, Math.min(4, Math.max(1, Math.ceil(cpu / 4))));
+  // 上限保留 8；真正保护由后端逐个启动子进程时动态暂停。
+  return Math.max(suggested, Math.min(8, Math.max(4, Math.ceil(cpu / 3))));
 }
 
 const defaultSystemResources = {
@@ -3015,7 +3015,7 @@ async function uploadPythonFolder() {
               }}
             >
               <div>本机 CPU 核数：<strong>{resourceInfo.cpu_count}</strong>；建议进程数：<strong>{resourceInfo.suggested_workers}</strong>；上限进程数：<strong>{resourceInfo.max_workers}</strong></div>
-              <div style={{ marginTop: 4 }}>建议值按重型遥感模块保守计算：默认最高 2；上限默认最高 4。后端仍会根据 CPU、内存、磁盘压力自动降低或排队。</div>
+              <div style={{ marginTop: 4 }}>建议值按重型遥感模块保守计算：默认最高 2；上限默认最高 8。后端仍会根据 CPU、内存、磁盘压力自动降低或排队。</div>
               <div>当前已占用进程槽：<strong>{resourceInfo.running_workers}/{resourceInfo.max_workers}</strong>；等待队列：<strong>{resourceInfo.queued_task_count}</strong></div>
               <div>系统 CPU 使用率：<strong>{resourceInfo.cpu_percent == null ? '-' : `${Number(resourceInfo.cpu_percent).toFixed(1)}%`}</strong>；模块进程 CPU：<strong>{resourceInfo.running_process_cpu_percent == null ? '-' : `${Number(resourceInfo.running_process_cpu_percent).toFixed(1)}%`}</strong></div>
               <div>内存：<strong>{resourceInfo.memory_percent == null ? '-' : `${Number(resourceInfo.memory_percent).toFixed(1)}%`}</strong>；可用内存：<strong>{resourceInfo.memory_available_gb == null ? '-' : `${Number(resourceInfo.memory_available_gb).toFixed(1)}GB`}</strong>；磁盘：<strong>{resourceInfo.disk_percent == null ? '-' : `${Number(resourceInfo.disk_percent).toFixed(1)}%`}</strong>；剩余：<strong>{resourceInfo.disk_free_gb == null ? '-' : `${Number(resourceInfo.disk_free_gb).toFixed(1)}GB`}</strong></div>

@@ -1757,6 +1757,11 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
             runtime_env["LOCAL_WEB_MODULE_SOURCE_DIR"] = str(source_dir)
             runtime_env["LOCAL_WEB_MODULE_RUNTIME_DIR"] = str(runtime_task_dir)
             runtime_env["LOCAL_WEB_NO_FIXED_RESOURCE_COPY"] = "1"
+            # 防御性清理：如果旧代码或热重载残留创建了 runtime/job_xxx/source，立即删除，
+            # 防止模型/资源文件再次进入 runtime。
+            stale_source = runtime_task_dir / "source"
+            if stale_source.exists():
+                shutil.rmtree(stale_source, ignore_errors=True)
 
             template_text = " ".join(str(x) for x in (command_template or []))
             if (not command_template) or ("{entry_script}" not in template_text and "entry_script" not in template_text):
@@ -4571,12 +4576,17 @@ def resolve_run_parallel_mode(module: dict, inputs: dict, workers: int) -> str:
 
     return "none"
 def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: int) -> tuple[int, dict]:
-    """根据当前电脑负载和模块固定资源大小自动降低并行进程数，防止卡死/崩溃。"""
+    """轻量化并行调整。
+
+    这版只在 CPU/内存/磁盘已经接近不可用时才降低进程数；
+    固定模型/资源大小只做日志提示，不再参与降级。
+    这样用户选择 4/6/8 时，系统不会因为 pkl 大小动不动降成 1，
+    真正的保护交给 TaskManager 在启动每个子进程前动态暂停。
+    """
     requested = clamp_parallel_workers(requested_workers, task_manager.max_process_slots)
     safe = requested
     reasons: list[str] = []
 
-    # 找一个输出目录或 runtime 所在盘用于磁盘余量判断。
     disk_probe = RUNTIME_DIR
     try:
         for field in module.get("inputs", []) or []:
@@ -4594,66 +4604,36 @@ def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: 
     disk_percent = pressure.get("disk_percent")
     disk_free = pressure.get("disk_free_gb")
 
-    # CPU 已经较忙时，少开新进程；否则会直接把电脑打满。
+    # 只在系统已经接近满载时，才在启动前降级。
     if cpu is not None:
-        if cpu is not None:
-            if cpu >= 80:
-                safe = min(safe, 1)
-                reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 已很高")
-            elif cpu >= 68:
-                safe = min(safe, 2)
-                reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 较高")
-            elif cpu >= 58:
-                safe = min(safe, max(2, min(task_manager.suggested_process_slots, 3)))
-                reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 偏高")
-
-    # 内存是重模型遥感任务最容易卡死的原因。
-    if mem_percent is not None and mem_avail is not None:
-        if mem_percent >= 85 or mem_avail <= 4.0:
+        if cpu >= 98:
             safe = min(safe, 1)
-            reasons.append(f"内存压力过高：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
-        elif mem_percent >= 76 or mem_avail <= 8.0:
-            safe = min(safe, 2)
-            reasons.append(f"内存压力偏高：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
-        elif mem_percent >= 68 or mem_avail <= 12.0:
-            safe = min(safe, 3)
-            reasons.append(f"内存余量有限：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
+            reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 已接近满载")
+        elif cpu >= 95:
+            safe = min(safe, max(2, requested // 2))
+            reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 很高，先降低一部分并发")
 
-    # 固定模型虽然不再复制，但每个进程通常会各加载一份到内存。
+    # 内存只做临界保护；不再因为可用内存 2GB 左右就直接降为 1。
+    if mem_percent is not None and mem_avail is not None:
+        if mem_percent >= 99 or mem_avail <= 0.3:
+            safe = min(safe, 1)
+            reasons.append(f"内存几乎耗尽：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
+        elif mem_percent >= 97 or mem_avail <= 0.8:
+            safe = min(safe, max(2, requested // 2))
+            reasons.append(f"内存压力很高：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
+
+    # 固定模型/资源只统计展示，不再限制进程数。
     resource_bytes, resource_examples = estimate_fixed_resource_bytes(module)
     resource_gb = _gb(resource_bytes)
-    if resource_gb >= 0.5 and mem_avail is not None:
-        per_worker_gb = max(2.5, resource_gb * 2.0 + 0.5)
-        by_memory = max(1, int((mem_avail * 0.60) // per_worker_gb))
-        if by_memory < safe:
-            safe = min(safe, by_memory)
-            examples = "；".join(resource_examples[:3]) if resource_examples else f"约 {resource_gb:.1f}GB"
-            reasons.append(
-                f"检测到固定模型/资源约 {resource_gb:.1f}GB（{examples}），"
-                f"按可用内存估算安全并发为 {by_memory}"
-            )
 
-    if resource_gb >= 1.0:
-        try:
-            heavy_cap = int(os.environ.get("LOCAL_WEB_HEAVY_MODEL_MAX_WORKERS", "2") or 2)
-        except Exception:
-            heavy_cap = 3
-        heavy_cap = max(1, heavy_cap)
-        if safe > heavy_cap:
-            safe = min(safe, heavy_cap)
-            reasons.append(f"该模块属于大模型/大资源任务，默认安全上限为 {heavy_cap}")
-
-    # 磁盘空间/使用率保护。即使不复制固定资源，输出文件和日志也需要空间。
+    # 磁盘也只做临界保护。固定资源不复制后，磁盘压力主要来自输出文件。
     if disk_percent is not None and disk_free is not None:
-        if disk_percent >= 92 or disk_free <= 8.0:
+        if disk_percent >= 99.5 or disk_free <= 0.5:
             safe = min(safe, 1)
-            reasons.append(f"磁盘空间不足：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
-        elif disk_percent >= 86 or disk_free <= 15.0:
-            safe = min(safe, 2)
-            reasons.append(f"磁盘空间偏紧：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
-        elif disk_percent >= 80 or disk_free <= 25.0:
-            safe = min(safe, max(2, min(safe, 3)))
-            reasons.append(f"磁盘余量有限：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
+            reasons.append(f"磁盘空间几乎耗尽：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
+        elif disk_percent >= 99 or disk_free <= 1.0:
+            safe = min(safe, max(2, requested // 2))
+            reasons.append(f"磁盘空间很紧：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
 
     safe = max(1, min(requested, safe))
     adjusted = safe < requested

@@ -1,3 +1,4 @@
+from __future__ import annotations
 import json
 import time
 import os
@@ -7,7 +8,7 @@ import subprocess
 import threading
 import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,8 +36,10 @@ class TaskManager:
         # 如需手动覆盖，可设置环境变量：
         # LOCAL_WEB_SUGGESTED_PROCESS_SLOTS / LOCAL_WEB_MAX_PROCESS_SLOTS。
         self.cpu_count = max(1, int(os.cpu_count() or 1))
-        default_suggested_slots = max(1, min(2, (self.cpu_count + 7) // 8))
-        default_max_slots = max(default_suggested_slots, min(4, max(1, (self.cpu_count + 3) // 4)))
+        # 放宽默认值：建议数更接近实际可用进程池。
+        # 16 核/24 核默认建议 4，上限 8；用户选择后不再因为固定模型大小直接砍成 1。
+        default_suggested_slots = max(1, min(4, (self.cpu_count + 3) // 4))
+        default_max_slots = max(default_suggested_slots, min(8, max(4, (self.cpu_count + 2) // 3)))
 
         try:
             env_suggested_slots = int(os.environ.get("LOCAL_WEB_SUGGESTED_PROCESS_SLOTS", "") or default_suggested_slots)
@@ -50,17 +53,20 @@ class TaskManager:
 
         self.max_process_slots = max(1, min(self.cpu_count, env_max_slots))
         self.suggested_process_slots = max(1, min(self.max_process_slots, env_suggested_slots))
-        self.cpu_busy_threshold = float(os.environ.get("LOCAL_WEB_CPU_QUEUE_THRESHOLD", "72"))
+        # 顶层排队只做“临界保护”。一般负载不阻止父任务启动，避免一直 queued。
+        self.cpu_busy_threshold = float(os.environ.get("LOCAL_WEB_CPU_QUEUE_THRESHOLD", "99"))
         self.scheduler_queue: list[Dict[str, Any]] = []
         self.active_slots: Dict[str, int] = {}
         self.drain_lock = threading.Lock()
         # 运行中保护：批处理/并行任务启动子进程前会检查 CPU、内存和磁盘压力，压力过高时暂停启动新子任务。
-        self.child_launch_cpu_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_CPU_THRESHOLD", "72"))
-        self.child_launch_memory_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_MEMORY_THRESHOLD", "82"))
-        self.child_launch_min_memory_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_MEMORY_GB", "6"))
-        self.child_launch_disk_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_DISK_THRESHOLD", "90"))
-        self.child_launch_min_disk_free_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_DISK_FREE_GB", "15"))
-        self.child_launch_wait_seconds = float(os.environ.get("LOCAL_WEB_CHILD_START_WAIT_SECONDS", "8"))
+        # 子进程启动保护：逐个启动子任务；达到阈值时暂停启动新的子任务。
+        self.child_launch_cpu_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_CPU_THRESHOLD", "96"))
+        self.child_launch_memory_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_MEMORY_THRESHOLD", "99"))
+        self.child_launch_min_memory_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_MEMORY_GB", "0.3"))
+        self.child_launch_disk_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_DISK_THRESHOLD", "99.5"))
+        self.child_launch_min_disk_free_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_DISK_FREE_GB", "0.5"))
+        self.child_launch_wait_seconds = float(os.environ.get("LOCAL_WEB_CHILD_START_WAIT_SECONDS", "2"))
+        self.child_start_stagger_seconds = float(os.environ.get("LOCAL_WEB_CHILD_START_STAGGER_SECONDS", "0.5"))
         self._last_pressure_log_at: Dict[str, float] = {}
 
         self._load_tasks()
@@ -223,8 +229,25 @@ class TaskManager:
             pass
         return None
 
+    def _active_process_count(self) -> int:
+        """当前平台真实启动、尚未退出的子进程数。"""
+        count = 0
+        with self.lock:
+            processes = list(self.processes.values())
+        for process in processes:
+            try:
+                if process and process.poll() is None:
+                    count += 1
+            except Exception:
+                continue
+        return count
+
     def _running_process_cpu_percent(self) -> float | None:
-        """读取当前由平台启动的模块进程 CPU 占用总和；没有 psutil 时返回 None。"""
+        """读取平台启动的模块进程 CPU 占用总和。
+
+        psutil 的 cpu_percent(interval=0.0) 第一次常返回 0，所以这里用短采样；
+        同时把子进程的子进程也统计进去，避免前端一直显示 0。
+        """
         try:
             import psutil  # type: ignore
         except Exception:
@@ -236,7 +259,14 @@ class TaskManager:
         for process in processes:
             try:
                 if process.poll() is None:
-                    total += float(psutil.Process(process.pid).cpu_percent(interval=0.0))
+                    proc = psutil.Process(process.pid)
+                    total += float(proc.cpu_percent(interval=0.03))
+                    for child in proc.children(recursive=True):
+                        try:
+                            if child.is_running():
+                                total += float(child.cpu_percent(interval=0.0))
+                        except Exception:
+                            continue
             except Exception:
                 continue
         return round(total, 2)
@@ -342,26 +372,36 @@ class TaskManager:
                 return {"percent": None, "free_gb": None}
 
     def _runtime_pressure_reason(self) -> str:
-        """返回当前是否应该暂停启动新的子任务。空字符串表示可以启动。"""
+        """返回是否应该暂停启动新的子进程。
+
+        轻量化策略：
+        - 顶层任务不因为内存 80% 多就长期 queued；
+        - 真正启动每一个子进程前，才检查 CPU/内存/磁盘和当前平台进程数；
+        - 已启动的进程不强杀，只暂停后续启动，等负载下降再继续。
+        """
+        active_processes = self._active_process_count()
+        if active_processes >= self.max_process_slots:
+            return f"平台已启动 {active_processes}/{self.max_process_slots} 个模块进程，等待已有进程完成"
+
         cpu = self._system_cpu_percent()
         if cpu is not None and cpu >= self.child_launch_cpu_threshold:
-            return f"CPU 使用率 {cpu:.1f}% 已超过安全阈值 {self.child_launch_cpu_threshold:.0f}%"
+            return f"CPU 使用率 {cpu:.1f}% 已超过暂停启动阈值 {self.child_launch_cpu_threshold:.0f}%"
 
         mem = self._virtual_memory_snapshot()
         mem_percent = mem.get("percent")
         mem_available = mem.get("available_gb")
         if mem_percent is not None and mem_percent >= self.child_launch_memory_threshold:
-            return f"内存使用率 {mem_percent:.1f}% 已超过安全阈值 {self.child_launch_memory_threshold:.0f}%"
+            return f"内存使用率 {mem_percent:.1f}% 已超过暂停启动阈值 {self.child_launch_memory_threshold:.0f}%"
         if mem_available is not None and mem_available <= self.child_launch_min_memory_gb:
-            return f"可用内存仅 {mem_available:.1f}GB，低于安全阈值 {self.child_launch_min_memory_gb:.1f}GB"
+            return f"可用内存仅 {mem_available:.1f}GB，低于最低阈值 {self.child_launch_min_memory_gb:.1f}GB"
 
         disk = self._disk_usage_snapshot()
         disk_percent = disk.get("percent")
         disk_free = disk.get("free_gb")
         if disk_percent is not None and disk_percent >= self.child_launch_disk_threshold:
-            return f"磁盘使用率 {disk_percent:.1f}% 已超过安全阈值 {self.child_launch_disk_threshold:.0f}%"
+            return f"磁盘使用率 {disk_percent:.1f}% 已超过暂停启动阈值 {self.child_launch_disk_threshold:.0f}%"
         if disk_free is not None and disk_free <= self.child_launch_min_disk_free_gb:
-            return f"磁盘剩余空间仅 {disk_free:.1f}GB，低于安全阈值 {self.child_launch_min_disk_free_gb:.1f}GB"
+            return f"磁盘剩余空间仅 {disk_free:.1f}GB，低于最低阈值 {self.child_launch_min_disk_free_gb:.1f}GB"
 
         return ""
 
@@ -415,12 +455,13 @@ class TaskManager:
         process_cpu_percent = self._running_process_cpu_percent()
         mem_snapshot = self._virtual_memory_snapshot()
         disk_snapshot = self._disk_usage_snapshot()
+        active_processes = self._active_process_count()
         return {
             "cpu_count": self.cpu_count,
             "suggested_workers": self.suggested_process_slots,
             "max_workers": self.max_process_slots,
-            "running_workers": running_workers,
-            "available_workers": max(0, self.max_process_slots - running_workers),
+            "running_workers": active_processes,
+            "available_workers": max(0, self.max_process_slots - active_processes),
             "active_task_count": active_task_count,
             "queued_task_count": queued_task_count,
             "cpu_percent": cpu_percent,
@@ -439,10 +480,8 @@ class TaskManager:
         if used + requested > self.max_process_slots:
             return False, f"进程数超过本机安全上限：当前 {used}/{self.max_process_slots}，本任务需要 {requested}"
 
-        reason = self._runtime_pressure_reason()
-        if reason:
-            return False, f"系统负载过高，暂不启动新任务：{reason}"
-
+        # 顶层任务只按槽位排队，不再因为内存/磁盘中等压力长期 queued。
+        # CPU/内存/磁盘保护放到子进程逐个启动前执行。
         return True, ""
 
     def _enqueue_task_runner(
@@ -653,12 +692,12 @@ class TaskManager:
         )
 
         self._append_parallel_adjustment_log(task["id"], inputs)
-        requested_slots = inputs.get("parallel_workers") or inputs.get("_parallel_workers") or 1
+        # 单个模块进程只占 1 个真实启动槽；parallel_workers 只写入配置，不作为父任务排队条件。
         self._enqueue_task_runner(
             task["id"],
             self._run_process_task,
             (task["id"], command, working_dir, env),
-            requested_slots=requested_slots,
+            requested_slots=1,
         )
         return self.get_task(task["id"]) or task
 
@@ -692,7 +731,7 @@ class TaskManager:
             parent["id"],
             self._run_parallel_task,
             (parent["id"], jobs, max_workers),
-            requested_slots=max_workers,
+            requested_slots=1,
         )
         return self.get_task(parent["id"]) or parent
 
@@ -757,7 +796,7 @@ class TaskManager:
             parent["id"],
             self._run_batch_group,
             (parent["id"], child_job_map, max_parallel),
-            requested_slots=max_parallel,
+            requested_slots=1,
         )
         return self.get_task(parent["id"]) or parent
 
@@ -768,6 +807,7 @@ class TaskManager:
         max_parallel: int,
     ):
         total = len(child_job_map)
+        max_parallel = max(1, int(max_parallel or 1))
         self.update_task(
             parent_id,
             status="running",
@@ -775,20 +815,22 @@ class TaskManager:
             parallel_total=total,
             parallel_done=0,
             parallel_failed=0,
+            max_workers=max_parallel,
         )
         self.append_log(parent_id, f"[INFO] 批处理开始，共 {total} 个子任务")
-        self.append_log(parent_id, f"[INFO] 最大并发数 = {max_parallel}")
-        self.append_log(parent_id, "[SAFE] 已启用运行中保护：CPU/内存/磁盘压力过高时，会暂停启动新的子任务，已启动任务不受影响。")
+        self.append_log(parent_id, f"[INFO] 用户选择并发数 = {max_parallel}；系统会逐个启动子进程，负载高时暂停启动新进程")
+        self.append_log(parent_id, "[SAFE] 轻量化调度：不一次性提交全部子任务，只在 CPU/内存/磁盘安全时启动下一个子任务。")
 
-        progress_lock = threading.Lock()
-        progress = {"done": 0, "failed": 0}
+        job_items = list(child_job_map.items())
+        next_index = 0
+        failures = 0
+        done = 0
 
         def _worker(child_id: str, job: Dict[str, Any]):
             child_snapshot = self.get_task(child_id) or {}
             if parent_id in self.cancel_flags or child_snapshot.get("status") == "cancelled":
                 self.update_task(child_id, status="cancelled", ended_at=now_iso())
                 return child_id
-            self._wait_until_safe_to_start_child(parent_id, job.get("label") or child_id)
             self._run_process_task(
                 child_id,
                 job["command"],
@@ -797,54 +839,75 @@ class TaskManager:
             )
             return child_id
 
-        failures = 0
-        with ThreadPoolExecutor(max_workers=max(1, int(max_parallel or 1))) as executor:
-            futures = {
-                executor.submit(_worker, child_id, job): child_id
-                for child_id, job in child_job_map.items()
-            }
-            for future in as_completed(futures):
-                child_id = futures[future]
-                try:
-                    future.result()
-                    task = self.get_task(child_id) or {}
-                    status = task.get("status")
-                    return_code = task.get("return_code")
-                    if status != "success":
-                        failures += 1
-                    self.append_log(
-                        parent_id,
-                        f"[INFO] 子任务完成: {child_id}, 状态={status}, return_code={return_code}",
-                    )
-                except Exception as e:
-                    failures += 1
-                    self.append_log(parent_id, f"[ERROR] 子任务异常: {child_id} -> {repr(e)}")
+        with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            running: Dict[Any, str] = {}
+            while (next_index < total or running) and parent_id not in self.cancel_flags:
+                launched_any = False
+                while next_index < total and len(running) < max_parallel and parent_id not in self.cancel_flags:
+                    child_id, job = job_items[next_index]
+                    label = job.get("label") or child_id
+                    reason = self._runtime_pressure_reason()
+                    if reason:
+                        now = time.time()
+                        last = self._last_pressure_log_at.get(parent_id, 0.0)
+                        if now - last >= 8:
+                            self._last_pressure_log_at[parent_id] = now
+                            self.append_log(
+                                parent_id,
+                                f"[SAFE] 暂停启动新子任务 {label}：{reason}。当前运行 {len(running)} 个；已完成 {done}/{total}。",
+                            )
+                        break
 
-                with progress_lock:
-                    progress["done"] += 1
-                    progress["failed"] = failures
-                    self.update_task(
-                        parent_id,
-                        parallel_done=progress["done"],
-                        parallel_failed=progress["failed"],
-                    )
+                    self.append_log(parent_id, f"[INFO] 启动子任务 {next_index + 1}/{total}: {label}；当前运行 {len(running) + 1}/{max_parallel}")
+                    future = executor.submit(_worker, child_id, job)
+                    running[future] = child_id
+                    next_index += 1
+                    launched_any = True
+                    time.sleep(max(0.0, self.child_start_stagger_seconds))
+
+                if not running:
+                    time.sleep(max(1.0, self.child_launch_wait_seconds))
+                    continue
+
+                done_set, _ = wait(set(running.keys()), timeout=1.0, return_when=FIRST_COMPLETED)
+                if not done_set and not launched_any:
+                    time.sleep(0.5)
+                    continue
+
+                for future in done_set:
+                    child_id = running.pop(future, "")
+                    try:
+                        future.result()
+                        task = self.get_task(child_id) or {}
+                        status = task.get("status")
+                        return_code = task.get("return_code")
+                        if status != "success":
+                            failures += 1
+                        self.append_log(parent_id, f"[INFO] 子任务完成: {child_id}, 状态={status}, return_code={return_code}")
+                    except Exception as e:
+                        failures += 1
+                        self.append_log(parent_id, f"[ERROR] 子任务异常: {child_id} -> {repr(e)}")
+                        self.append_log(parent_id, traceback.format_exc())
+
+                    done += 1
+                    self.update_task(parent_id, parallel_done=done, parallel_failed=failures)
 
         if parent_id in self.cancel_flags:
             final_status = "cancelled"
             return_code = -1
         else:
-            final_status = "success" if failures == 0 else "failed"
-            return_code = 0 if failures == 0 else 1
+            final_status = "success" if failures == 0 and done == total else "failed"
+            return_code = 0 if final_status == "success" else 1
 
         self.update_task(
             parent_id,
             status=final_status,
             ended_at=now_iso(),
             return_code=return_code,
-            parallel_done=total,
+            parallel_done=done,
             parallel_failed=failures,
         )
-        self.append_log(parent_id, f"[INFO] 批处理结束，失败数={failures}")
+        self.append_log(parent_id, f"[INFO] 批处理结束，完成={done}/{total}，失败数={failures}")
         self.cancel_flags.discard(parent_id)
 
     def _stream_reader(self, pipe, task_id: str, prefix: str):
@@ -1080,10 +1143,9 @@ class TaskManager:
             max_workers=max_workers,
         )
 
-        self.append_log(parent_id, f"[PARALLEL] 并行任务启动：总任务数={total}，并行数={max_workers}")
-        self.append_log(parent_id, "[SAFE] 已启用运行中保护：CPU/内存/磁盘压力过高时，会暂停启动新的子任务。")
+        self.append_log(parent_id, f"[PARALLEL] 并行任务启动：总任务数={total}，用户选择并行数={max_workers}")
+        self.append_log(parent_id, "[SAFE] 轻量化调度：不再按模型文件大小直接降为 1；逐个启动子进程，每次启动前检查 CPU/内存/磁盘，压力高时暂停启动后续子任务。")
 
-        progress_lock = threading.Lock()
         progress = {"done": 0, "failed": 0}
 
         def run_one(index: int, spec: Dict[str, Any]):
@@ -1093,11 +1155,6 @@ class TaskManager:
             label = spec.get("label") or f"子任务 {index + 1}"
             parent_task = self.get_task(parent_id) or {}
             owner_username = str(parent_task.get("owner_username") or "")
-
-            self._wait_until_safe_to_start_child(parent_id, label)
-
-            if parent_id in self.cancel_flags:
-                return None
 
             child = self.create_task(
                 module_id=spec.get("module_id", ""),
@@ -1129,49 +1186,65 @@ class TaskManager:
             )
 
             child_task = self.get_task(child["id"]) or {}
-            status = child_task.get("status")
-
-            with progress_lock:
-                progress["done"] += 1
-                if status != "success":
-                    progress["failed"] += 1
-
-                self.update_task(
-                    parent_id,
-                    parallel_done=progress["done"],
-                    parallel_failed=progress["failed"],
-                )
-
-            self.append_log(
-                parent_id,
-                f"[PARALLEL] 完成 {progress['done']}/{total}: {label}，状态={status}",
-            )
-
-            return child["id"]
+            return child["id"], child_task.get("status")
 
         failures = 0
+        next_index = 0
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(run_one, idx, job): idx
-                for idx, job in enumerate(jobs)
-            }
+            running: Dict[Any, int] = {}
+            while (next_index < total or running) and parent_id not in self.cancel_flags:
+                launched_any = False
+                while next_index < total and len(running) < max_workers and parent_id not in self.cancel_flags:
+                    spec = jobs[next_index]
+                    label = spec.get("label") or f"子任务 {next_index + 1}"
+                    reason = self._runtime_pressure_reason()
+                    if reason:
+                        now = time.time()
+                        last = self._last_pressure_log_at.get(parent_id, 0.0)
+                        if now - last >= 8:
+                            self._last_pressure_log_at[parent_id] = now
+                            self.append_log(
+                                parent_id,
+                                f"[SAFE] 暂停启动新子任务 {label}：{reason}。当前运行 {len(running)} 个；已完成 {progress['done']}/{total}。",
+                            )
+                        break
 
-            for future in as_completed(future_map):
-                try:
-                    future.result()
-                except Exception as exc:
-                    failures += 1
-                    with progress_lock:
+                    future = executor.submit(run_one, next_index, spec)
+                    running[future] = next_index
+                    self.append_log(parent_id, f"[PARALLEL] 已提交 {next_index + 1}/{total}；当前运行 {len(running)}/{max_workers}")
+                    next_index += 1
+                    launched_any = True
+                    time.sleep(max(0.0, self.child_start_stagger_seconds))
+
+                if not running:
+                    time.sleep(max(1.0, self.child_launch_wait_seconds))
+                    continue
+
+                done_set, _ = wait(set(running.keys()), timeout=1.0, return_when=FIRST_COMPLETED)
+                if not done_set and not launched_any:
+                    time.sleep(0.5)
+                    continue
+
+                for future in done_set:
+                    idx = running.pop(future, -1)
+                    label = jobs[idx].get("label") if 0 <= idx < len(jobs) else "子任务"
+                    try:
+                        result = future.result()
+                        child_id, status = result if result else (None, "cancelled")
+                        if status != "success":
+                            failures += 1
                         progress["done"] += 1
-                        progress["failed"] += 1
-                        self.update_task(
-                            parent_id,
-                            parallel_done=progress["done"],
-                            parallel_failed=progress["failed"],
-                        )
-                    self.append_log(parent_id, f"[PARALLEL-ERROR] 子任务异常: {type(exc).__name__}: {exc}")
-                    self.append_log(parent_id, traceback.format_exc())
+                        progress["failed"] = failures
+                        self.update_task(parent_id, parallel_done=progress["done"], parallel_failed=progress["failed"])
+                        self.append_log(parent_id, f"[PARALLEL] 完成 {progress['done']}/{total}: {label}，状态={status}")
+                    except Exception as exc:
+                        failures += 1
+                        progress["done"] += 1
+                        progress["failed"] = failures
+                        self.update_task(parent_id, parallel_done=progress["done"], parallel_failed=progress["failed"])
+                        self.append_log(parent_id, f"[PARALLEL-ERROR] 子任务异常: {type(exc).__name__}: {exc}")
+                        self.append_log(parent_id, traceback.format_exc())
 
         parent = self.get_task(parent_id) or {}
         children = parent.get("children") or []
@@ -1180,7 +1253,7 @@ class TaskManager:
         if parent_id in self.cancel_flags or any(s == "cancelled" for s in child_statuses):
             final_status = "cancelled"
             return_code = -1
-        elif failures > 0 or any(s != "success" for s in child_statuses):
+        elif failures > 0 or progress["done"] < total or any(s != "success" for s in child_statuses):
             final_status = "failed"
             return_code = 1
         else:
@@ -1192,7 +1265,7 @@ class TaskManager:
             status=final_status,
             return_code=return_code,
             ended_at=now_iso(),
-            parallel_done=total,
+            parallel_done=progress["done"],
             parallel_failed=sum(1 for s in child_statuses if s != "success"),
         )
 
