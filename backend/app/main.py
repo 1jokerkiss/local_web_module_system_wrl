@@ -19,7 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
-
+import stat
+import time
 from .auth import (
     admin_reset_password,
     create_token,
@@ -98,6 +99,7 @@ task_manager = TaskManager(TASKS_FILE)
 def api_system_resources(authorization: str | None = Header(default=None)):
     """返回本机 CPU 核数、建议进程数、上限进程数和当前任务资源占用。"""
     get_current_user(authorization)
+    task_manager.kick_scheduler()
     return task_manager.get_system_resource_info()
 
 
@@ -208,7 +210,14 @@ class PythonFolderModuleUploadRequest(BaseModel):
 class PythonModuleConfigRequest(BaseModel):
     path: str
 # 通用辅助函数
-VALID_PARALLEL_MODES = {"none", "auto", "single_file", "folder_chunks", "module_internal"}
+VALID_PARALLEL_MODES = {
+    "none",
+    "auto",
+    "single_file",
+    "folder_chunks",
+    "module_internal",
+    "batch_group",
+}
 DEFAULT_PARALLEL_PATTERNS = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
 
 # 初始默认工具栏。现在云反演 / 气溶胶反演也按普通动态工具栏处理，
@@ -1165,30 +1174,35 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
     if not module.get("enabled", True):
         raise HTTPException(status_code=400, detail="模块已禁用")
 
-    # 直接使用前端传来的用户选择路径；管理员固定输入在这里补齐。
+    # 1. 合并输入参数
     inputs = merge_admin_fixed_inputs(module, payload.inputs or {})
     inputs = coerce_json_marked_inputs(module, inputs)
-    requested_parallel_workers = clamp_parallel_workers(payload.parallel_workers, task_manager.max_process_slots)
 
-    # 必填校验。
+    requested_workers = clamp_parallel_workers(
+        payload.parallel_workers,
+        task_manager.max_process_slots,
+    )
+
+    # 2. 必填校验
     for field in module.get("inputs", []) or []:
         key = field.get("key")
-        required = field.get("required", False)
         if not key:
             continue
         if field.get("control_only") is True:
             continue
+
+        required = bool(field.get("required", False))
         if required and (key not in inputs or inputs.get(key) in ("", None)):
             raise HTTPException(status_code=400, detail=f"缺少必填参数: {key}")
 
-    # control_only 字段不写入 config.json。
+    # 3. control_only 不写入 config
     for field in module.get("inputs", []) or []:
         if field.get("control_only") is True:
             key = field.get("key")
             if key:
                 inputs.pop(key, None)
 
-    # 输出目录只负责创建，不改写用户选择的路径。
+    # 4. 输出目录只创建，不改写用户路径
     for field in module.get("inputs", []) or []:
         key = field.get("key")
         if not key or not is_output_field(field):
@@ -1200,68 +1214,78 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
 
         field_type = str(field.get("type", "")).lower()
         p = Path(value)
+
         if field_type == "dir_path":
             p.mkdir(parents=True, exist_ok=True)
         elif field_type == "file_path" and p.parent:
             p.parent.mkdir(parents=True, exist_ok=True)
 
-    # 自动安全调整：用户可以选进程数，但最终启动前会根据 CPU/内存/磁盘/模型大小降低到安全值。
-    parallel_workers, adjust_report = auto_adjust_parallel_workers(module, inputs, requested_parallel_workers)
+    # 5. 根据 CPU/内存/磁盘/模型大小自动降低进程数
+    workers, adjust_report = auto_adjust_parallel_workers(
+        module,
+        inputs,
+        requested_workers,
+    )
     inputs = apply_parallel_adjustment_to_inputs(inputs, adjust_report)
 
-    # 旧系统进程池批处理：只要识别到批处理目录，就算进程数是 1，也先拆成具体文件 job。
-    if _is_batch_request(module, inputs):
-        jobs, output_paths = build_batch_jobs_for_module(module, inputs, parallel_workers)
+    # 6. 统一决定运行方式
+    run_mode = resolve_run_parallel_mode(module, inputs, workers)
+    output_paths = collect_output_paths_from_inputs(module, inputs)
+
+    # 6.1 C++/多输入目录批处理模式
+    if run_mode == "batch_group":
+        jobs, batch_output_paths = build_batch_jobs_for_module(module, inputs, workers)
         task = task_manager.submit_batch_group(
             module_id=module["id"],
             module_name=module.get("name", module["id"]),
             jobs=jobs,
-            max_parallel=parallel_workers,
+            max_parallel=workers,
             owner_username=username,
         )
-        if output_paths:
+
+        scan_paths = batch_output_paths or output_paths
+        if scan_paths:
             start_data_file_scan_after_task(
                 task["id"],
                 module,
-                output_paths,
+                scan_paths,
                 owner_username=username,
             )
+
         return task
 
-    # 文件夹型模块的平台级并行：模块本身只接收一个文件夹时，平台拆分为多个 worker_xx 文件夹。
-    if parallel_workers > 1:
-        parallel_mode = str(normalize_parallel_config(module).get("mode") or "auto").strip() or "auto"
-        if parallel_mode != "module_internal":
-            parallel_jobs = prepare_parallel_jobs(module, inputs, parallel_workers)
-            if len(parallel_jobs) > 1:
-                task_inputs = dict(inputs)
-                task_inputs["parallel_workers"] = parallel_workers
-                task_inputs["_parallel_workers"] = parallel_workers
-                task_inputs["_parallel_job_count"] = len(parallel_jobs)
-                task_inputs["_parallel_mode"] = parallel_mode
+    # 6.2 平台级并行拆分
+    if run_mode == "platform_split":
+        jobs = prepare_parallel_jobs(module, inputs, workers)
 
-                task = task_manager.submit_parallel_module_task(
-                    module_id=module["id"],
-                    module_name=module.get("name", module["id"]),
-                    jobs=parallel_jobs,
-                    inputs=task_inputs,
-                    max_workers=parallel_workers,
+        if len(jobs) > 1:
+            task_inputs = dict(inputs)
+            task_inputs["parallel_workers"] = workers
+            task_inputs["_parallel_workers"] = workers
+            task_inputs["_parallel_job_count"] = len(jobs)
+            task_inputs["_parallel_mode"] = str(normalize_parallel_config(module).get("mode") or "auto")
+
+            task = task_manager.submit_parallel_module_task(
+                module_id=module["id"],
+                module_name=module.get("name", module["id"]),
+                jobs=jobs,
+                inputs=task_inputs,
+                max_workers=workers,
+                owner_username=username,
+            )
+
+            if output_paths:
+                start_data_file_scan_after_task(
+                    task["id"],
+                    module,
+                    output_paths,
                     owner_username=username,
                 )
 
-                output_paths = collect_output_paths_from_inputs(module, inputs)
-                if output_paths:
-                    start_data_file_scan_after_task(
-                        task["id"],
-                        module,
-                        output_paths,
-                        owner_username=username,
-                    )
-                return task
+            return task
 
-    # 非批处理模块：如果模块内部自己处理并行，则把安全调整后的进程数传给模块。
-    output_paths = collect_output_paths_from_inputs(module, inputs)
-
+    # 6.3 模块内部并行 / 普通单进程
+    # module_internal 不拆任务，只把 parallel_workers 写入 config.json。
     command, working_dir, runtime_env = build_runtime_for_module(module, inputs)
 
     task = task_manager.submit_module_task(
@@ -2021,6 +2045,99 @@ def load_python_module_config(raw_path: str) -> tuple[dict, Path]:
         "python_executable": python_executable,
         "python_env_mode": python_env_mode,
     }, config_path
+def make_python_install_release_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def remove_tree_windows_safe(path: Path, title: str = "删除目录"):
+    path = Path(path)
+
+    if not path.exists():
+        return
+
+    def on_rm_error(func, p, exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:
+            pass
+
+    last_error = None
+
+    for _ in range(6):
+        try:
+            shutil.rmtree(path, onerror=on_rm_error)
+            return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.4)
+
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"{title}失败：{path}\n"
+            f"原因：{last_error}\n\n"
+            "通常是文件正在被 Python、GDAL、GIS 软件或资源管理器预览占用。"
+        ),
+    )
+
+
+def copy_or_link_python_module_file(src: str, dst: str):
+    """
+    安装 Python 模块源码时：
+    - 普通 .py/.json/.txt 直接复制；
+    - 大模型、tif、pkl 等优先硬链接，减少磁盘占用；
+    - 硬链接失败再复制。
+    """
+    src_path = Path(src)
+    dst_path = Path(dst)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    link_suffixes = {
+        ".pkl", ".joblib", ".model", ".onnx",
+        ".h5", ".hdf5", ".npy", ".npz",
+        ".pt", ".pth", ".tif", ".tiff", ".nc", ".hdf",
+    }
+
+    try:
+        should_link = (
+            src_path.suffix.lower() in link_suffixes
+            or src_path.stat().st_size >= 20 * 1024 * 1024
+        )
+    except Exception:
+        should_link = False
+
+    if should_link:
+        try:
+            if dst_path.exists():
+                dst_path.unlink()
+            os.link(src_path, dst_path)
+            return str(dst_path)
+        except OSError:
+            pass
+
+    return shutil.copy2(src_path, dst_path)
+
+
+def copy_python_module_source_folder(source_root: Path, source_target_dir: Path):
+    shutil.copytree(
+        source_root,
+        source_target_dir,
+        dirs_exist_ok=True,
+        copy_function=copy_or_link_python_module_file,
+        ignore=shutil.ignore_patterns(
+            "__pycache__",
+            "*.pyc",
+            ".git",
+            ".idea",
+            ".vscode",
+            ".venv",
+            "venv",
+            "env",
+            "module_envs",
+            "runtime",
+        ),
+    )
 def install_python_venv_module_from_values(
     module_id: str,
     module_name: str,
@@ -2036,6 +2153,10 @@ def install_python_venv_module_from_values(
     safe_module_id = sanitize_filename(module_id).strip()
     if not safe_module_id:
         raise HTTPException(status_code=400, detail="模块 ID 不能为空")
+
+    python_env_mode = str(python_env_mode or "create_venv").strip().lower()
+    if python_env_mode not in {"create_venv", "existing"}:
+        raise HTTPException(status_code=400, detail="python_env_mode 只支持 create_venv 或 existing")
 
     source_root = Path(source_dir or "").expanduser()
     if not source_root.is_absolute():
@@ -2066,37 +2187,46 @@ def install_python_venv_module_from_values(
     if not entry_candidate.exists() or not entry_candidate.is_file():
         raise HTTPException(status_code=400, detail=f"未找到 Python 入口文件: {entry_name}")
 
-    target_dir = INSTALLED_MODULES_DIR / safe_module_id
-    if target_dir.exists():
-        shutil.rmtree(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    release_id = make_python_install_release_id()
 
-    source_target_dir = target_dir / "source"
-    shutil.copytree(source_root, source_target_dir, dirs_exist_ok=True)
+    module_root = INSTALLED_MODULES_DIR / safe_module_id
+    releases_root = module_root / "releases"
+    release_dir = releases_root / release_id
+    source_target_dir = release_dir / "source"
 
-    # 保存参数模板
-    param_template_path = target_dir / "param_template.json"
-    param_template_path.write_text(
-        json.dumps(param_json, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    env_dir = PYTHON_MODULE_ENVS_DIR / f"{safe_module_id}_{release_id}"
 
-    rel_entry = entry_candidate.resolve().relative_to(source_root.resolve())
-    installed_entry_script = source_target_dir / rel_entry
+    created_release = False
+    created_env = False
 
-    if python_env_mode == "existing":
-        python_exe = resolve_existing_python_executable(python_executable)
-    else:
-        python_exe = create_python_module_env(
-            safe_module_id,
-            source_target_dir,
-            base_python_executable=python_executable,
+    try:
+        release_dir.mkdir(parents=True, exist_ok=False)
+        created_release = True
+
+        copy_python_module_source_folder(source_root, source_target_dir)
+
+        param_template_path = release_dir / "param_template.json"
+        param_template_path.write_text(
+            json.dumps(param_json, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
 
-    module_json_candidates = list(source_target_dir.rglob("module.json"))
-    if module_json_candidates:
-        module_data = json.loads(module_json_candidates[0].read_text(encoding="utf-8"))
-    else:
+        rel_entry = entry_candidate.resolve().relative_to(source_root.resolve())
+        installed_entry_script = source_target_dir / rel_entry
+
+        if python_env_mode == "existing":
+            python_exe = resolve_existing_python_executable(python_executable)
+            actual_env_dir = python_exe.parent.parent
+        else:
+            python_exe = create_python_module_env(
+                safe_module_id,
+                source_target_dir,
+                base_python_executable=python_executable,
+                env_dir=env_dir,
+            )
+            created_env = True
+            actual_env_dir = env_dir
+
         module_data = {
             "id": safe_module_id,
             "name": module_name or safe_module_id,
@@ -2104,41 +2234,75 @@ def install_python_venv_module_from_values(
             "enabled": True,
         }
 
-    selected_tool_type = (
-        normalize_tool_key(tool_type or module_data.get("tool_type") or "")
-        or guess_module_tool_type(module_data)
-    )
+        selected_tool_type = (
+            normalize_tool_key(tool_type or "")
+            or guess_module_tool_type(module_data)
+        )
 
-    module_data["id"] = safe_module_id
-    module_data["name"] = module_name or module_data.get("name") or safe_module_id
-    module_data["description"] = description or module_data.get("description") or "Python 源码独立环境运行模块"
-    module_data["tool_type"] = selected_tool_type
-    module_data["enabled"] = module_data.get("enabled", True)
-    module_data["runtime_type"] = "python_venv"
-    module_data["python_env_mode"] = python_env_mode
-    module_data["base_python_executable"] = python_executable
-    module_data["config_mode"] = "config_json"
-    module_data["command_template"] = ["{executable}", "{entry_script}", "{config_json}"]
-    module_data["inputs"] = inferred_inputs
-    module_data["param_template"] = to_project_relative_path(param_template_path)
-    module_data["source_dir"] = to_project_relative_path(source_target_dir)
-    module_data["entry_file"] = rel_entry.as_posix()
-    module_data["entry_script"] = to_project_relative_path(installed_entry_script)
-    module_data["python_env_dir"] = to_project_relative_path(PYTHON_MODULE_ENVS_DIR / safe_module_id)
+        module_data["tool_type"] = selected_tool_type
+        module_data["runtime_type"] = "python_venv"
+        module_data["python_env_mode"] = python_env_mode
+        module_data["base_python_executable"] = python_executable
+        module_data["install_release"] = release_id
 
-    module_data["executable"] = to_project_relative_path(python_exe)
-    if python_env_mode == "existing":
-        module_data["python_env_dir"] = str(python_exe.parent.parent)
-    else:
-        module_data["python_env_dir"] = to_project_relative_path(PYTHON_MODULE_ENVS_DIR / safe_module_id)
+        module_data["config_mode"] = "config_json"
+        module_data["command_template"] = ["{executable}", "{entry_script}", "{config_json}"]
+        module_data["inputs"] = inferred_inputs
 
-    module_data["executable"] = to_project_relative_path(python_exe)
-    module_data["working_dir"] = to_project_relative_path(source_target_dir)
+        module_data["param_template"] = to_project_relative_path(param_template_path)
+        module_data["source_dir"] = to_project_relative_path(source_target_dir)
+        module_data["entry_file"] = rel_entry.as_posix()
+        module_data["entry_script"] = to_project_relative_path(installed_entry_script)
 
-    ensure_toolbar_exists(selected_tool_type)
-    upsert_module(module_data)
+        module_data["python_env_dir"] = (
+            str(actual_env_dir)
+            if python_env_mode == "existing"
+            else to_project_relative_path(actual_env_dir)
+        )
+        module_data["executable"] = to_project_relative_path(python_exe)
+        module_data["working_dir"] = to_project_relative_path(source_target_dir)
 
-    return module_data
+        ensure_toolbar_exists(selected_tool_type)
+        upsert_module(module_data)
+
+        return module_data
+
+    except HTTPException:
+        if created_env and env_dir.exists():
+            try:
+                remove_tree_windows_safe(env_dir, title="清理失败的 Python 虚拟环境")
+            except Exception:
+                pass
+
+        if created_release and release_dir.exists():
+            try:
+                remove_tree_windows_safe(release_dir, title="清理失败的 Python 模块版本目录")
+            except Exception:
+                pass
+
+        raise
+
+    except Exception as exc:
+        if created_env and env_dir.exists():
+            try:
+                remove_tree_windows_safe(env_dir, title="清理失败的 Python 虚拟环境")
+            except Exception:
+                pass
+
+        if created_release and release_dir.exists():
+            try:
+                remove_tree_windows_safe(release_dir, title="清理失败的 Python 模块版本目录")
+            except Exception:
+                pass
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Python 模块安装失败：\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                + traceback.format_exc()
+            ),
+        )
 
 def infer_param_input_type(key: str, value: Any) -> str:
     k = str(key or "").lower()
@@ -2465,12 +2629,13 @@ def create_python_module_env(
     module_id: str,
     source_dir: Path,
     base_python_executable: str = "",
+    env_dir: Path | None = None,
 ) -> Path:
     """为 Python 源码模块创建独立 venv，并安装 requirements.txt。"""
-    env_dir = PYTHON_MODULE_ENVS_DIR / module_id
+    env_dir = Path(env_dir) if env_dir else PYTHON_MODULE_ENVS_DIR / module_id
 
     if env_dir.exists():
-        shutil.rmtree(env_dir)
+        remove_tree_windows_safe(env_dir, title="删除旧 Python 虚拟环境")
 
     # 用 --clear 明确创建干净环境，--copies 在 Windows 上比软链接更稳
     base_python = (
@@ -3671,7 +3836,6 @@ def api_upload_python_module(
     finally:
         shutil.rmtree(upload_tmp, ignore_errors=True)
 
-
 @app.post("/api/admin/modules/upload-python-folder")
 def api_upload_python_folder_module(
     payload: PythonFolderModuleUploadRequest,
@@ -3679,56 +3843,68 @@ def api_upload_python_folder_module(
 ):
     require_admin(authorization)
 
-    # 新模式：用户只选择 Python 模块文件夹
-    if str(payload.folder_path or "").strip():
-        config_path = resolve_python_module_config_from_folder(
-            payload.folder_path,
-            payload.config_filename or "python_module.json",
-        )
+    try:
+        # 新模式：用户只选择 Python 模块文件夹
+        if str(payload.folder_path or "").strip():
+            config_path = resolve_python_module_config_from_folder(
+                payload.folder_path,
+                payload.config_filename or "python_module.json",
+            )
 
-        validation = validate_python_module_config_file(str(config_path))
-        if not validation.get("can_install"):
-            raise_python_validation_error(validation)
+            validation = validate_python_module_config_file(str(config_path))
+            if not validation.get("can_install"):
+                raise_python_validation_error(validation)
 
-        config, _ = load_python_module_config(str(config_path))
+            config, _ = load_python_module_config(str(config_path))
+
+            module_data = install_python_venv_module_from_values(
+                module_id=config["module_id"],
+                module_name=config["module_name"],
+                source_dir=config["source_dir"],
+                entry_file=config["entry_file"],
+                tool_type=config["tool_type"],
+                description=config["description"],
+                param_json_path=config["param_json_path"],
+                param_json=config["param_json"],
+                python_executable=config.get("python_executable") or "",
+                python_env_mode=config.get("python_env_mode") or "create_venv",
+            )
+
+            return {
+                "ok": True,
+                "message": "Python 模块文件夹安装成功",
+                "module": module_data,
+                "config_path": str(config_path),
+                "validation": validation,
+            }
 
         module_data = install_python_venv_module_from_values(
-            module_id=config["module_id"],
-            module_name=config["module_name"],
-            source_dir=config["source_dir"],
-            entry_file=config["entry_file"],
-            tool_type=config["tool_type"],
-            description=config["description"],
-            param_json_path=config["param_json_path"],
-            param_json=config["param_json"],
-            python_executable=config.get("python_executable") or "",
-            python_env_mode=config.get("python_env_mode") or "create_venv",
+            module_id=payload.module_id,
+            module_name=payload.module_name,
+            source_dir=payload.source_dir,
+            entry_file=payload.entry_file or "main.py",
+            tool_type=payload.tool_type,
+            description=payload.description,
+            param_json_path=payload.param_json_path,
         )
 
         return {
             "ok": True,
-            "message": "Python 模块文件夹安装成功",
+            "message": "Python 源码模块已创建独立环境并安装成功",
             "module": module_data,
-            "config_path": str(config_path),
-            "validation": validation,
         }
 
-    # 旧模式：保留原来的 source_dir / module_id / param_json_path 方式
-    module_data = install_python_venv_module_from_values(
-        module_id=payload.module_id,
-        module_name=payload.module_name,
-        source_dir=payload.source_dir,
-        entry_file=payload.entry_file or "main.py",
-        tool_type=payload.tool_type,
-        description=payload.description,
-        param_json_path=payload.param_json_path,
-    )
-
-    return {
-        "ok": True,
-        "message": "Python 源码模块已创建独立环境并安装成功",
-        "module": module_data,
-    }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Python 模块文件夹安装过程异常：\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                + traceback.format_exc()
+            ),
+        )
 @app.get("/api/auth/forgot-password/question")
 def api_forgot_password_question(username: str):
     try:
@@ -4351,7 +4527,49 @@ def get_runtime_pressure_snapshot(path_for_disk: str | Path | None = None) -> di
 
     return snapshot
 
+def resolve_run_parallel_mode(module: dict, inputs: dict, workers: int) -> str:
+    """
+    统一决定任务运行方式，避免 batch_group / 平台拆分 / 模块内部并行混在一起。
 
+    返回：
+    - none：普通单进程运行
+    - module_internal：模块自己处理并行，平台不拆任务，只把 parallel_workers 写入 config.json
+    - platform_split：平台按文件/文件夹拆成多个子进程
+    - batch_group：多输入目录按时次匹配，生成批处理子任务
+    """
+    cfg = normalize_parallel_config(module)
+    mode = str(cfg.get("mode") or "auto").strip() or "auto"
+
+    if mode not in VALID_PARALLEL_MODES:
+        mode = "auto"
+
+    # 显式 none：永远不拆。
+    if mode == "none":
+        return "none"
+
+    # 显式模块内部并行：永远不拆。
+    if mode == "module_internal":
+        return "module_internal"
+
+    # 显式批处理：按多输入目录匹配。
+    if mode == "batch_group":
+        return "batch_group"
+
+    # 显式平台拆分。
+    if mode in {"single_file", "folder_chunks"}:
+        return "platform_split" if workers > 1 else "none"
+
+    # auto 模式：
+    # 1. 如果配置了 batch_role，例如 B01/B03/B06/SOLAR，走批处理；
+    # 2. 否则 workers > 1 才走平台拆分；
+    # 3. workers == 1 就普通运行。
+    if _is_batch_request(module, inputs):
+        return "batch_group"
+
+    if workers > 1:
+        return "platform_split"
+
+    return "none"
 def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: int) -> tuple[int, dict]:
     """根据当前电脑负载和模块固定资源大小自动降低并行进程数，防止卡死/崩溃。"""
     requested = clamp_parallel_workers(requested_workers, task_manager.max_process_slots)
@@ -4378,15 +4596,16 @@ def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: 
 
     # CPU 已经较忙时，少开新进程；否则会直接把电脑打满。
     if cpu is not None:
-        if cpu >= 80:
-            safe = min(safe, 1)
-            reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 已很高")
-        elif cpu >= 58:
-            safe = min(safe, 2)
-            reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 偏高")
-        elif cpu >= 58:
-            safe = min(safe, max(2, min(task_manager.suggested_process_slots, 4)))
-            reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 较高")
+        if cpu is not None:
+            if cpu >= 80:
+                safe = min(safe, 1)
+                reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 已很高")
+            elif cpu >= 68:
+                safe = min(safe, 2)
+                reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 较高")
+            elif cpu >= 58:
+                safe = min(safe, max(2, min(task_manager.suggested_process_slots, 3)))
+                reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 偏高")
 
     # 内存是重模型遥感任务最容易卡死的原因。
     if mem_percent is not None and mem_avail is not None:
@@ -5243,12 +5462,14 @@ def require_own_task(task_id: str, user) -> dict:
 def api_list_tasks(authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
     username = get_username_from_user(user)
+    task_manager.kick_scheduler()
     return task_manager.list_tasks(owner_username=username)
 
 
 @app.get("/api/tasks/{task_id}")
 def api_get_task(task_id: str, authorization: str | None = Header(default=None)):
     user = get_current_user(authorization)
+    task_manager.kick_scheduler()
     return require_own_task(task_id, user)
 
 

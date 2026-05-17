@@ -1,4 +1,5 @@
 import json
+import time
 import os
 import shutil
 import time
@@ -64,7 +65,70 @@ class TaskManager:
 
         self._load_tasks()
         self._mark_interrupted_tasks()
+        self._scheduler_heartbeat_thread = threading.Thread(
+            target=self._scheduler_heartbeat,
+            daemon=True,
+        )
+        self._scheduler_heartbeat_thread.start()
+    def kick_scheduler(self):
+        """
+        外部主动唤醒调度器。
+        前端轮询 /api/tasks 或 /api/system/resources 时调用，
+        防止任务已经 queued 但调度器没有继续 drain。
+        """
+        try:
+            self._drain_scheduler_queue()
+        except Exception as exc:
+            try:
+                with self.lock:
+                    for item in self.scheduler_queue:
+                        task_id = str(item.get("task_id") or "")
+                        task = self.tasks.get(task_id)
+                        if task and task.get("status") == "queued":
+                            task["queue_reason"] = (
+                                f"调度器唤醒失败: {type(exc).__name__}: {exc}"
+                            )
+                self._save_tasks()
+            except Exception:
+                pass
+    def kick_scheduler(self):
+        """
+        外部主动唤醒调度器。
+        前端轮询 /api/tasks、/api/tasks/{id}、/api/system/resources 时调用。
+        """
+        try:
+            self._drain_scheduler_queue()
+        except Exception as exc:
+            try:
+                with self.lock:
+                    for item in self.scheduler_queue:
+                        task_id = str(item.get("task_id") or "")
+                        task = self.tasks.get(task_id)
+                        if task and task.get("status") == "queued":
+                            task["queue_reason"] = (
+                                f"调度器唤醒失败: {type(exc).__name__}: {exc}"
+                            )
+                self._save_tasks()
+            except Exception:
+                pass
+    def _scheduler_heartbeat(self):
+        """
+        调度器心跳。
+        防止某次 enqueue/drain 因异常或热重载时机导致 queued 任务没有被启动。
+        """
+        while True:
+            time.sleep(1.0)
+            try:
+                with self.lock:
+                    has_queued = any(
+                        (self.tasks.get(str(item.get("task_id") or "")) or {}).get("status") == "queued"
+                        for item in self.scheduler_queue
+                    )
 
+                if has_queued:
+                    self._drain_scheduler_queue()
+            except Exception:
+                pass
     def _load_tasks(self):
         if not self.tasks_file.exists():
             self.tasks = {}
@@ -201,10 +265,16 @@ class TaskManager:
                 continue
             requested = self._normalize_requested_slots(item.get("requested_slots"))
             task["queue_position"] = pos
-            task["queue_reason"] = (
-                f"等待本地 CPU 空闲：当前占用 {used}/{self.max_process_slots}，"
-                f"本任务需要 {requested} 个进程槽"
-            )
+            if used == 0 and requested <= self.max_process_slots:
+                task["queue_reason"] = (
+                    f"调度器等待启动：当前占用 {used}/{self.max_process_slots}，"
+                    f"本任务需要 {requested} 个进程槽。若长时间不启动，请检查后端是否使用 --reload 或调度器是否异常。"
+                )
+            else:
+                task["queue_reason"] = (
+                    f"等待本地 CPU 空闲：当前占用 {used}/{self.max_process_slots}，"
+                    f"本任务需要 {requested} 个进程槽"
+                )
             pos += 1
 
 
@@ -998,6 +1068,8 @@ class TaskManager:
 
     def _run_parallel_task(self, parent_id: str, jobs: List[Dict[str, Any]], max_workers: int):
         total = len(jobs)
+        max_workers = max(1, min(int(max_workers or 1), max(1, total)))
+
         self.update_task(
             parent_id,
             status="running",
@@ -1005,106 +1077,126 @@ class TaskManager:
             parallel_total=total,
             parallel_done=0,
             parallel_failed=0,
+            max_workers=max_workers,
         )
-        self.append_log(parent_id, f"[PARALLEL] 并行任务启动，总任务数={total}，并行数={max_workers}")
-        self.append_log(parent_id, "[SAFE] 已启用运行中保护：CPU/内存/磁盘压力过高时，会暂停启动新的子任务，已启动任务不受影响。")
 
-        index_lock = threading.Lock()
+        self.append_log(parent_id, f"[PARALLEL] 并行任务启动：总任务数={total}，并行数={max_workers}")
+        self.append_log(parent_id, "[SAFE] 已启用运行中保护：CPU/内存/磁盘压力过高时，会暂停启动新的子任务。")
+
         progress_lock = threading.Lock()
-        next_index = {"value": 0}
         progress = {"done": 0, "failed": 0}
 
-        def next_job() -> tuple[int, Dict[str, Any]] | None:
-            with index_lock:
-                if parent_id in self.cancel_flags:
-                    return None
-                idx = next_index["value"]
-                if idx >= total:
-                    return None
-                next_index["value"] += 1
-                return idx, jobs[idx]
+        def run_one(index: int, spec: Dict[str, Any]):
+            if parent_id in self.cancel_flags:
+                return None
 
-        def worker(worker_no: int):
-            while True:
-                item = next_job()
-                if item is None:
-                    return
-                idx, spec = item
-                label = spec.get("label") or f"子任务 {idx + 1}"
-                parent_task = self.get_task(parent_id) or {}
-                owner_username = str(parent_task.get("owner_username") or "")
+            label = spec.get("label") or f"子任务 {index + 1}"
+            parent_task = self.get_task(parent_id) or {}
+            owner_username = str(parent_task.get("owner_username") or "")
 
-                self._wait_until_safe_to_start_child(parent_id, label)
-                if parent_id in self.cancel_flags:
-                    return
+            self._wait_until_safe_to_start_child(parent_id, label)
 
-                child = self.create_task(
-                    module_id=spec.get("module_id", ""),
-                    module_name=spec.get("module_name", label),
-                    command=spec.get("command") or [],
-                    inputs=spec.get("inputs") or {},
-                    kind="module",
-                    extra={
-                        "parent_id": parent_id,
-                        "worker_no": worker_no,
-                        "job_index": idx + 1,
-                        "owner_username": owner_username,
-                    },
-                )
-                with self.lock:
-                    parent = self.tasks.get(parent_id)
-                    if parent:
-                        parent.setdefault("children", []).append(child["id"])
-                self._save_tasks()
+            if parent_id in self.cancel_flags:
+                return None
 
-                self.append_log(parent_id, f"[PARALLEL] Worker-{worker_no} 启动 {idx + 1}/{total}: {label}")
-                self._run_process_task(
-                    child["id"],
-                    spec.get("command") or [],
-                    spec.get("working_dir"),
-                    spec.get("env"),
-                )
-                child_task = self.get_task(child["id"]) or {}
-                child_status = child_task.get("status")
-                with progress_lock:
-                    progress["done"] += 1
-                    if child_status != "success":
-                        progress["failed"] += 1
-                    self.update_task(
-                        parent_id,
-                        parallel_done=progress["done"],
-                        parallel_failed=progress["failed"],
-                    )
-                self.append_log(
+            child = self.create_task(
+                module_id=spec.get("module_id", ""),
+                module_name=spec.get("module_name", label),
+                command=spec.get("command") or [],
+                inputs=spec.get("inputs") or {},
+                kind="module",
+                extra={
+                    "parent_id": parent_id,
+                    "worker_no": None,
+                    "job_index": index + 1,
+                    "owner_username": owner_username,
+                },
+            )
+
+            with self.lock:
+                parent = self.tasks.get(parent_id)
+                if parent:
+                    parent.setdefault("children", []).append(child["id"])
+            self._save_tasks()
+
+            self.append_log(parent_id, f"[PARALLEL] 启动 {index + 1}/{total}: {label}")
+
+            self._run_process_task(
+                child["id"],
+                spec.get("command") or [],
+                spec.get("working_dir"),
+                spec.get("env"),
+            )
+
+            child_task = self.get_task(child["id"]) or {}
+            status = child_task.get("status")
+
+            with progress_lock:
+                progress["done"] += 1
+                if status != "success":
+                    progress["failed"] += 1
+
+                self.update_task(
                     parent_id,
-                    f"[PARALLEL] 完成 {progress['done']}/{total}: {label}，状态={child_status}",
+                    parallel_done=progress["done"],
+                    parallel_failed=progress["failed"],
                 )
 
-        thread_count = max(1, min(max_workers, total))
-        workers = [
-            threading.Thread(target=worker, args=(i + 1,), daemon=True)
-            for i in range(thread_count)
-        ]
-        for t in workers:
-            t.start()
-        for t in workers:
-            t.join()
+            self.append_log(
+                parent_id,
+                f"[PARALLEL] 完成 {progress['done']}/{total}: {label}，状态={status}",
+            )
+
+            return child["id"]
+
+        failures = 0
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(run_one, idx, job): idx
+                for idx, job in enumerate(jobs)
+            }
+
+            for future in as_completed(future_map):
+                try:
+                    future.result()
+                except Exception as exc:
+                    failures += 1
+                    with progress_lock:
+                        progress["done"] += 1
+                        progress["failed"] += 1
+                        self.update_task(
+                            parent_id,
+                            parallel_done=progress["done"],
+                            parallel_failed=progress["failed"],
+                        )
+                    self.append_log(parent_id, f"[PARALLEL-ERROR] 子任务异常: {type(exc).__name__}: {exc}")
+                    self.append_log(parent_id, traceback.format_exc())
 
         parent = self.get_task(parent_id) or {}
         children = parent.get("children") or []
         child_statuses = [(self.get_task(cid) or {}).get("status") for cid in children]
+
         if parent_id in self.cancel_flags or any(s == "cancelled" for s in child_statuses):
-            status = "cancelled"
+            final_status = "cancelled"
             return_code = -1
-        elif any(s != "success" for s in child_statuses):
-            status = "failed"
+        elif failures > 0 or any(s != "success" for s in child_statuses):
+            final_status = "failed"
             return_code = 1
         else:
-            status = "success"
+            final_status = "success"
             return_code = 0
 
-        self.update_task(parent_id, status=status, return_code=return_code, ended_at=now_iso())
-        self.append_log(parent_id, f"[PARALLEL] 并行任务结束，状态={status}")
+        self.update_task(
+            parent_id,
+            status=final_status,
+            return_code=return_code,
+            ended_at=now_iso(),
+            parallel_done=total,
+            parallel_failed=sum(1 for s in child_statuses if s != "success"),
+        )
+
+        self.append_log(parent_id, f"[PARALLEL] 并行任务结束，状态={final_status}")
         self.cancel_flags.discard(parent_id)
 
     def cancel_task(self, task_id: str) -> bool:
