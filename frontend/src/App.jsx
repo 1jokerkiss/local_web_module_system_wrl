@@ -1502,6 +1502,7 @@ export default function App() {
   const [dataPreview, setDataPreview] = useState(null);
   const [dataPreviewLoading, setDataPreviewLoading] = useState(false);
   const [dataPreviewScale, setDataPreviewScale] = useState(1);
+  const [dataPreviewScaleInput, setDataPreviewScaleInput] = useState('100');
 
   const [activeTab, setActiveTab] = useState(() => getSavedActiveTab() || 'tool:cloud');
   const [activeModuleByTool, setActiveModuleByTool] = useState({});
@@ -3424,6 +3425,7 @@ function renderDataManagementPage() {
       setDataPreviewLoading(true);
       const data = await previewDataFile(file.id);
       setDataPreviewScale(1);
+      setDataPreviewScaleInput('100');
       setDataPreview(data);
     } catch (e) {
       alert(e?.message || '预览失败');
@@ -3600,13 +3602,36 @@ function renderDataManagementPage() {
           return Math.max(0.05, Math.min(20, n));
         }
 
-        function updatePreviewScale(next) {
-          setDataPreviewScale(clampPreviewScale(next));
+        function formatScalePercent(scale) {
+          return String(Math.round(clampPreviewScale(scale) * 100));
         }
 
-        function updatePreviewScalePercent(value) {
-          const n = Number(String(value || '').replace('%', '').trim());
+        function updatePreviewScale(next) {
+          const nextScale = clampPreviewScale(next);
+          setDataPreviewScale(nextScale);
+          setDataPreviewScaleInput(formatScalePercent(nextScale));
+        }
+
+        function updatePreviewScalePercentText(value) {
+          const raw = String(value ?? '').replace('%', '').trim();
+          setDataPreviewScaleInput(raw);
+
+          // 允许用户先清空输入框，再输入 120 这种数字。
+          // 只有输入的是有效数字时，才实时更新图片缩放。
+          if (raw === '') return;
+          const n = Number(raw);
           if (!Number.isFinite(n)) return;
+          const nextScale = clampPreviewScale(n / 100);
+          setDataPreviewScale(nextScale);
+        }
+
+        function commitPreviewScalePercentText() {
+          const raw = String(dataPreviewScaleInput ?? '').replace('%', '').trim();
+          const n = Number(raw);
+          if (!raw || !Number.isFinite(n)) {
+            setDataPreviewScaleInput(formatScalePercent(dataPreviewScale));
+            return;
+          }
           updatePreviewScale(n / 100);
         }
 
@@ -3671,14 +3696,19 @@ function renderDataManagementPage() {
                       >
                         比例
                         <input
-                          type="number"
-                          min="5"
-                          max="2000"
-                          step="5"
-                          value={Math.round(dataPreviewScale * 100)}
-                          onChange={(e) => updatePreviewScalePercent(e.target.value)}
+                          type="text"
+                          inputMode="numeric"
+                          value={dataPreviewScaleInput}
+                          onChange={(e) => updatePreviewScalePercentText(e.target.value)}
+                          onBlur={commitPreviewScalePercentText}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.currentTarget.blur();
+                            }
+                          }}
+                          placeholder="100"
                           style={{
-                            width: 76,
+                            width: 86,
                             height: 36,
                             borderRadius: 9,
                             border: '1px solid #cdd8ea',
