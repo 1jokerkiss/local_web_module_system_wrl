@@ -253,5 +253,71 @@
       }
     ],
     "tool_type": "aerosol"
+  },
+  {
+    "id": "H8_CLOUD_TYPE",
+    "name": "葵花8号云类型反演",
+    "description": "葵花8号卫星云类型反演 Python 源码模块",
+    "enabled": true,
+    "tool_type": "cloud",
+    "runtime_type": "python_venv",
+    "python_env_mode": "create_venv",
+    "base_python_executable": "D:\\develop\\py38\\python.exe",
+    "install_release": "20260518_151456",
+    "config_mode": "config_json",
+    "command_template": [
+      "{executable}",
+      "{entry_script}",
+      "{config_json}"
+    ],
+    "inputs": [
+      {
+        "key": "file",
+        "label": "file",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:\\local_web_module_system_wrl\\NC"
+      },
+      {
+        "key": "cm_files",
+        "label": "cm_files",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:\\local_web_module_system_wrl\\CM_24"
+      },
+      {
+        "key": "outpath",
+        "label": "outpath",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "D:\\local_web_module_system_wrl\\NC_1"
+      }
+    ],
+    "param_template": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260518_151456/param_template.json",
+    "source_dir": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260518_151456/source",
+    "entry_file": "CM_CTH.py",
+    "entry_script": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260518_151456/source/CM_CTH.py",
+    "python_env_dir": "backend/module_envs/H8_CLOUD_TYPE_20260518_151456",
+    "executable": "backend/module_envs/H8_CLOUD_TYPE_20260518_151456/Scripts/python.exe",
+    "working_dir": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260518_151456/source",
+    "parallel": {
+      "mode": "auto",
+      "input_key": "",
+      "output_key": "",
+      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
+      "output_suffix": ".tif"
+    }
   }
 ]

@@ -353,15 +353,15 @@ function clampParallelWorkersValue(value, maxWorkers = 64) {
 
 function getConservativeSuggestedWorkers(cpuCount) {
   const cpu = Math.max(1, Number.parseInt(String(cpuCount || 1), 10) || 1);
-  // 放宽建议值：16/24 核默认建议 4；不再动不动建议 1 或 2。
-  return Math.max(1, Math.min(4, Math.ceil(cpu / 4)));
+  // 遥感反演通常是内存/磁盘重任务，前端兜底值保守：16/24 核也默认建议 2。
+  return Math.max(1, Math.min(2, Math.ceil(cpu / 8)));
 }
 
 function getConservativeMaxWorkers(cpuCount, suggestedWorkers) {
   const cpu = Math.max(1, Number.parseInt(String(cpuCount || 1), 10) || 1);
   const suggested = Math.max(1, Number.parseInt(String(suggestedWorkers || getConservativeSuggestedWorkers(cpu)), 10) || 1);
-  // 上限保留 8；真正保护由后端逐个启动子进程时动态暂停。
-  return Math.max(suggested, Math.min(8, Math.max(4, Math.ceil(cpu / 3))));
+  // 上限也降低：16/24 核默认最高 4；后端仍会按 CPU/内存/磁盘/模型大小自动降到更安全值。
+  return Math.max(suggested, Math.min(4, Math.max(1, Math.ceil(cpu / 4))));
 }
 
 const defaultSystemResources = {
@@ -685,6 +685,15 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
           <div><strong>PID：</strong>{task?.pid || '-'}</div>
           {task?.status === 'queued' && (
             <div><strong>排队：</strong>{task?.queue_position ? `第 ${task.queue_position} 位` : '等待中'}{task?.queue_reason ? `，${task.queue_reason}` : ''}</div>
+          )}
+          {Array.isArray(task?.temporary_outputs) && task.temporary_outputs.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <strong>临时输出：</strong>{task.temporary_outputs.length} 个，父任务成功后登记到数据管理
+              <div style={{ color: '#5f7088', fontSize: 12, marginTop: 4, maxHeight: 56, overflow: 'auto' }}>
+                {task.temporary_outputs.slice(0, 5).map((item) => item.name || item.path).join('；')}
+                {task.temporary_outputs.length > 5 ? `；...还有 ${task.temporary_outputs.length - 5} 个` : ''}
+              </div>
+            </div>
           )}
         </div>
 
@@ -1492,6 +1501,7 @@ export default function App() {
   const [dataFiles, setDataFiles] = useState([]);
   const [dataPreview, setDataPreview] = useState(null);
   const [dataPreviewLoading, setDataPreviewLoading] = useState(false);
+  const [dataPreviewScale, setDataPreviewScale] = useState(1);
 
   const [activeTab, setActiveTab] = useState(() => getSavedActiveTab() || 'tool:cloud');
   const [activeModuleByTool, setActiveModuleByTool] = useState({});
@@ -1501,6 +1511,7 @@ export default function App() {
   const [runtimeForms, setRuntimeForms] = useState({});
   const [moduleForm, setModuleForm] = useState(emptyModuleForm);
   const [editingModuleId, setEditingModuleId] = useState('');
+  const [moduleEditOpen, setModuleEditOpen] = useState(false);
   const [inputEditorOpen, setInputEditorOpen] = useState(false);
   const [inputEditorFields, setInputEditorFields] = useState([]);
   const [uploadToolType, setUploadToolType] = useState('');
@@ -2383,6 +2394,7 @@ function addTaskWindow(task, title) {
       extra_json_text: JSON.stringify(pickModuleExtraFields(module), null, 2),
       enabled: module.enabled !== false,
     });
+    setModuleEditOpen(true);
   }
 
   async function saveCurrentModule() {
@@ -2408,6 +2420,7 @@ function addTaskWindow(task, title) {
       });
       setModuleForm(emptyModuleForm);
       setEditingModuleId('');
+      setModuleEditOpen(false);
       await Promise.all([refreshModules(), refreshToolbars()]);
       alert('模块已保存');
     } catch (e) {
@@ -3015,7 +3028,7 @@ async function uploadPythonFolder() {
               }}
             >
               <div>本机 CPU 核数：<strong>{resourceInfo.cpu_count}</strong>；建议进程数：<strong>{resourceInfo.suggested_workers}</strong>；上限进程数：<strong>{resourceInfo.max_workers}</strong></div>
-              <div style={{ marginTop: 4 }}>建议值按重型遥感模块保守计算：默认最高 2；上限默认最高 8。后端仍会根据 CPU、内存、磁盘压力自动降低或排队。</div>
+              <div style={{ marginTop: 4 }}>建议值按重型遥感模块保守计算：默认最高 2；上限默认最高 4。后端仍会根据 CPU、内存、磁盘压力自动降低或排队。</div>
               <div>当前已占用进程槽：<strong>{resourceInfo.running_workers}/{resourceInfo.max_workers}</strong>；等待队列：<strong>{resourceInfo.queued_task_count}</strong></div>
               <div>系统 CPU 使用率：<strong>{resourceInfo.cpu_percent == null ? '-' : `${Number(resourceInfo.cpu_percent).toFixed(1)}%`}</strong>；模块进程 CPU：<strong>{resourceInfo.running_process_cpu_percent == null ? '-' : `${Number(resourceInfo.running_process_cpu_percent).toFixed(1)}%`}</strong></div>
               <div>内存：<strong>{resourceInfo.memory_percent == null ? '-' : `${Number(resourceInfo.memory_percent).toFixed(1)}%`}</strong>；可用内存：<strong>{resourceInfo.memory_available_gb == null ? '-' : `${Number(resourceInfo.memory_available_gb).toFixed(1)}GB`}</strong>；磁盘：<strong>{resourceInfo.disk_percent == null ? '-' : `${Number(resourceInfo.disk_percent).toFixed(1)}%`}</strong>；剩余：<strong>{resourceInfo.disk_free_gb == null ? '-' : `${Number(resourceInfo.disk_free_gb).toFixed(1)}GB`}</strong></div>
@@ -3170,6 +3183,51 @@ async function uploadPythonFolder() {
             </div>
           );
         })}
+      </div>
+    );
+  }
+
+  function renderModuleEditForm() {
+    return (
+      <div style={{ display: 'grid', gap: 12 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <select
+            value={moduleForm.tool_type}
+            onChange={(e) => setModuleForm({ ...moduleForm, tool_type: e.target.value })}
+            style={styles.input}
+          >
+            {renderToolbarOptions()}
+          </select>
+          <input
+            placeholder="ID"
+            value={moduleForm.id}
+            readOnly
+            style={{ ...styles.input, background: '#f3f7fb', color: '#62738a' }}
+          />
+          <input placeholder="名称" value={moduleForm.name} onChange={(e) => setModuleForm({ ...moduleForm, name: e.target.value })} style={styles.input} />
+          <input placeholder="可执行文件 / Python 解释器" value={moduleForm.executable} onChange={(e) => setModuleForm({ ...moduleForm, executable: e.target.value })} style={styles.input} />
+          <input placeholder="工作目录" value={moduleForm.working_dir} onChange={(e) => setModuleForm({ ...moduleForm, working_dir: e.target.value })} style={styles.input} />
+          <input placeholder="标签，英文逗号分隔" value={moduleForm.tags_text} onChange={(e) => setModuleForm({ ...moduleForm, tags_text: e.target.value })} style={styles.input} />
+          <textarea placeholder="描述" value={moduleForm.description} onChange={(e) => setModuleForm({ ...moduleForm, description: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 80 }} />
+          <textarea placeholder="命令模板(JSON数组)" value={moduleForm.command_template_text} onChange={(e) => setModuleForm({ ...moduleForm, command_template_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2' }} />
+          <textarea placeholder="输入字段(JSON数组)：包含输入/输出路径、是否用户可见、管理员预填 resources 等" value={moduleForm.inputs_text} onChange={(e) => setModuleForm({ ...moduleForm, inputs_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 180 }} />
+          <textarea placeholder="并行配置(JSON对象)，保存在 module.json 的 parallel 字段" value={moduleForm.parallel_json_text} onChange={(e) => setModuleForm({ ...moduleForm, parallel_json_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 110 }} />
+        </div>
+
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <button style={styles.blueBtn} onClick={saveCurrentModule}>保存模块</button>
+          <button style={styles.whiteBtn} onClick={openInputEditor}>编辑输入文件</button>
+          <button
+            style={styles.whiteBtn}
+            onClick={() => {
+              setModuleEditOpen(false);
+              setEditingModuleId('');
+              setModuleForm(emptyModuleForm);
+            }}
+          >
+            取消
+          </button>
+        </div>
       </div>
     );
   }
@@ -3365,6 +3423,7 @@ function renderDataManagementPage() {
     try {
       setDataPreviewLoading(true);
       const data = await previewDataFile(file.id);
+      setDataPreviewScale(1);
       setDataPreview(data);
     } catch (e) {
       alert(e?.message || '预览失败');
@@ -3510,41 +3569,215 @@ function renderDataManagementPage() {
 
       </section>
 
-      {dataPreview && (
-        <SimpleOverlay
-          title={`文件预览：${dataPreview.name || ''}`}
-          onClose={() => setDataPreview(null)}
-          width="min(1100px, 96vw)"
-        >
-          {dataPreviewLoading && <div>加载中...</div>}
+      {dataPreview && (() => {
+        const meta = dataPreview.meta || {};
+        const rawW = Number(meta.preview_width || meta.width || 900) || 900;
+        const rawH = Number(meta.preview_height || meta.height || 650) || 650;
+        const vw = typeof window !== 'undefined' ? window.innerWidth : 1400;
+        const vh = typeof window !== 'undefined' ? window.innerHeight : 900;
+        // 预览框默认接近数据管理表格中间区域大小。
+        // 图片默认按等比例“适应预览框”：小图会自动放大，大图会自动缩小，尽量铺满预览框且不变形。
+        const targetW = Math.floor(vw * 0.72);
+        const targetH = Math.floor(vh * 0.76);
+        const baseW = Math.min(Math.max(980, targetW), Math.floor(vw * 0.92));
+        const baseH = Math.min(Math.max(620, targetH), Math.floor(vh * 0.90));
+        const previewPanelW = Math.max(360, baseW - 64);
+        const previewPanelH = Math.max(360, baseH - 168);
+        const fitScale = Math.max(
+          0.01,
+          Math.min(
+            (previewPanelW - 28) / Math.max(1, rawW),
+            (previewPanelH - 28) / Math.max(1, rawH)
+          )
+        );
+        const renderedW = Math.max(1, Math.round(rawW * fitScale * dataPreviewScale));
+        const renderedH = Math.max(1, Math.round(rawH * fitScale * dataPreviewScale));
+        const actualPercent = Math.round(fitScale * dataPreviewScale * 100);
 
-          {dataPreview.type === 'image' && dataPreview.data_url ? (
-            <div>
-              <div style={{ marginBottom: 12, color: '#6a7f96', wordBreak: 'break-all' }}>
-                {dataPreview.path}
+        function clampPreviewScale(value) {
+          const n = Number(value);
+          if (!Number.isFinite(n)) return 1;
+          return Math.max(0.05, Math.min(20, n));
+        }
+
+        function updatePreviewScale(next) {
+          setDataPreviewScale(clampPreviewScale(next));
+        }
+
+        function updatePreviewScalePercent(value) {
+          const n = Number(String(value || '').replace('%', '').trim());
+          if (!Number.isFinite(n)) return;
+          updatePreviewScale(n / 100);
+        }
+
+        return (
+          <div
+            style={{
+              position: 'fixed',
+              inset: 0,
+              background: 'rgba(7,22,44,0.32)',
+              zIndex: 7000,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: 12,
+            }}
+          >
+            <div
+              style={{
+                width: baseW,
+                height: baseH,
+                maxWidth: '96vw',
+                maxHeight: '94vh',
+                minWidth: 520,
+                minHeight: 380,
+                resize: 'both',
+                overflow: 'auto',
+                borderRadius: 18,
+                background: 'rgba(248,251,255,0.98)',
+                boxShadow: '0 22px 60px rgba(0,0,0,0.22)',
+                padding: 16,
+              }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, marginBottom: 14 }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 20, fontWeight: 900, color: '#102a4a', wordBreak: 'break-all' }}>
+                    文件预览：{dataPreview.name || ''}
+                  </div>
+                  <div style={{ fontSize: 13, color: '#6a7f96', marginTop: 4 }}>
+                    原始预览尺寸：{rawW} × {rawH}；默认已等比适应预览框；当前实际显示约为原图 {actualPercent}%
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                  {dataPreview.type === 'image' && dataPreview.data_url && (
+                    <>
+                      <button
+                        style={{ ...styles.whiteBtn, padding: '9px 14px', fontSize: 14 }}
+                        onClick={() => updatePreviewScale(dataPreviewScale - 0.1)}
+                      >
+                        缩小
+                      </button>
+
+                      <label
+                        style={{
+                          display: 'flex',
+                          flexDirection: 'row',
+                          alignItems: 'center',
+                          gap: 6,
+                          fontSize: 13,
+                          color: '#17406b',
+                          fontWeight: 800,
+                        }}
+                      >
+                        比例
+                        <input
+                          type="number"
+                          min="5"
+                          max="2000"
+                          step="5"
+                          value={Math.round(dataPreviewScale * 100)}
+                          onChange={(e) => updatePreviewScalePercent(e.target.value)}
+                          style={{
+                            width: 76,
+                            height: 36,
+                            borderRadius: 9,
+                            border: '1px solid #cdd8ea',
+                            padding: '0 8px',
+                            fontWeight: 800,
+                            color: '#17406b',
+                          }}
+                        />
+                        %
+                      </label>
+
+                      <button
+                        style={{ ...styles.whiteBtn, padding: '9px 14px', fontSize: 14 }}
+                        onClick={() => updatePreviewScale(dataPreviewScale + 0.1)}
+                      >
+                        放大
+                      </button>
+
+                      <button
+                        style={{ ...styles.whiteBtn, padding: '9px 14px', fontSize: 14 }}
+                        onClick={() => updatePreviewScale(1)}
+                      >
+                        适应窗口
+                      </button>
+                    </>
+                  )}
+                  <button
+                    style={{
+                      ...styles.redBtn,
+                      padding: '12px 22px',
+                      fontSize: 16,
+                      borderRadius: 12,
+                      boxShadow: '0 8px 18px rgba(197, 50, 50, 0.25)',
+                    }}
+                    onClick={() => setDataPreview(null)}
+                  >
+                    关闭预览
+                  </button>
+                </div>
               </div>
-              <img
-                src={dataPreview.data_url}
-                alt={dataPreview.name}
-                style={{
-                  maxWidth: '100%',
-                  maxHeight: '75vh',
-                  borderRadius: 12,
-                  border: '1px solid #d8e3f0',
-                  background: '#fff',
-                }}
-              />
+
+              {dataPreviewLoading && <div>加载中...</div>}
+
+              {dataPreview.type === 'image' && dataPreview.data_url ? (
+                <div>
+                  <div style={{ marginBottom: 10, color: '#6a7f96', wordBreak: 'break-all', fontSize: 12 }}>
+                    {dataPreview.path}
+                  </div>
+                  <div
+                    style={{
+                      height: previewPanelH,
+                      width: '100%',
+                      overflow: 'auto',
+                      border: '1px solid #d8e3f0',
+                      borderRadius: 14,
+                      background: '#f8fbff',
+                      padding: 14,
+                      boxSizing: 'border-box',
+                    }}
+                  >
+                    <div
+                      style={{
+                        minWidth: '100%',
+                        minHeight: '100%',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                      }}
+                    >
+                      <img
+                        src={dataPreview.data_url}
+                        alt={dataPreview.name}
+                        style={{
+                          width: renderedW,
+                          height: renderedH,
+                          maxWidth: 'none',
+                          maxHeight: 'none',
+                          objectFit: 'contain',
+                          borderRadius: 12,
+                          border: '1px solid #d8e3f0',
+                          background: '#fff',
+                          boxShadow: '0 6px 18px rgba(15,45,80,0.12)',
+                        }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ lineHeight: 1.8 }}>
+                  <div>{dataPreview.message || '该文件暂不支持在线预览'}</div>
+                  <div style={{ color: '#6a7f96', wordBreak: 'break-all', marginTop: 8 }}>
+                    {dataPreview.path}
+                  </div>
+                </div>
+              )}
             </div>
-          ) : (
-            <div style={{ lineHeight: 1.8 }}>
-              <div>{dataPreview.message || '该文件暂不支持在线预览'}</div>
-              <div style={{ color: '#6a7f96', wordBreak: 'break-all', marginTop: 8 }}>
-                {dataPreview.path}
-              </div>
-            </div>
-          )}
-        </SimpleOverlay>
-      )}
+          </div>
+        );
+      })()}
     </>
   );
 }
@@ -3598,7 +3831,7 @@ function renderTaskManagementPage() {
             </thead>
 
             <tbody>
-            {tasks.map((task, index) => (
+            {tasks.filter((item) => !item.parent_id).map((task, index) => (
                 <tr
                     key={task.id}
                     style={{
@@ -3616,7 +3849,7 @@ function renderTaskManagementPage() {
                   <td style={taskTdEllipsisStyle} title={task.module_name || '-'}>
                     {task.module_name}
                   </td>
-                  <td style={taskTdStyle}>{task.kind}</td>
+                  <td style={taskTdStyle}>{task.kind === 'parallel' || task.kind === 'batch_parent' ? 'module' : task.kind}</td>
                   <td style={taskTdStyle}>
                     {statusBadge(task.status)}
                     {task.status === 'queued' && (task.queue_position || task.queue_reason) && (
@@ -3668,7 +3901,7 @@ function renderTaskManagementPage() {
                 </tr>
               ))}
 
-              {tasks.length === 0 && (
+              {tasks.filter((item) => !item.parent_id).length === 0 && (
                 <tr>
                   <td colSpan={isAdmin ? 8 : 7} style={{...taskTdStyle, padding: 30, textAlign: 'center', color: '#6c8098'}}>
                     暂无任务
@@ -3778,12 +4011,6 @@ function renderTaskManagementPage() {
                     'installed_modules',
                     '已安装模块',
                     '查看当前已经安装到系统中的模块，并进行编辑或删除。'
-                  )}
-
-                  {renderModuleMgmtButton(
-                    'toolbars',
-                    '工具栏',
-                    '管理云反演、气溶胶反演等顶部工具栏分类。'
                   )}
                 </div>
               </div>
@@ -4135,77 +4362,7 @@ function renderTaskManagementPage() {
                       </div>
                       {renderInstalledModulesTree()}
                     </div>
-
-                    <div style={{ ...styles.card, padding: 16 }}>
-                      <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
-                        {editingModuleId ? `编辑模块：${editingModuleId}` : '手工新增 / 更新模块'}
-                      </div>
-
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                        <select
-                          value={moduleForm.tool_type}
-                          onChange={(e) => setModuleForm({ ...moduleForm, tool_type: e.target.value })}
-                          style={styles.input}
-                        >
-                          {renderToolbarOptions()}
-                        </select>
-                        <input
-                          placeholder="ID"
-                          value={moduleForm.id}
-                          onChange={(e) => setModuleForm({ ...moduleForm, id: e.target.value })}
-                          style={styles.input}
-                        />
-                        <input placeholder="名称" value={moduleForm.name} onChange={(e) => setModuleForm({ ...moduleForm, name: e.target.value })} style={styles.input} />
-                        <input placeholder="可执行文件" value={moduleForm.executable} onChange={(e) => setModuleForm({ ...moduleForm, executable: e.target.value })} style={styles.input} />
-                        <input placeholder="工作目录" value={moduleForm.working_dir} onChange={(e) => setModuleForm({ ...moduleForm, working_dir: e.target.value })} style={styles.input} />
-                        <input placeholder="标签，英文逗号分隔" value={moduleForm.tags_text} onChange={(e) => setModuleForm({ ...moduleForm, tags_text: e.target.value })} style={styles.input} />
-                        <textarea placeholder="描述" value={moduleForm.description} onChange={(e) => setModuleForm({ ...moduleForm, description: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 80 }} />
-                        <textarea placeholder="命令模板(JSON数组)" value={moduleForm.command_template_text} onChange={(e) => setModuleForm({ ...moduleForm, command_template_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2' }} />
-                        <textarea placeholder="输入字段(JSON数组)：包含输入/输出路径、是否用户可见、管理员预填 resources 等" value={moduleForm.inputs_text} onChange={(e) => setModuleForm({ ...moduleForm, inputs_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 180 }} />
-                        <textarea placeholder="并行配置(JSON对象)，保存在 module.json 的 parallel 字段" value={moduleForm.parallel_json_text} onChange={(e) => setModuleForm({ ...moduleForm, parallel_json_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 110 }} />
-                      </div>
-
-                      <div style={{ display: 'flex', gap: 10, marginTop: 14, flexWrap: 'wrap' }}>
-                        <button style={styles.blueBtn} onClick={saveCurrentModule}>保存模块</button>
-                        <button style={styles.whiteBtn} onClick={openInputEditor}>编辑输入文件</button>
-                        <button
-                          style={styles.whiteBtn}
-                          onClick={() => {
-                            setEditingModuleId('');
-                            setModuleForm(emptyModuleForm);
-                          }}
-                        >
-                          新建空白
-                        </button>
-                      </div>
-                    </div>
                   </>
-                )}
-
-                {moduleMgmtAction === 'toolbars' && (
-                  <div style={{ ...styles.card, padding: 18 }}>
-                    <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
-                      工具栏列表
-                    </div>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8, marginBottom: 10 }}>
-                      <input
-                        placeholder="新增工具栏名称"
-                        value={newToolbarForm.label}
-                        onChange={(e) => setNewToolbarForm({ ...newToolbarForm, label: e.target.value })}
-                        style={{ ...styles.input, minHeight: 38, fontSize: 13 }}
-                      />
-                      <input
-                        placeholder="标识，可选"
-                        value={newToolbarForm.key}
-                        onChange={(e) => setNewToolbarForm({ ...newToolbarForm, key: e.target.value })}
-                        style={{ ...styles.input, minHeight: 38, fontSize: 13 }}
-                      />
-                      <button style={{ ...styles.blueBtn, padding: '8px 12px', fontSize: 13 }} onClick={handleAddToolbar}>
-                        添加
-                      </button>
-                    </div>
-                    {renderToolbarAdminList()}
-                  </div>
                 )}
               </div>
             </div>
@@ -4303,6 +4460,20 @@ function renderTaskManagementPage() {
             {renderTaskTrayPanel()}
           </TaskTrayFloatingWindow>
         )}
+
+      {moduleEditOpen && (
+        <SimpleOverlay
+          title={`编辑模块：${editingModuleId || moduleForm.id || ''}`}
+          onClose={() => {
+            setModuleEditOpen(false);
+            setEditingModuleId('');
+            setModuleForm(emptyModuleForm);
+          }}
+          width="min(1120px, 96vw)"
+        >
+          {renderModuleEditForm()}
+        </SimpleOverlay>
+      )}
 
 {inputEditorOpen && (
         <SimpleOverlay
