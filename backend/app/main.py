@@ -1757,6 +1757,11 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
             runtime_env["LOCAL_WEB_MODULE_SOURCE_DIR"] = str(source_dir)
             runtime_env["LOCAL_WEB_MODULE_RUNTIME_DIR"] = str(runtime_task_dir)
             runtime_env["LOCAL_WEB_NO_FIXED_RESOURCE_COPY"] = "1"
+            # 防御性清理：如果旧代码或热重载残留创建了 runtime/job_xxx/source，立即删除，
+            # 防止模型/资源文件再次进入 runtime。
+            stale_source = runtime_task_dir / "source"
+            if stale_source.exists():
+                shutil.rmtree(stale_source, ignore_errors=True)
 
             template_text = " ".join(str(x) for x in (command_template or []))
             if (not command_template) or ("{entry_script}" not in template_text and "entry_script" not in template_text):
@@ -4571,12 +4576,17 @@ def resolve_run_parallel_mode(module: dict, inputs: dict, workers: int) -> str:
 
     return "none"
 def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: int) -> tuple[int, dict]:
-    """根据当前电脑负载和模块固定资源大小自动降低并行进程数，防止卡死/崩溃。"""
+    """轻量化并行调整。
+
+    这版只在 CPU/内存/磁盘已经接近不可用时才降低进程数；
+    固定模型/资源大小只做日志提示，不再参与降级。
+    这样用户选择 4/6/8 时，系统不会因为 pkl 大小动不动降成 1，
+    真正的保护交给 TaskManager 在启动每个子进程前动态暂停。
+    """
     requested = clamp_parallel_workers(requested_workers, task_manager.max_process_slots)
     safe = requested
     reasons: list[str] = []
 
-    # 找一个输出目录或 runtime 所在盘用于磁盘余量判断。
     disk_probe = RUNTIME_DIR
     try:
         for field in module.get("inputs", []) or []:
@@ -4594,66 +4604,36 @@ def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: 
     disk_percent = pressure.get("disk_percent")
     disk_free = pressure.get("disk_free_gb")
 
-    # CPU 已经较忙时，少开新进程；否则会直接把电脑打满。
+    # 只在系统已经接近满载时，才在启动前降级。
     if cpu is not None:
-        if cpu is not None:
-            if cpu >= 80:
-                safe = min(safe, 1)
-                reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 已很高")
-            elif cpu >= 68:
-                safe = min(safe, 2)
-                reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 较高")
-            elif cpu >= 58:
-                safe = min(safe, max(2, min(task_manager.suggested_process_slots, 3)))
-                reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 偏高")
-
-    # 内存是重模型遥感任务最容易卡死的原因。
-    if mem_percent is not None and mem_avail is not None:
-        if mem_percent >= 85 or mem_avail <= 4.0:
+        if cpu >= 98:
             safe = min(safe, 1)
-            reasons.append(f"内存压力过高：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
-        elif mem_percent >= 76 or mem_avail <= 8.0:
-            safe = min(safe, 2)
-            reasons.append(f"内存压力偏高：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
-        elif mem_percent >= 68 or mem_avail <= 12.0:
-            safe = min(safe, 3)
-            reasons.append(f"内存余量有限：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
+            reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 已接近满载")
+        elif cpu >= 95:
+            safe = min(safe, max(2, requested // 2))
+            reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 很高，先降低一部分并发")
 
-    # 固定模型虽然不再复制，但每个进程通常会各加载一份到内存。
+    # 内存只做临界保护；不再因为可用内存 2GB 左右就直接降为 1。
+    if mem_percent is not None and mem_avail is not None:
+        if mem_percent >= 99 or mem_avail <= 0.3:
+            safe = min(safe, 1)
+            reasons.append(f"内存几乎耗尽：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
+        elif mem_percent >= 97 or mem_avail <= 0.8:
+            safe = min(safe, max(2, requested // 2))
+            reasons.append(f"内存压力很高：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
+
+    # 固定模型/资源只统计展示，不再限制进程数。
     resource_bytes, resource_examples = estimate_fixed_resource_bytes(module)
     resource_gb = _gb(resource_bytes)
-    if resource_gb >= 0.5 and mem_avail is not None:
-        per_worker_gb = max(2.5, resource_gb * 2.0 + 0.5)
-        by_memory = max(1, int((mem_avail * 0.60) // per_worker_gb))
-        if by_memory < safe:
-            safe = min(safe, by_memory)
-            examples = "；".join(resource_examples[:3]) if resource_examples else f"约 {resource_gb:.1f}GB"
-            reasons.append(
-                f"检测到固定模型/资源约 {resource_gb:.1f}GB（{examples}），"
-                f"按可用内存估算安全并发为 {by_memory}"
-            )
 
-    if resource_gb >= 1.0:
-        try:
-            heavy_cap = int(os.environ.get("LOCAL_WEB_HEAVY_MODEL_MAX_WORKERS", "2") or 2)
-        except Exception:
-            heavy_cap = 3
-        heavy_cap = max(1, heavy_cap)
-        if safe > heavy_cap:
-            safe = min(safe, heavy_cap)
-            reasons.append(f"该模块属于大模型/大资源任务，默认安全上限为 {heavy_cap}")
-
-    # 磁盘空间/使用率保护。即使不复制固定资源，输出文件和日志也需要空间。
+    # 磁盘也只做临界保护。固定资源不复制后，磁盘压力主要来自输出文件。
     if disk_percent is not None and disk_free is not None:
-        if disk_percent >= 92 or disk_free <= 8.0:
+        if disk_percent >= 99.5 or disk_free <= 0.5:
             safe = min(safe, 1)
-            reasons.append(f"磁盘空间不足：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
-        elif disk_percent >= 86 or disk_free <= 15.0:
-            safe = min(safe, 2)
-            reasons.append(f"磁盘空间偏紧：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
-        elif disk_percent >= 80 or disk_free <= 25.0:
-            safe = min(safe, max(2, min(safe, 3)))
-            reasons.append(f"磁盘余量有限：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
+            reasons.append(f"磁盘空间几乎耗尽：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
+        elif disk_percent >= 99 or disk_free <= 1.0:
+            safe = min(safe, max(2, requested // 2))
+            reasons.append(f"磁盘空间很紧：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
 
     safe = max(1, min(requested, safe))
     adjusted = safe < requested
@@ -4902,12 +4882,29 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
             # 传入单个文件时退化为 single_file。
             return prepare_parallel_jobs({**module, "parallel": {**normalize_parallel_config(module), "mode": "single_file"}}, inputs, workers)
 
-        chunks = split_evenly(files, workers)
+        # 稳定进程池语义：并行进程数 = 同时运行的子任务数，而不是把文件预先切成 workers 份。
+        # 例如目录里有 27 个文件、用户选择 4 个进程，就创建 27 个单文件 job；
+        # TaskManager 始终保持最多 4 个子进程同时运行，一个完成后立即补上下一个。
+        # 如果少数模块确实希望一个 job 处理多个文件，可在 module.json 的 parallel.files_per_job 中显式配置。
+        parallel_cfg = normalize_parallel_config(module)
+        try:
+            files_per_job = int(parallel_cfg.get("files_per_job") or 1)
+        except Exception:
+            files_per_job = 1
+        files_per_job = max(1, files_per_job)
+
+        job_units: list[list[Path]] = []
+        if files_per_job <= 1:
+            job_units = [[f] for f in files]
+        else:
+            for i in range(0, len(files), files_per_job):
+                job_units.append(files[i:i + files_per_job])
+
         chunk_root = RUNTIME_DIR / "parallel_chunks" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         chunk_root.mkdir(parents=True, exist_ok=True)
 
-        for idx, chunk in enumerate(chunks, start=1):
-            chunk_dir = chunk_root / f"worker_{idx:02d}"
+        for idx, chunk in enumerate(job_units, start=1):
+            chunk_dir = chunk_root / f"job_{idx:04d}"
             chunk_dir.mkdir(parents=True, exist_ok=True)
             used_names: set[str] = set()
             for src in chunk:
@@ -4918,13 +4915,18 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
             job_inputs[input_key] = str(chunk_dir.resolve())
             job_inputs["_parallel_workers"] = 1
             job_inputs["_parallel_index"] = idx
-            job_inputs["_parallel_total"] = len(chunks)
+            job_inputs["_parallel_total"] = len(job_units)
             job_inputs["_parallel_chunk_file_count"] = len(chunk)
+            job_inputs["_parallel_pool_size"] = workers
             command, working_dir, runtime_env = build_runtime_for_module(module, job_inputs)
+            if len(chunk) == 1:
+                label = f"{idx}/{len(job_units)} {chunk[0].name}"
+            else:
+                label = f"job_{idx:04d} ({len(chunk)} files)"
             jobs.append({
                 "module_id": module.get("id", ""),
                 "module_name": module.get("name", module.get("id", "")),
-                "label": f"worker_{idx:02d} ({len(chunk)} files)",
+                "label": label,
                 "command": command,
                 "working_dir": working_dir,
                 "env": runtime_env,
@@ -5702,34 +5704,14 @@ def start_data_file_scan_after_task(
     owner_username: str = "",
 ):
     """
-    任务运行期间只把输出文件临时挂到父任务记录里；
-    只有父任务整体 success 后，才正式登记到数据管理。
-    如果父任务 failed/cancelled，中途产生的临时输出只从任务记录移除，不进入数据管理。
+    任务结束后扫描输出路径，将结果登记到数据管理。
     """
     import threading
     import time
 
     terminal_statuses = {"success", "failed", "cancelled"}
 
-    def compact_outputs(files: list[Path]) -> list[dict]:
-        rows = []
-        for fp in files:
-            try:
-                st = fp.stat()
-                rows.append({
-                    "path": str(fp.resolve()),
-                    "name": fp.name,
-                    "file_type": get_file_type(fp),
-                    "size": st.st_size,
-                    "size_text": format_file_size(st.st_size),
-                    "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
-                })
-            except Exception:
-                continue
-        return rows
-
     def worker():
-        last_temp_key = ""
         while True:
             task = task_manager.get_task(task_id)
             if not task:
@@ -5740,13 +5722,6 @@ def start_data_file_scan_after_task(
                 if status == "success":
                     try:
                         task_owner = owner_username or str(task.get("owner_username") or "")
-                        final_files = scan_output_files(output_paths)
-                        task_manager.update_task(
-                            task_id,
-                            temporary_outputs=[],
-                            registered_outputs=compact_outputs(final_files),
-                            registered_output_count=len(final_files),
-                        )
 
                         upsert_data_files_from_outputs(
                             module=module,
@@ -5755,7 +5730,7 @@ def start_data_file_scan_after_task(
                             owner_username=task_owner,
                         )
                         try:
-                            task_manager.append_log(task_id, f"[DATA] 父任务成功完成，{len(final_files)} 个输出文件已正式登记到数据管理")
+                            task_manager.append_log(task_id, "[DATA] 输出结果已登记到数据管理")
                         except Exception:
                             pass
                     except Exception as exc:
@@ -5765,32 +5740,10 @@ def start_data_file_scan_after_task(
                             pass
                 else:
                     try:
-                        task_manager.update_task(
-                            task_id,
-                            temporary_outputs=[],
-                            temporary_output_count=0,
-                        )
-                        task_manager.append_log(task_id, f"[DATA] 任务状态为 {status}，临时输出已从任务记录移除，不登记到数据管理")
+                        task_manager.append_log(task_id, f"[DATA] 任务状态为 {status}，不登记输出文件")
                     except Exception:
                         pass
                 return
-
-            # 运行期间扫描已产生的输出，只暂存到父任务，方便任务窗口查看。
-            try:
-                temp_files = scan_output_files(output_paths)
-                temp_rows = compact_outputs(temp_files)
-                temp_key = "|".join(f"{x.get('path')}:{x.get('size')}" for x in temp_rows)
-                if temp_key != last_temp_key:
-                    last_temp_key = temp_key
-                    task_manager.update_task(
-                        task_id,
-                        temporary_outputs=temp_rows,
-                        temporary_output_count=len(temp_rows),
-                    )
-                    if temp_rows:
-                        task_manager.append_log(task_id, f"[DATA-TEMP] 已临时发现 {len(temp_rows)} 个输出文件；父任务成功后才会正式登记")
-            except Exception:
-                pass
 
             time.sleep(2)
 

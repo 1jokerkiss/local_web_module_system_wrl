@@ -76,10 +76,10 @@ const emptyModuleForm = {
 
 const cppExecutableModuleTemplate = {
   id: 'parasol_aod',
-  name: 'PARASOL AOD 反演',
-  description: 'C++ 可执行模块示例：module.json、exe、resources、deps 同级放置。C++ 模块不需要上传源码。',
-  runtime: 'cpp_native',
-  executable: 'ParasolAOD.exe',
+  name: '可执行模块示例',
+  description: '可执行模块示例：module.json、exe、resources、deps 同级放置。适用于 C++ 编译程序、Python 打包 exe、MATLAB 编译 exe 等本地可执行程序。',
+  runtime: 'native',
+  executable: 'MyExecutableModule.exe',
   working_dir: '.',
   config_mode: 'none',
   dependency_dirs: ['deps'],
@@ -92,7 +92,7 @@ const cppExecutableModuleTemplate = {
     output_suffix: '.tif',
     output_naming: 'source_stem',
   },
-  tags: ['cpp', 'native', 'remote-sensing'],
+  tags: ['executable', 'native', 'remote-sensing'],
   enabled: true,
   inputs: [
     {
@@ -282,6 +282,16 @@ function clearSavedActiveTab() {
   try {
     localStorage.removeItem(ACTIVE_TAB_STORAGE_KEY);
   } catch {}
+}
+
+function getDefaultActiveTabForRole(role) {
+  return role === 'admin' ? 'module_mgmt' : 'tool:cloud';
+}
+
+function getFirstActiveTabForUser(user) {
+  const saved = getSavedActiveTab();
+  if (saved) return saved;
+  return getDefaultActiveTabForRole(user?.role);
 }
 function normalizeToolKey(v) {
   return String(v || '')
@@ -1504,7 +1514,7 @@ export default function App() {
   const [dataPreviewScale, setDataPreviewScale] = useState(1);
   const [dataPreviewScaleInput, setDataPreviewScaleInput] = useState('100');
 
-  const [activeTab, setActiveTab] = useState(() => getSavedActiveTab() || 'tool:cloud');
+  const [activeTab, setActiveTab] = useState(() => getSavedActiveTab() || 'module_mgmt');
   const [activeModuleByTool, setActiveModuleByTool] = useState({});
   const [expandedToolTypes, setExpandedToolTypes] = useState({ cloud: true, aerosol: true });
   const [cloudForms, setCloudForms] = useState({});
@@ -1576,13 +1586,33 @@ export default function App() {
 
   const navItems = useMemo(() => {
     const arr = [];
+
+    // 顶部导航固定顺序：模块管理 → 云反演 → 气溶胶反演 → 任务管理 → 数据管理 → 用户管理。
     if (isAdmin) {
       arr.push({ key: 'module_mgmt', label: '模块管理' });
+    }
+
+    const toolRank = (key) => {
+      if (key === 'cloud') return 0;
+      if (key === 'aerosol') return 1;
+      return 2;
+    };
+
+    [...visibleToolbars]
+      .sort((a, b) => {
+        const rankDiff = toolRank(a.key) - toolRank(b.key);
+        if (rankDiff !== 0) return rankDiff;
+        return String(a.label || a.key).localeCompare(String(b.label || b.key), 'zh-CN');
+      })
+      .forEach((t) => arr.push({ key: `tool:${t.key}`, label: t.label }));
+
+    arr.push({ key: 'tasks', label: '任务管理' });
+    arr.push({ key: 'data_mgmt', label: '数据管理' });
+
+    if (isAdmin) {
       arr.push({ key: 'user_mgmt', label: '用户管理' });
     }
-    visibleToolbars.forEach((t) => arr.push({ key: `tool:${t.key}`, label: t.label }));
-    arr.push({ key: 'data_mgmt', label: '数据管理' });
-    arr.push({ key: 'tasks', label: '任务管理' });
+
     return arr;
   }, [isAdmin, visibleToolbars]);
 
@@ -1593,7 +1623,7 @@ export default function App() {
       try {
         const me = await getMe();
         setCurrentUser(me);
-        setActiveTab(getSavedActiveTab() || 'tool:cloud');
+        setActiveTab(getFirstActiveTabForUser(me));
 
         const [toolbarList, mods, taskList, dataList, resources] = await Promise.all([
           getToolbars(),
@@ -1802,8 +1832,9 @@ useEffect(() => {
       const data = await login(loginForm.username, loginForm.password, loginType);
       setAuthToken(data.token);
       setCurrentUser(data.user);
-      setActiveTab('tool:cloud');
-      saveActiveTab('tool:cloud');
+      const nextActiveTab = getDefaultActiveTabForRole(data.user?.role);
+      setActiveTab(nextActiveTab);
+      saveActiveTab(nextActiveTab);
 
       const [toolbarList, mods, taskList, dataList, resources] = await Promise.all([
         getToolbars(),
@@ -1886,7 +1917,7 @@ async function handleRegister() {
   async function browseModuleFolder() {
   try {
     const result = await chooseLocalDir({
-      title: '选择 C++ 可执行模块文件夹',
+      title: '选择可执行模块文件夹',
     });
 
     if (result?.path) {
@@ -2052,7 +2083,7 @@ function buildFetchFailedUploadMessage(error) {
 async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options = {}) {
   const path = String(pathValue || '').trim();
   if (!path) {
-    setUploadMsg('请选择 C++ 可执行模块文件夹');
+    setUploadMsg('请选择可执行模块文件夹');
     setCppValidation(null);
     return null;
   }
@@ -2063,7 +2094,7 @@ async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options
   }
 
   setCppValidationLoading(true);
-  if (!options.silent) setUploadMsg('正在检查 C++ 模块规范...');
+  if (!options.silent) setUploadMsg('正在检查可执行模块规范...');
 
   try {
     const data = await validateCppModuleFolder({
@@ -2078,9 +2109,9 @@ async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options
     const missingCount = Array.isArray(data?.missing_files) ? data.missing_files.length : 0;
 
     if (data?.can_install) {
-      setUploadMsg(`C++ 模块检查通过：错误 0 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。可以安装。`);
+      setUploadMsg(`可执行模块检查通过：错误 0 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。可以安装。`);
     } else {
-      setUploadMsg(`C++ 模块检查未通过：错误 ${errorCount} 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。请先按提示修改。`);
+      setUploadMsg(`可执行模块检查未通过：错误 ${errorCount} 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。请先按提示修改。`);
     }
 
     return data;
@@ -2088,7 +2119,7 @@ async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options
     const detailReport = getCppValidationReportFromError(e);
     if (detailReport) {
       setCppValidation(detailReport);
-      setUploadMsg(detailReport.message || 'C++ 模块检查未通过，请按下方提示修改。');
+      setUploadMsg(detailReport.message || '可执行模块检查未通过，请按下方提示修改。');
       return detailReport;
     }
     setCppValidation(null);
@@ -2101,7 +2132,7 @@ async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options
 
 async function installModuleFolder() {
   if (!moduleFolderPath.trim()) {
-    setUploadMsg('请选择 C++ 可执行模块文件夹');
+    setUploadMsg('请选择可执行模块文件夹');
     return;
   }
 
@@ -2112,30 +2143,30 @@ async function installModuleFolder() {
 
   const validation = await validateCppModuleFolderPath(moduleFolderPath, { silent: true });
   if (!validation?.can_install) {
-    setUploadMsg('C++ 模块没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
+    setUploadMsg('可执行模块没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
     return;
   }
 
-  setUploadMsg('正在安装 C++ 可执行模块，并尝试自动收集运行时 DLL 依赖...');
+  setUploadMsg('正在安装可执行模块，并尝试自动收集运行时 DLL 依赖...');
 
   try {
     await uploadModuleFolder({
       folder_path: moduleFolderPath.trim(),
       tool_type: uploadToolType,
-      runtime: 'cpp_native',
+      runtime: 'native',
       auto_collect_dependencies: true,
     });
 
     setModuleFolderPath('');
     setCppValidation(null);
-    setUploadMsg('C++ 可执行模块安装成功');
+    setUploadMsg('可执行模块安装成功');
 
     await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
   } catch (e) {
     const detailReport = getCppValidationReportFromError(e);
     if (detailReport) {
       setCppValidation(detailReport);
-      setUploadMsg(detailReport.message || 'C++ 可执行模块安装失败，请按下方提示修改。');
+      setUploadMsg(detailReport.message || '可执行模块安装失败，请按下方提示修改。');
       return;
     }
     setUploadMsg(buildFetchFailedUploadMessage(e));
@@ -2165,7 +2196,7 @@ async function installModuleFolder() {
     clearSavedActiveTab();
 
     setCurrentUser(null);
-    setActiveTab('tool:cloud');
+    setActiveTab('module_mgmt');
     setModules([]);
     setTasks([]);
     setUsers([]);
@@ -2574,7 +2605,7 @@ function renderCppValidationReport() {
       }}
     >
       <div style={{ fontWeight: 900, color: canInstall ? '#1f7f36' : '#b42318', marginBottom: 6 }}>
-        {canInstall ? 'C++ 模块检查通过，可以安装' : 'C++ 模块检查未通过，请先修改'}
+        {canInstall ? '可执行模块检查通过，可以安装' : '可执行模块检查未通过，请先修改'}
       </div>
       <div style={{ fontSize: 13, color: '#4f6682', wordBreak: 'break-all' }}>
         module.json：{cppValidation.module_json_path || '-'}
@@ -3235,7 +3266,18 @@ async function uploadPythonFolder() {
 
   function renderInstalledModulesTree() {
     return (
-      <div style={{ display: 'grid', gap: 10, marginTop: 12, maxHeight: 'calc(100vh - 520px)', overflow: 'auto' }}>
+      <div
+        style={{
+          display: 'grid',
+          gap: 10,
+          marginTop: 12,
+          flex: 1,
+          minHeight: 0,
+          overflow: 'auto',
+          alignContent: 'start',
+          paddingRight: 4,
+        }}
+      >
         {visibleToolbars.map((tb) => {
           const list = modulesByTool[tb.key] || [];
           const expanded = expandedToolTypes[tb.key] !== false;
@@ -4018,8 +4060,24 @@ function renderTaskManagementPage() {
 
       <div style={{ padding: 12 }}>
         {activeTab === 'module_mgmt' && isAdmin && (
-          <section style={{ ...styles.card, padding: 16, minHeight: 'calc(100vh - 98px)' }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '380px minmax(0, 1fr)', gap: 16 }}>
+          <section
+            style={{
+              ...styles.card,
+              padding: 16,
+              minHeight: 'calc(100vh - 98px)',
+              display: 'flex',
+            }}
+          >
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '380px minmax(0, 1fr)',
+                gap: 16,
+                width: '100%',
+                minHeight: 'calc(100vh - 130px)',
+                alignItems: 'stretch',
+              }}
+            >
               <div style={{ ...styles.card, padding: 16 }}>
                 <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 16 }}>
                   模块管理功能
@@ -4034,8 +4092,8 @@ function renderTaskManagementPage() {
 
                   {renderModuleMgmtButton(
                     'cpp_upload',
-                    'C++ 可执行模块上传',
-                    '选择包含 module.json、编译好的 exe、resources 和 deps 的 C++ 可执行模块文件夹，先检查规范再安装。'
+                    '可执行模块上传',
+                    '选择包含 module.json、可执行 exe、resources 和 deps 的本地可执行模块文件夹，先检查规范再安装。'
                   )}
                   {renderModuleMgmtButton(
                     'installed_modules',
@@ -4045,7 +4103,7 @@ function renderTaskManagementPage() {
                 </div>
               </div>
 
-              <div style={{ display: 'grid', gap: 16, minWidth: 0 }}>
+              <div style={{ display: 'grid', gap: 16, minWidth: 0, minHeight: 'calc(100vh - 130px)', alignItems: 'stretch' }}>
                 {moduleMgmtAction === 'python_upload' && (
                   <div style={{ ...styles.card, padding: 22 }}>
                     <div style={{ fontSize: 24, fontWeight: 900, color: '#12385f', marginBottom: 10 }}>
@@ -4207,12 +4265,12 @@ function renderTaskManagementPage() {
                 {moduleMgmtAction === 'cpp_upload' && (
                     <div style={{ ...styles.card, padding: 18 }}>
                       <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
-                        C++ 可执行模块上传
+                        可执行模块上传
                       </div>
 
                       <div style={{ color: '#6a7f96', lineHeight: 1.8, marginBottom: 14 }}>
-                        请选择一个已经准备好的 C++ 可执行模块文件夹。推荐目录结构为：module.json、编译后的 exe、resources 固定资源目录、deps 运行时 DLL 依赖目录。
-                        C++ 模块不需要上传源码；系统会先检查 module.json 是否规范、固定资源是否缺失、exe 是否存在，并尝试识别运行时 DLL 依赖。
+                        请选择一个已经准备好的可执行模块文件夹。推荐目录结构为：module.json、可执行 exe、resources 固定资源目录、deps 运行时 DLL 依赖目录。
+                        可执行模块不需要上传源码；可以是 C++ 编译 exe、Python 打包 exe 或 MATLAB 编译 exe。系统会先检查 module.json 是否规范、固定资源是否缺失、exe 是否存在，并尝试识别运行时 DLL 依赖。
                       </div>
 
                       <div
@@ -4228,7 +4286,7 @@ function renderTaskManagementPage() {
                       >
                         <div style={{ fontWeight: 900, color: '#12385f', marginBottom: 6 }}>依赖说明</div>
                         <div>deps 主要放 <strong>运行时 DLL 依赖</strong>，也就是 exe 启动时还需要但没有打进 exe 的动态库。</div>
-                        <div>C++ 模块这里按成品 exe 安装，不需要源码、头文件、静态库或 CMake 工程。deps 只放 exe 运行时还缺少的 DLL。</div>
+                        <div>这里按成品 exe 安装，不需要上传源码。deps 只放 exe 运行时还缺少的 DLL；Python/MATLAB 打包程序需要的运行时 DLL 也可以放在 deps 或 resources 中。</div>
                         <div>自动收集只能尽力识别 exe 导入表中的 DLL；如果程序用 LoadLibrary 动态加载 DLL，仍建议手动放到 deps 并在 module.json 的 dependency_dirs 中声明。</div>
                       </div>
 
@@ -4248,7 +4306,7 @@ function renderTaskManagementPage() {
                         </div>
 
                         <div>
-                          <div style={labelStyle}>C++ 可执行模块文件夹</div>
+                          <div style={labelStyle}>可执行模块文件夹</div>
                           <div style={{ display: 'flex', gap: 10 }}>
                             <input
                               style={{ ...styles.input, flex: 1 }}
@@ -4257,7 +4315,7 @@ function renderTaskManagementPage() {
                                 setModuleFolderPath(e.target.value);
                                 setCppValidation(null);
                               }}
-                              placeholder="请选择或粘贴包含 module.json 和 exe 的 C++ 模块文件夹路径"
+                              placeholder="请选择或粘贴包含 module.json 和 exe 的可执行模块文件夹路径"
                             />
                             <button style={styles.whiteBtn} onClick={browseModuleFolder}>
                               浏览并检查
@@ -4268,7 +4326,7 @@ function renderTaskManagementPage() {
                         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                           <button
                             style={styles.whiteBtn}
-                            onClick={() => downloadTextFile('cpp_module_template.json', getCppExecutableModuleTemplateText())}
+                            onClick={() => downloadTextFile('executable_module_template.json', getCppExecutableModuleTemplateText())}
                           >
                             下载 module.json 模板
                           </button>
@@ -4278,7 +4336,7 @@ function renderTaskManagementPage() {
                             onClick={async () => {
                               try {
                                 await navigator.clipboard.writeText(getCppExecutableModuleTemplateText());
-                                setUploadMsg('已复制 C++ 可执行模块 module.json 模板。用户需要把文件命名为 module.json，并放到 exe 同级目录。');
+                                setUploadMsg('已复制可执行模块 module.json 模板。用户需要把文件命名为 module.json，并放到 exe 同级目录。');
                               } catch {
                                 setUploadMsg(getCppExecutableModuleTemplateText());
                               }
@@ -4296,7 +4354,7 @@ function renderTaskManagementPage() {
                           </button>
 
                           <button style={styles.blueBtn} onClick={installModuleFolder} disabled={cppValidationLoading}>
-                            安装 C++ 可执行模块
+                            安装可执行模块
                           </button>
 
                           <button
@@ -4319,7 +4377,7 @@ function renderTaskManagementPage() {
                           </button>
 
                           <button style={styles.whiteBtn} onClick={() => setShowDropHint(true)}>
-                            C++ 可执行模块目录说明
+                            可执行模块目录说明
                           </button>
                         </div>
 
@@ -4353,7 +4411,7 @@ function renderTaskManagementPage() {
                             }}
                           >
                             <div style={{ fontWeight: 900, color: '#12385f', marginBottom: 8 }}>
-                              待投放 C++ 模块 zip：{dropInfo.items.length} 个
+                              待投放可执行模块 zip：{dropInfo.items.length} 个
                             </div>
                             <div style={{ display: 'grid', gap: 8 }}>
                               {dropInfo.items.map((item) => (
@@ -4386,8 +4444,18 @@ function renderTaskManagementPage() {
 
                 {moduleMgmtAction === 'installed_modules' && (
                   <>
-                    <div style={{ ...styles.card, padding: 18 }}>
-                      <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
+                    <div
+                      style={{
+                        ...styles.card,
+                        padding: 18,
+                        minHeight: 'calc(100vh - 150px)',
+                        height: '100%',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12, flexShrink: 0 }}>
                         已安装模块
                       </div>
                       {renderInstalledModulesTree()}
@@ -4639,23 +4707,23 @@ function renderTaskManagementPage() {
 
       {showDropHint && (
         <SimpleOverlay
-          title="C++ 本地模块目录投放说明"
+          title="可执行模块目录投放说明"
           onClose={() => setShowDropHint(false)}
           width="min(820px, 96vw)"
         >
           <div style={{ lineHeight: 1.9, color: '#173353' }}>
-            <p>这里用于 C++ / 本地原生可执行模块投放。zip 内部需要包含 module.json、编译好的 exe、固定资源 resources，以及可选的运行时依赖 deps。C++ 模块不需要上传源码。</p>
+            <p>这里用于本地可执行模块投放。zip 内部需要包含 module.json、可执行 exe、固定资源 resources，以及可选的运行时依赖 deps。可执行模块不需要上传源码，支持 C++ 编译 exe、Python 打包 exe、MATLAB 编译 exe。</p>
             <p>
               当前后端会自动创建并扫描本地投放目录：
               <code>{dropInfo.drop_dir || '项目根目录/module_drop'}</code>
             </p>
             <ol>
               <li>管理员先在“模块所属工具栏”里选择云反演、气溶胶反演或自定义工具类型。</li>
-              <li>把 C++ 可执行模块 zip 直接放进这个目录，不需要在网页里选择文件。</li>
+              <li>把可执行模块 zip 直接放进这个目录，不需要在网页里选择文件。</li>
               <li>点击“扫描本地目录安装”，后端会先校验 module.json 和缺失文件，再安装通过的 zip。</li>
               <li>系统会尝试从 exe 导入表识别 DLL，并把可找到的非系统 DLL 复制到 deps/auto。</li>
             </ol>
-            <p>注意：deps 是运行时依赖目录，只放 exe 运行时缺少的 DLL。源码、头文件、静态库、CMake/vcpkg 配置都不需要上传。</p>
+            <p>注意：deps 是运行时依赖目录，只放 exe 运行时缺少的 DLL。源码、头文件、静态库、CMake/vcpkg 配置都不需要上传。Python/MATLAB 打包 exe 需要的运行时 DLL 也可以放到 deps。</p>
           </div>
         </SimpleOverlay>
       )}
