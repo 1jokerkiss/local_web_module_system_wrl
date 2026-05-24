@@ -1653,9 +1653,40 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
     dll_search_dirs = [str(module_dir)]
 
     for dep in dependency_dirs:
-        dep_path = (module_dir / dep).resolve()
+        dep_path = Path(str(dep)).expanduser()
+        if not dep_path.is_absolute():
+            dep_path = (module_dir / dep_path).resolve()
+        else:
+            dep_path = dep_path.resolve()
         if dep_path.exists() and dep_path.is_dir():
             dll_search_dirs.append(str(dep_path))
+
+    # 可执行模块运行环境路径：例如 MATLAB Runtime/bin、OSGeo4W/bin、其它 DLL 目录。
+    # 新版“像 Python 一样”的可执行模块由用户在 runtime_env_path / dependency_search_dirs 中填写。
+    extra_search_dirs = []
+    for key in ["dependency_search_dirs", "runtime_env_path", "environment_path", "env_path"]:
+        raw_value = module.get(key)
+        if not raw_value:
+            continue
+        if isinstance(raw_value, str):
+            raw_items = [raw_value]
+        elif isinstance(raw_value, list):
+            raw_items = raw_value
+        else:
+            raw_items = []
+        for item in raw_items:
+            item_text = str(item or "").strip()
+            if not item_text:
+                continue
+            p = Path(item_text).expanduser()
+            if not p.is_absolute():
+                p = (module_dir / p).resolve()
+            else:
+                p = p.resolve()
+            if p.exists() and p.is_dir():
+                extra_search_dirs.append(str(p))
+
+    dll_search_dirs.extend(extra_search_dirs)
 
     # 去重，保持顺序
     seen = set()
@@ -2842,21 +2873,51 @@ def _load_module_json_for_validation(module_json_path: Path, report: dict) -> di
 
 
 def _find_module_json(folder_path: Path, report: dict) -> Path | None:
-    direct = folder_path / "module.json"
-    if direct.exists() and direct.is_file():
-        return direct
+    """查找统一模块配置文件。
 
-    candidates = [p for p in folder_path.rglob("module.json") if p.is_file()]
+    新版推荐使用 executable_module.json，输入方式与 Python 源码模块一致：
+    module_id/module_name/source_dir/entry_file/param_json_path/runtime_env_path。
+    为兼容旧模块，仍然支持 module.json。
+    """
+    for filename in ("executable_module.json", "module.json"):
+        direct = folder_path / filename
+        if direct.exists() and direct.is_file():
+            return direct
+
+    candidates: list[Path] = []
+    for filename in ("executable_module.json", "module.json"):
+        candidates.extend([p for p in folder_path.rglob(filename) if p.is_file()])
+
     if not candidates:
-        _add_error(report, "module.json", "模块文件夹中未找到 module.json", "把 module.json 放在模块根目录，和 exe、resources、deps 等目录放在同一级。")
-        _add_missing(report, folder_path / "module.json", "缺少模块清单文件", "新增 module.json，并填写 id、name、executable、command_template、inputs。")
+        _add_error(
+            report,
+            "executable_module.json",
+            "模块文件夹中未找到 executable_module.json 或 module.json",
+            "新版可执行模块建议把 executable_module.json 放在模块根目录，和 exe、config.json、resources、deps 放在同一级。",
+        )
+        _add_missing(
+            report,
+            folder_path / "executable_module.json",
+            "缺少统一模块配置文件",
+            "新增 executable_module.json，填写 module_id、module_name、entry_file、source_dir、param_json_path、runtime_env_path 等字段。",
+        )
         return None
 
-    candidates.sort(key=lambda x: len(x.parts))
+    candidates.sort(key=lambda x: (len(x.parts), 0 if x.name == "executable_module.json" else 1))
     if len(candidates) > 1:
-        _add_warning(report, "module.json", f"检测到 {len(candidates)} 个 module.json，系统会使用最靠近根目录的这个：{candidates[0]}", "建议一个模块包只保留一个 module.json，避免安装错模块。")
+        _add_warning(
+            report,
+            "module_config",
+            f"检测到 {len(candidates)} 个模块配置文件，系统会使用最靠近根目录的这个：{candidates[0]}",
+            "建议一个模块包只保留一个 executable_module.json 或 module.json，避免安装错模块。",
+        )
     else:
-        _add_warning(report, "module.json", f"module.json 不在选择目录根部，当前使用：{candidates[0]}", "建议把 module.json 放到你选择的模块文件夹根目录。")
+        _add_warning(
+            report,
+            "module_config",
+            f"模块配置文件不在选择目录根部，当前使用：{candidates[0]}",
+            "建议把 executable_module.json 放到你选择的模块文件夹根目录。",
+        )
     return candidates[0]
 
 
@@ -2882,12 +2943,186 @@ def _resolve_module_reference(module_root: Path, raw_value: Any, module_id: str 
     return (module_root / p).resolve()
 
 
+
+
+def _path_relative_to_root_or_abs(path: Path, root: Path) -> str:
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except Exception:
+        return str(path.resolve())
+
+
+def _is_unified_executable_config(module_data: dict, config_path: Path | None = None) -> bool:
+    """判断是否是新版“像 Python 一样”的可执行模块配置。"""
+    if not isinstance(module_data, dict):
+        return False
+    cfg = module_data.get("module") if isinstance(module_data.get("module"), dict) else module_data
+    runtime = str(cfg.get("runtime") or cfg.get("runtime_type") or "").strip().lower()
+    if runtime in {"executable", "native_executable", "exe_module", "binary_executable"}:
+        return True
+    # 新版字段：module_id + entry_file + param_json_path/source_dir
+    return bool(
+        (cfg.get("module_id") or cfg.get("module_name") or cfg.get("entry_file"))
+        and not cfg.get("command_template")
+        and not cfg.get("inputs")
+    )
+
+
+def _as_str_list(value: Any, default: list[str] | None = None) -> list[str]:
+    if value is None:
+        return list(default or [])
+    if isinstance(value, str):
+        return [value] if value.strip() else list(default or [])
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x or "").strip()]
+    return list(default or [])
+
+
+def _normalize_unified_executable_config(module_root: Path, raw_data: dict, report: dict, tool_type: str | None = None) -> dict | None:
+    """把新版可执行模块配置转换成系统内部 Module 记录。\n\n    新版输入方式与 Python 源码模块一致：\n    - executable_module.json / module.json 只描述模块基本信息和运行环境路径；\n    - config.json 描述用户输入参数，系统自动识别输入/输出表单；\n    - 运行时统一执行：entry_file config.json。\n    """
+    cfg = raw_data.get("module") if isinstance(raw_data.get("module"), dict) else raw_data
+
+    module_id = str(cfg.get("module_id") or cfg.get("id") or "").strip()
+    module_name = str(cfg.get("module_name") or cfg.get("name") or "").strip()
+    source_dir_raw = str(cfg.get("source_dir") or ".").strip() or "."
+    entry_file = str(cfg.get("entry_file") or cfg.get("entry") or cfg.get("executable") or "").strip()
+    description = str(cfg.get("description") or "").strip()
+
+    if not module_id:
+        _add_error(report, "module_id", "缺少 module_id", "添加例如：\"module_id\": \"my_exe_module\"。")
+    elif not re.match(r"^[A-Za-z0-9_\-\.]+$", module_id):
+        _add_error(report, "module_id", f"module_id 不建议包含空格、中文或特殊符号：{module_id}", "建议只使用英文、数字、下划线、中划线或点。")
+
+    if not module_name:
+        _add_error(report, "module_name", "缺少 module_name", "添加例如：\"module_name\": \"我的可执行模块\"。")
+
+    source_dir = _resolve_module_reference(module_root, source_dir_raw, module_id, module_root)
+    if not source_dir.exists() or not source_dir.is_dir():
+        _add_error(report, "source_dir", f"模块文件夹不存在：{source_dir_raw}", "source_dir 通常写 \".\"，表示 executable_module.json 所在文件夹。")
+        _add_missing(report, source_dir, "source_dir 指向的目录不存在", "创建该目录，或把 source_dir 改为 \".\"。")
+
+    if not entry_file:
+        _add_error(report, "entry_file", "缺少 entry_file", "填写可执行程序文件名，例如：\"entry_file\": \"MyModule.exe\"。")
+        entry_path = source_dir
+    else:
+        entry_path = _resolve_module_reference(source_dir, entry_file, module_id, source_dir)
+        if not entry_path.exists() or not entry_path.is_file():
+            _add_error(report, "entry_file", f"可执行文件不存在：{entry_file}", "确认 exe 放在 source_dir 中，或把 entry_file 改成正确相对路径。")
+            _add_missing(report, entry_path, "entry_file 指向的可执行文件不存在", "把 exe 放入模块文件夹，或修改 entry_file。")
+        elif sys.platform.startswith("win") and entry_path.suffix.lower() not in {".exe", ".bat", ".cmd"}:
+            _add_warning(report, "entry_file", f"Windows 下建议 entry_file 指向 .exe/.bat/.cmd，当前是：{entry_path.name}", "如果这是可执行脚本，请确认系统可以直接运行。")
+
+    param_template = cfg.get("param_template")
+    param_json_path = None
+    if isinstance(param_template, dict):
+        param_json = param_template
+    else:
+        param_json_raw = str(cfg.get("param_json_path") or cfg.get("config_json") or "config.json").strip() or "config.json"
+        param_json_path = _resolve_module_reference(source_dir, param_json_raw, module_id, source_dir)
+        if not param_json_path.exists() or not param_json_path.is_file():
+            _add_error(report, "param_json_path", f"参数 JSON 文件不存在：{param_json_raw}", "在模块文件夹中放置 config.json，或修改 param_json_path。")
+            _add_missing(report, param_json_path, "缺少参数 JSON", "新增 config.json，用它描述输入文件夹、输出文件夹等参数默认值。")
+            param_json = {}
+        else:
+            try:
+                param_json = load_param_json_file(str(param_json_path))
+            except Exception as exc:
+                _add_error(report, "param_json_path", f"参数 JSON 解析失败：{type(exc).__name__}: {exc}", "检查 config.json 必须是合法 JSON 对象，不能有注释或尾随逗号。")
+                param_json = {}
+
+    inputs = cfg.get("inputs")
+    if not isinstance(inputs, list):
+        inputs = infer_inputs_from_param_json(param_json)
+
+    selected_tool_type = (
+        normalize_tool_key(tool_type or cfg.get("tool_type") or "")
+        or guess_module_tool_type({"id": module_id, "name": module_name, "description": description, "tags": cfg.get("tags") or []})
+    )
+
+    dependency_dirs = _as_str_list(cfg.get("dependency_dirs"), ["deps"])
+    resource_dirs = _as_str_list(cfg.get("resource_dirs"), ["resources"])
+    dependency_search_dirs = _as_str_list(cfg.get("dependency_search_dirs"), [])
+
+    runtime_env_path = str(
+        cfg.get("runtime_env_path")
+        or cfg.get("environment_path")
+        or cfg.get("env_path")
+        or cfg.get("runtime_path")
+        or ""
+    ).strip()
+    if runtime_env_path:
+        runtime_env_dirs = _as_str_list(runtime_env_path, [])
+        for env_dir in runtime_env_dirs:
+            env_path = Path(env_dir).expanduser()
+            if not env_path.is_absolute():
+                env_path = (module_root / env_path).resolve()
+            else:
+                env_path = env_path.resolve()
+            dependency_search_dirs.append(str(env_path))
+            if not env_path.exists() or not env_path.is_dir():
+                _add_warning(report, "runtime_env_path", f"运行环境路径不存在：{env_path}", "如果该 exe 需要 MATLAB Runtime、OSGeo4W、Python 打包运行库等，请填写真实存在的 bin/runtime 目录；不需要可留空。")
+    else:
+        _add_warning(report, "runtime_env_path", "未填写运行环境路径", "如果 exe 依赖 MATLAB Runtime、OSGeo4W 或其它运行库，请在 runtime_env_path 中填写对应 bin/runtime 目录；纯独立 exe 可以留空。")
+
+    for dirname in dependency_dirs:
+        dep_path = _resolve_module_reference(source_dir, dirname, module_id, source_dir)
+        if not dep_path.exists() or not dep_path.is_dir():
+            _add_warning(report, "dependency_dirs", f"依赖目录不存在：{dirname}", "如果没有额外 DLL 可以忽略；如果有运行时 DLL，请创建 deps 并放入依赖。")
+
+    for dirname in resource_dirs:
+        res_path = _resolve_module_reference(source_dir, dirname, module_id, source_dir)
+        if not res_path.exists() or not res_path.is_dir():
+            _add_warning(report, "resource_dirs", f"固定资源目录不存在：{dirname}", "如果模块没有固定资源可以忽略；如果有模型、XML、LUT、DEM 等，请放到 resources 或对应目录。")
+
+    parallel = cfg.get("parallel") if isinstance(cfg.get("parallel"), dict) else {}
+    if not parallel:
+        parallel = {
+            "mode": "auto",
+            "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
+            "output_suffix": ".tif",
+            "output_naming": "source_stem",
+        }
+
+    command_template = cfg.get("command_template")
+    if not isinstance(command_template, list) or not all(isinstance(x, str) and x.strip() for x in command_template):
+        # 新版默认：像 Python 源码模块一样，平台生成 config.json，然后把 config 路径传给 exe。
+        command_template = ["{executable}", "{config_json}"]
+
+    module_data = {
+        "id": module_id,
+        "name": module_name or module_id,
+        "description": description or "本地可执行模块",
+        "tool_type": selected_tool_type,
+        "runtime": "native",
+        "runtime_type": "executable_config",
+        "entry_file": entry_file,
+        "source_dir": _path_relative_to_root_or_abs(source_dir, module_root),
+        "executable": _path_relative_to_root_or_abs(entry_path, module_root),
+        "working_dir": _path_relative_to_root_or_abs(source_dir, module_root),
+        "config_mode": "config_json",
+        "param_json_path": _path_relative_to_root_or_abs(param_json_path, module_root) if param_json_path else "",
+        "config_template_json": param_json,
+        "command_template": command_template,
+        "inputs": inputs,
+        "parallel": parallel,
+        "dependency_dirs": dependency_dirs,
+        "dependency_search_dirs": dependency_search_dirs,
+        "resource_dirs": resource_dirs,
+        "fixed_resources": cfg.get("fixed_resources") if isinstance(cfg.get("fixed_resources"), list) else [],
+        "runtime_env_path": runtime_env_path,
+        "tags": cfg.get("tags") if isinstance(cfg.get("tags"), list) else ["executable", "native"],
+        "enabled": cfg.get("enabled", True) is not False,
+        "auto_collect_deps": cfg.get("auto_collect_deps", True) is not False,
+    }
+
+    return module_data
+
 def _module_json_error_detail(report: dict) -> dict:
     _dedupe_report_items(report)
     report["ok"] = False
     report["can_install"] = False
     return {
-        "message": "C++ 可执行模块校验失败，请按下面提示修改后再安装。",
+        "message": "可执行模块校验失败，请按下面提示修改后再安装。",
         **report,
     }
 
@@ -3232,15 +3467,20 @@ def validate_cpp_module_folder(folder_path: Path, tool_type: str | None = None, 
         _dedupe_report_items(report)
         return report
 
-    selected_tool_type = (
-        normalize_tool_key(tool_type or module_data.get("tool_type") or "")
-        or guess_module_tool_type(module_data)
-    )
-    module_data["tool_type"] = selected_tool_type
-    if str(module_data.get("runtime") or "").strip() == "":
-        module_data["runtime"] = "cpp_native"
+    if _is_unified_executable_config(module_data, module_json_path):
+        normalized = _normalize_unified_executable_config(module_root, module_data, report, tool_type=tool_type)
+        if normalized is not None:
+            module_data = normalized
+    else:
+        selected_tool_type = (
+            normalize_tool_key(tool_type or module_data.get("tool_type") or "")
+            or guess_module_tool_type(module_data)
+        )
+        module_data["tool_type"] = selected_tool_type
+        if str(module_data.get("runtime") or "").strip() == "":
+            module_data["runtime"] = "cpp_native"
 
-    _validate_cpp_module_structure(module_root, module_data, report)
+        _validate_cpp_module_structure(module_root, module_data, report)
 
     executable = str(module_data.get("executable") or module_data.get("entry") or "").strip()
     module_id = str(module_data.get("id") or "").strip()
@@ -3708,7 +3948,7 @@ def api_validate_cpp_module_folder(
 
     return {
         "ok": bool(report.get("ok")),
-        "message": "C++ 可执行模块校验通过" if report.get("ok") else "C++ 可执行模块校验未通过",
+        "message": "可执行模块校验通过" if report.get("ok") else "可执行模块校验未通过",
         **report,
     }
 
@@ -3741,7 +3981,7 @@ def api_install_module_folder(
 
     return {
         "ok": True,
-        "message": "C++ 模块文件夹安装成功",
+        "message": "可执行模块文件夹安装成功",
         "module": module_data,
     }
 """新增 /api/admin/modules/upload-python

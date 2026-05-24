@@ -75,60 +75,27 @@ const emptyModuleForm = {
 
 
 const cppExecutableModuleTemplate = {
-  id: 'parasol_aod',
-  name: '可执行模块示例',
-  description: '可执行模块示例：module.json、exe、resources、deps 同级放置。适用于 C++ 编译程序、Python 打包 exe、MATLAB 编译 exe 等本地可执行程序。',
-  runtime: 'native',
-  executable: 'MyExecutableModule.exe',
-  working_dir: '.',
-  config_mode: 'none',
+  module_id: 'my_executable_module',
+  module_name: '我的可执行模块',
+  tool_type: 'cloud',
+  runtime: 'executable',
+  entry_file: 'MyExecutableModule.exe',
+  source_dir: '.',
+  param_json_path: 'config.json',
+  description: '可执行模块示例：输入方式与 Python 源码模块一致。系统读取 config.json 自动生成输入/输出表单，运行时把平台生成的 config.json 传给 exe。',
+  runtime_env_path: 'D:/YourRuntime/bin',
   dependency_dirs: ['deps'],
   dependency_search_dirs: [],
+  resource_dirs: ['resources'],
   auto_collect_deps: true,
-  command_template: ['{executable}', '{input_file}', '{output_dir}', '{config_xml}'],
   parallel: {
     mode: 'auto',
-    file_patterns: '*.*',
+    file_patterns: '*.tif;*.tiff;*.nc;*.hdf;*.h5',
     output_suffix: '.tif',
     output_naming: 'source_stem',
   },
   tags: ['executable', 'native', 'remote-sensing'],
   enabled: true,
-  inputs: [
-    {
-      key: 'input_file',
-      label: '输入文件目录',
-      type: 'dir_path',
-      required: true,
-      visible_to_user: true,
-      admin_fixed: false,
-      path_mode: 'absolute',
-      batch_role: 'input',
-      match_mode: 'each_file',
-      io_role: 'input',
-    },
-    {
-      key: 'output_dir',
-      label: '输出目录',
-      type: 'dir_path',
-      required: true,
-      visible_to_user: true,
-      admin_fixed: false,
-      path_mode: 'absolute',
-      io_role: 'output',
-    },
-    {
-      key: 'config_xml',
-      label: '配置 XML',
-      type: 'file_path',
-      required: true,
-      default: 'resources/ConfigXMLFile.xml',
-      visible_to_user: false,
-      admin_fixed: true,
-      path_mode: 'relative_to_module',
-      io_role: 'input',
-    },
-  ],
 };
 
 function getCppExecutableModuleTemplateText() {
@@ -2072,7 +2039,7 @@ function buildFetchFailedUploadMessage(error) {
   const msg = String(error?.message || '请求失败');
   if (msg.includes('Failed to fetch') || error?.status === 0) {
     return [
-      '请求没有到达后端，所以前端拿不到 module.json 的具体错误。',
+      '请求没有到达后端，所以前端拿不到 可执行模块配置的具体错误。',
       '请确认：1）后端服务正在运行；2）已经用新版 main.py 重启后端；3）前端请求地址和后端端口一致；4）浏览器控制台 Network 里 /api/admin/modules/validate-cpp-folder 不是红色网络失败。',
       `原始错误：${msg}`,
     ].join('\n');
@@ -2088,13 +2055,8 @@ async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options
     return null;
   }
 
-  if (!uploadToolType) {
-    alert('请先选择模块所属工具栏');
-    return null;
-  }
-
   setCppValidationLoading(true);
-  if (!options.silent) setUploadMsg('正在检查可执行模块规范...');
+  if (!options.silent) setUploadMsg('正在检查可执行模块配置...');
 
   try {
     const data = await validateCppModuleFolder({
@@ -2109,9 +2071,9 @@ async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options
     const missingCount = Array.isArray(data?.missing_files) ? data.missing_files.length : 0;
 
     if (data?.can_install) {
-      setUploadMsg(`可执行模块检查通过：错误 0 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。可以安装。`);
+      setUploadMsg(`可执行模块配置检查通过：错误 0 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。可以安装。`);
     } else {
-      setUploadMsg(`可执行模块检查未通过：错误 ${errorCount} 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。请先按提示修改。`);
+      setUploadMsg(`可执行模块配置检查未通过：错误 ${errorCount} 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。请先按提示修改。`);
     }
 
     return data;
@@ -2136,18 +2098,13 @@ async function installModuleFolder() {
     return;
   }
 
-  if (!uploadToolType) {
-    alert('请先选择模块所属工具栏');
-    return;
-  }
-
   const validation = await validateCppModuleFolderPath(moduleFolderPath, { silent: true });
   if (!validation?.can_install) {
-    setUploadMsg('可执行模块没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
+    setUploadMsg('可执行模块配置没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
     return;
   }
 
-  setUploadMsg('正在安装可执行模块，并尝试自动收集运行时 DLL 依赖...');
+  setUploadMsg('正在安装可执行模块，并按 config.json 自动识别输入/输出参数...');
 
   try {
     await uploadModuleFolder({
@@ -4093,7 +4050,7 @@ function renderTaskManagementPage() {
                   {renderModuleMgmtButton(
                     'cpp_upload',
                     '可执行模块上传',
-                    '选择包含 module.json、可执行 exe、resources 和 deps 的本地可执行模块文件夹，先检查规范再安装。'
+                    '选择包含 executable_module.json、config.json、可执行程序、resources 和 deps 的模块文件夹，输入方式与 Python 模块一致。'
                   )}
                   {renderModuleMgmtButton(
                     'installed_modules',
@@ -4269,8 +4226,9 @@ function renderTaskManagementPage() {
                       </div>
 
                       <div style={{ color: '#6a7f96', lineHeight: 1.8, marginBottom: 14 }}>
-                        请选择一个已经准备好的可执行模块文件夹。推荐目录结构为：module.json、可执行 exe、resources 固定资源目录、deps 运行时 DLL 依赖目录。
-                        可执行模块不需要上传源码；可以是 C++ 编译 exe、Python 打包 exe 或 MATLAB 编译 exe。系统会先检查 module.json 是否规范、固定资源是否缺失、exe 是否存在，并尝试识别运行时 DLL 依赖。
+                        请选择一个已经准备好的可执行模块文件夹。新版可执行模块的输入方式与 Python 源码模块一致：
+                        文件夹中放 executable_module.json、config.json、可执行程序、resources 固定资源目录、deps 运行时依赖目录。
+                        系统会读取 config.json 自动生成输入文件夹、输出文件夹等表单；运行时把平台生成的 config.json 路径传给 exe。
                       </div>
 
                       <div
@@ -4286,25 +4244,11 @@ function renderTaskManagementPage() {
                       >
                         <div style={{ fontWeight: 900, color: '#12385f', marginBottom: 6 }}>依赖说明</div>
                         <div>deps 主要放 <strong>运行时 DLL 依赖</strong>，也就是 exe 启动时还需要但没有打进 exe 的动态库。</div>
-                        <div>这里按成品 exe 安装，不需要上传源码。deps 只放 exe 运行时还缺少的 DLL；Python/MATLAB 打包程序需要的运行时 DLL 也可以放在 deps 或 resources 中。</div>
-                        <div>自动收集只能尽力识别 exe 导入表中的 DLL；如果程序用 LoadLibrary 动态加载 DLL，仍建议手动放到 deps 并在 module.json 的 dependency_dirs 中声明。</div>
+                        <div>运行环境路径由用户在 executable_module.json 的 <strong>runtime_env_path</strong> 中填写，例如 MATLAB Runtime、OSGeo4W、其它 bin/runtime 目录；纯独立 exe 可以留空。</div>
+                        <div>输入文件夹、输出文件夹不再写 command_template/inputs，而是写在 config.json 里，系统会像 Python 模块一样自动识别并生成表单。</div>
                       </div>
 
                       <div style={{ display: 'grid', gap: 12 }}>
-                        <div>
-                          <div style={labelStyle}>模块所属工具栏</div>
-                          <select
-                            value={uploadToolType}
-                            onChange={(e) => {
-                              setUploadToolType(e.target.value);
-                              setCppValidation(null);
-                            }}
-                            style={styles.input}
-                          >
-                            {renderToolbarOptions()}
-                          </select>
-                        </div>
-
                         <div>
                           <div style={labelStyle}>可执行模块文件夹</div>
                           <div style={{ display: 'flex', gap: 10 }}>
@@ -4315,7 +4259,7 @@ function renderTaskManagementPage() {
                                 setModuleFolderPath(e.target.value);
                                 setCppValidation(null);
                               }}
-                              placeholder="请选择或粘贴包含 module.json 和 exe 的可执行模块文件夹路径"
+                              placeholder="请选择或粘贴包含 executable_module.json、config.json 和可执行程序的模块文件夹路径"
                             />
                             <button style={styles.whiteBtn} onClick={browseModuleFolder}>
                               浏览并检查
@@ -4326,9 +4270,9 @@ function renderTaskManagementPage() {
                         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                           <button
                             style={styles.whiteBtn}
-                            onClick={() => downloadTextFile('executable_module_template.json', getCppExecutableModuleTemplateText())}
+                            onClick={() => downloadTextFile('executable_module.json', getCppExecutableModuleTemplateText())}
                           >
-                            下载 module.json 模板
+                            下载 executable_module.json 模板
                           </button>
 
                           <button
@@ -4336,7 +4280,7 @@ function renderTaskManagementPage() {
                             onClick={async () => {
                               try {
                                 await navigator.clipboard.writeText(getCppExecutableModuleTemplateText());
-                                setUploadMsg('已复制可执行模块 module.json 模板。用户需要把文件命名为 module.json，并放到 exe 同级目录。');
+                                setUploadMsg('已复制可执行模块 executable_module.json 模板。用户需要按自己的 exe、config.json、运行环境路径和资源目录修改。');
                               } catch {
                                 setUploadMsg(getCppExecutableModuleTemplateText());
                               }
@@ -4350,7 +4294,7 @@ function renderTaskManagementPage() {
                             onClick={() => validateCppModuleFolderPath(moduleFolderPath)}
                             disabled={cppValidationLoading}
                           >
-                            {cppValidationLoading ? '检查中...' : '检查模块规范'}
+                            {cppValidationLoading ? '检查中...' : '检查模块配置'}
                           </button>
 
                           <button style={styles.blueBtn} onClick={installModuleFolder} disabled={cppValidationLoading}>
@@ -4712,18 +4656,18 @@ function renderTaskManagementPage() {
           width="min(820px, 96vw)"
         >
           <div style={{ lineHeight: 1.9, color: '#173353' }}>
-            <p>这里用于本地可执行模块投放。zip 内部需要包含 module.json、可执行 exe、固定资源 resources，以及可选的运行时依赖 deps。可执行模块不需要上传源码，支持 C++ 编译 exe、Python 打包 exe、MATLAB 编译 exe。</p>
+            <p>这里用于本地可执行模块投放。zip 内部建议包含 executable_module.json、config.json、可执行程序、固定资源 resources，以及可选的运行时依赖 deps。输入方式与 Python 模块一致：系统从 config.json 识别输入/输出表单，运行时传入平台生成的 config.json。</p>
             <p>
               当前后端会自动创建并扫描本地投放目录：
               <code>{dropInfo.drop_dir || '项目根目录/module_drop'}</code>
             </p>
             <ol>
-              <li>管理员先在“模块所属工具栏”里选择云反演、气溶胶反演或自定义工具类型。</li>
+              <li>在 executable_module.json 里填写 tool_type，例如 cloud 或 aerosol。</li>
               <li>把可执行模块 zip 直接放进这个目录，不需要在网页里选择文件。</li>
-              <li>点击“扫描本地目录安装”，后端会先校验 module.json 和缺失文件，再安装通过的 zip。</li>
-              <li>系统会尝试从 exe 导入表识别 DLL，并把可找到的非系统 DLL 复制到 deps/auto。</li>
+              <li>点击“扫描本地目录安装”，后端会先校验 executable_module.json/config.json 和缺失文件，再安装通过的 zip。</li>
+              <li>系统会把 dependency_dirs、dependency_search_dirs 和 runtime_env_path 加入运行 PATH，并可尝试识别 DLL。</li>
             </ol>
-            <p>注意：deps 是运行时依赖目录，只放 exe 运行时缺少的 DLL。源码、头文件、静态库、CMake/vcpkg 配置都不需要上传。Python/MATLAB 打包 exe 需要的运行时 DLL 也可以放到 deps。</p>
+            <p>注意：deps 是运行时依赖目录，只放 exe 运行时缺少的 DLL。runtime_env_path 用来填写本机运行环境路径，例如 MATLAB Runtime 或其它运行库目录。</p>
           </div>
         </SimpleOverlay>
       )}
