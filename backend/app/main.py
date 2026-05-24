@@ -558,8 +558,30 @@ def sanitize_filename(name: str) -> str:
     return name.replace("..", "_").replace("/", "_").replace("\\", "_")
 
 def save_modules(modules: List[dict]):
+    """
+    保存模块列表时顺便按模块 ID 去重。
+    这样即使历史 modules.json 中已经出现重复模块，也会在下次保存时自动清理。
+    同一 ID 只保留第一条记录，避免后来误装的重复模块覆盖原模块。
+    """
+    cleaned: List[dict] = []
+    seen_ids = set()
+
+    for module in modules or []:
+        if not isinstance(module, dict):
+            continue
+
+        key = _normalize_module_id_for_compare(str(module.get("id") or ""))
+        if not key:
+            continue
+
+        if key in seen_ids:
+            continue
+
+        seen_ids.add(key)
+        cleaned.append(module)
+
     MODULES_FILE.write_text(
-        json.dumps(modules, ensure_ascii=False, indent=2),
+        json.dumps(cleaned, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -569,6 +591,83 @@ def get_module(module_id: str) -> Optional[dict]:
         if module.get("id") == module_id:
             return module
     return None
+
+
+def _normalize_module_id_for_compare(module_id: str) -> str:
+    """
+    模块 ID 用作 installed_modules/{module_id} 目录名。
+    Windows 路径大小写不敏感，所以这里按清理后的 ID 小写比较，避免
+    H8_CLOUD_TYPE / h8_cloud_type 被当成两个模块反复安装。
+    """
+    return sanitize_filename(str(module_id or "").strip()).lower()
+
+
+def find_existing_module_by_id(module_id: str) -> Optional[dict]:
+    target = _normalize_module_id_for_compare(module_id)
+    if not target:
+        return None
+
+    for module in load_modules():
+        current = _normalize_module_id_for_compare(str(module.get("id") or ""))
+        if current == target:
+            return module
+
+    return None
+
+
+def module_id_exists(module_id: str) -> bool:
+    return find_existing_module_by_id(module_id) is not None
+
+
+def _duplicate_module_detail(module_id: str, existing: dict | None = None) -> dict:
+    existing = existing or find_existing_module_by_id(module_id) or {}
+    return {
+        "message": (
+            f"模块 ID“{module_id}”已存在，不能重复添加同一个模块。"
+            "请先在模块管理中删除旧模块，或修改新模块配置中的 module_id / id 后再安装。"
+        ),
+        "errors": [
+            {
+                "field": "module_id",
+                "message": f"模块 ID 已存在：{module_id}",
+                "suggestion": "删除旧模块后再安装，或把新模块配置中的 module_id / id 改成新的唯一值。",
+                "existing_module": {
+                    "id": existing.get("id"),
+                    "name": existing.get("name"),
+                    "tool_type": existing.get("tool_type"),
+                },
+            }
+        ],
+        "existing_module": {
+            "id": existing.get("id"),
+            "name": existing.get("name"),
+            "tool_type": existing.get("tool_type"),
+        },
+    }
+
+
+def assert_new_module_id(module_id: str):
+    existing = find_existing_module_by_id(module_id)
+    if existing:
+        raise HTTPException(status_code=409, detail=_duplicate_module_detail(module_id, existing))
+
+
+def add_duplicate_module_error_to_report(report: dict, module_id: str):
+    existing = find_existing_module_by_id(module_id)
+    if not existing:
+        return
+
+    _add_error(
+        report,
+        "module_id",
+        f"模块 ID 已存在：{module_id}",
+        "请先在模块管理中删除旧模块，或修改新模块配置中的 module_id / id 后再安装。",
+        existing_module={
+            "id": existing.get("id"),
+            "name": existing.get("name"),
+            "tool_type": existing.get("tool_type"),
+        },
+    )
 
 
 def is_tif_path(path: Path) -> bool:
@@ -2159,6 +2258,8 @@ def install_python_venv_module_from_values(
     if not safe_module_id:
         raise HTTPException(status_code=400, detail="模块 ID 不能为空")
 
+    assert_new_module_id(safe_module_id)
+
     python_env_mode = str(python_env_mode or "create_venv").strip().lower()
     if python_env_mode not in {"create_venv", "existing"}:
         raise HTTPException(status_code=400, detail="python_env_mode 只支持 create_venv 或 existing")
@@ -3242,6 +3343,10 @@ def validate_cpp_module_folder(folder_path: Path, tool_type: str | None = None, 
 
     _validate_cpp_module_structure(module_root, module_data, report)
 
+    module_id = str(module_data.get("id") or "").strip()
+    if module_id:
+        add_duplicate_module_error_to_report(report, module_id)
+
     executable = str(module_data.get("executable") or module_data.get("entry") or "").strip()
     module_id = str(module_data.get("id") or "").strip()
     if collect_dependencies and executable:
@@ -3273,8 +3378,12 @@ def install_validated_cpp_module(module_root: Path, module_data: dict, collect_d
     if not module_id:
         raise HTTPException(status_code=400, detail="module.json 缺少 id")
 
+    assert_new_module_id(module_id)
+
     target_dir = INSTALLED_MODULES_DIR / module_id
     if target_dir.exists():
+        # 理论上已有模块会被 assert_new_module_id 拦截。
+        # 这里保留兜底，防止历史残留目录阻止重新安装一个未登记的新模块。
         shutil.rmtree(target_dir)
     shutil.copytree(module_root, target_dir)
 
@@ -3602,6 +3711,9 @@ def validate_python_module_config_file(raw_path: str) -> dict:
         except Exception as exc:
             _add_warning(report, "param_json_path", f"参数自动识别失败：{type(exc).__name__}: {exc}", "检查参数 JSON 中的值是否能被序列化；也可以先简化参数 JSON。")
 
+    if module_id:
+        add_duplicate_module_error_to_report(report, module_id)
+
     report["module"] = {
         "module_id": module_id,
         "module_name": module_name,
@@ -3769,6 +3881,8 @@ def api_upload_python_module(
     safe_module_id = sanitize_filename(module_id).strip()
     if not safe_module_id:
         raise HTTPException(status_code=400, detail="模块 ID 不能为空")
+
+    assert_new_module_id(safe_module_id)
 
     if not file.filename or not file.filename.lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="请上传 Python 源码 zip 包")

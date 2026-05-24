@@ -267,6 +267,41 @@ function normalizeToolKey(v) {
     .replace(/[\\/\s]+/g, '_');
 }
 
+function normalizeModuleIdForCompare(v) {
+  return normalizeToolKey(v).toLowerCase();
+}
+
+function getValidationModuleId(validation) {
+  return (
+    validation?.module?.id ||
+    validation?.module?.module_id ||
+    validation?.module_id ||
+    ''
+  );
+}
+
+function appendDuplicateModuleErrorToValidation(validation, moduleId, existingModule) {
+  const duplicateItem = {
+    field: 'module_id',
+    message: `模块 ID 已存在：${moduleId}`,
+    suggestion: '请先在模块管理中删除旧模块，或修改新模块配置中的 module_id / id 后再安装。',
+    existing_module: existingModule
+      ? {
+          id: existingModule.id,
+          name: existingModule.name,
+          tool_type: existingModule.tool_type,
+        }
+      : null,
+  };
+
+  return {
+    ...(validation || {}),
+    ok: false,
+    can_install: false,
+    errors: [duplicateItem, ...((validation && Array.isArray(validation.errors)) ? validation.errors : [])],
+  };
+}
+
 function guessToolType(module) {
   const explicit = normalizeToolKey(module?.tool_type || module?.category || '');
   if (explicit) return explicit;
@@ -1529,6 +1564,24 @@ export default function App() {
   const isAdmin = currentUser?.role === 'admin';
   const minimizedTaskCount = windows.filter((w) => w.minimized).length;
 
+  function findDuplicateModule(moduleId, exceptModuleId = '') {
+    const target = normalizeModuleIdForCompare(moduleId);
+    const except = normalizeModuleIdForCompare(exceptModuleId);
+    if (!target) return null;
+
+    return (
+      modules.find((module) => {
+        const current = normalizeModuleIdForCompare(module?.id);
+        return current === target && current !== except;
+      }) || null
+    );
+  }
+
+  function duplicateModuleMessage(moduleId, existingModule) {
+    const name = existingModule?.name ? `（${existingModule.name}）` : '';
+    return `模块 ID“${moduleId}”已存在${name}，不能重复添加同一个模块。请先删除旧模块，或修改新模块配置中的 module_id / id。`;
+  }
+
   const taskTrayReserveStyle = {
     boxSizing: 'border-box',
   };
@@ -2104,6 +2157,14 @@ async function installModuleFolder() {
     return;
   }
 
+  const moduleId = getValidationModuleId(validation);
+  const duplicate = findDuplicateModule(moduleId);
+  if (duplicate) {
+    setCppValidation(appendDuplicateModuleErrorToValidation(validation, moduleId, duplicate));
+    setUploadMsg(duplicateModuleMessage(moduleId, duplicate));
+    return;
+  }
+
   setUploadMsg('正在安装可执行模块，并按 config.json 自动识别输入/输出参数...');
 
   try {
@@ -2390,6 +2451,13 @@ function addTaskWindow(task, title) {
 
   async function saveCurrentModule() {
     try {
+      const nextModuleId = moduleForm.id.trim();
+      const duplicate = findDuplicateModule(nextModuleId, editingModuleId);
+      if (duplicate) {
+        alert(duplicateModuleMessage(nextModuleId, duplicate));
+        return;
+      }
+
       const extraModuleFields = JSON.parse(moduleForm.extra_json_text || '{}');
       await saveModule({
         ...extraModuleFields,
@@ -2686,6 +2754,14 @@ async function uploadPythonConfigJson() {
     return;
   }
 
+  const moduleId = getValidationModuleId(validation);
+  const duplicate = findDuplicateModule(moduleId);
+  if (duplicate) {
+    setPythonValidation(appendDuplicateModuleErrorToValidation(validation, moduleId, duplicate));
+    setPythonUploadMsg(duplicateModuleMessage(moduleId, duplicate));
+    return;
+  }
+
   setPythonUploadMsg('正在读取配置 JSON、创建独立 Python 环境并安装模块，请稍等...');
 
   try {
@@ -2715,6 +2791,14 @@ async function uploadPythonFolder() {
   const validation = await validatePythonModuleFolderPath(folderPath, { silent: true });
   if (!validation?.can_install) {
     setPythonUploadMsg('Python 模块文件夹没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
+    return;
+  }
+
+  const moduleId = getValidationModuleId(validation);
+  const duplicate = findDuplicateModule(moduleId);
+  if (duplicate) {
+    setPythonValidation(appendDuplicateModuleErrorToValidation(validation, moduleId, duplicate));
+    setPythonUploadMsg(duplicateModuleMessage(moduleId, duplicate));
     return;
   }
 
