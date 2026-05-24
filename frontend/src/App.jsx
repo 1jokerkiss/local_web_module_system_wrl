@@ -75,60 +75,27 @@ const emptyModuleForm = {
 
 
 const cppExecutableModuleTemplate = {
-  id: 'parasol_aod',
-  name: 'PARASOL AOD 反演',
-  description: 'C++ 可执行模块示例：module.json、exe、resources、deps 同级放置。C++ 模块不需要上传源码。',
-  runtime: 'cpp_native',
-  executable: 'ParasolAOD.exe',
-  working_dir: '.',
-  config_mode: 'none',
+  module_id: 'my_executable_module',
+  module_name: '我的可执行模块',
+  tool_type: 'cloud',
+  runtime: 'executable',
+  entry_file: 'MyExecutableModule.exe',
+  source_dir: '.',
+  param_json_path: 'config.json',
+  description: '可执行模块示例：输入方式与 Python 源码模块一致。系统读取 config.json 自动生成输入/输出表单，运行时把平台生成的 config.json 传给 exe。',
+  runtime_env_path: 'D:/YourRuntime/bin',
   dependency_dirs: ['deps'],
   dependency_search_dirs: [],
+  resource_dirs: ['resources'],
   auto_collect_deps: true,
-  command_template: ['{executable}', '{input_file}', '{output_dir}', '{config_xml}'],
   parallel: {
     mode: 'auto',
-    file_patterns: '*.*',
+    file_patterns: '*.tif;*.tiff;*.nc;*.hdf;*.h5',
     output_suffix: '.tif',
     output_naming: 'source_stem',
   },
-  tags: ['cpp', 'native', 'remote-sensing'],
+  tags: ['executable', 'native', 'remote-sensing'],
   enabled: true,
-  inputs: [
-    {
-      key: 'input_file',
-      label: '输入文件目录',
-      type: 'dir_path',
-      required: true,
-      visible_to_user: true,
-      admin_fixed: false,
-      path_mode: 'absolute',
-      batch_role: 'input',
-      match_mode: 'each_file',
-      io_role: 'input',
-    },
-    {
-      key: 'output_dir',
-      label: '输出目录',
-      type: 'dir_path',
-      required: true,
-      visible_to_user: true,
-      admin_fixed: false,
-      path_mode: 'absolute',
-      io_role: 'output',
-    },
-    {
-      key: 'config_xml',
-      label: '配置 XML',
-      type: 'file_path',
-      required: true,
-      default: 'resources/ConfigXMLFile.xml',
-      visible_to_user: false,
-      admin_fixed: true,
-      path_mode: 'relative_to_module',
-      io_role: 'input',
-    },
-  ],
 };
 
 function getCppExecutableModuleTemplateText() {
@@ -261,12 +228,6 @@ function normalize(v) {
 // 前端不再强制追加 cloud/aerosol，避免删除后又在页面上复活。
 const DEFAULT_TOOLBARS = [];
 const ACTIVE_TAB_STORAGE_KEY = 'local_web_active_tab';
-const ADMIN_DEFAULT_TAB = 'module_mgmt';
-const USER_DEFAULT_TAB = 'tool:cloud';
-
-function getDefaultActiveTab(user) {
-  return user?.role === 'admin' ? ADMIN_DEFAULT_TAB : USER_DEFAULT_TAB;
-}
 
 function getSavedActiveTab() {
   try {
@@ -288,6 +249,16 @@ function clearSavedActiveTab() {
   try {
     localStorage.removeItem(ACTIVE_TAB_STORAGE_KEY);
   } catch {}
+}
+
+function getDefaultActiveTabForRole(role) {
+  return role === 'admin' ? 'module_mgmt' : 'tool:cloud';
+}
+
+function getFirstActiveTabForUser(user) {
+  const saved = getSavedActiveTab();
+  if (saved) return saved;
+  return getDefaultActiveTabForRole(user?.role);
 }
 function normalizeToolKey(v) {
   return String(v || '')
@@ -359,15 +330,15 @@ function clampParallelWorkersValue(value, maxWorkers = 64) {
 
 function getConservativeSuggestedWorkers(cpuCount) {
   const cpu = Math.max(1, Number.parseInt(String(cpuCount || 1), 10) || 1);
-  // 放宽建议值：16/24 核默认建议 4；不再动不动建议 1 或 2。
-  return Math.max(1, Math.min(4, Math.ceil(cpu / 4)));
+  // 遥感反演通常是内存/磁盘重任务，前端兜底值保守：16/24 核也默认建议 2。
+  return Math.max(1, Math.min(2, Math.ceil(cpu / 8)));
 }
 
 function getConservativeMaxWorkers(cpuCount, suggestedWorkers) {
   const cpu = Math.max(1, Number.parseInt(String(cpuCount || 1), 10) || 1);
   const suggested = Math.max(1, Number.parseInt(String(suggestedWorkers || getConservativeSuggestedWorkers(cpu)), 10) || 1);
-  // 上限保留 8；真正保护由后端逐个启动子进程时动态暂停。
-  return Math.max(suggested, Math.min(8, Math.max(4, Math.ceil(cpu / 3))));
+  // 上限也降低：16/24 核默认最高 4；后端仍会按 CPU/内存/磁盘/模型大小自动降到更安全值。
+  return Math.max(suggested, Math.min(4, Math.max(1, Math.ceil(cpu / 4))));
 }
 
 const defaultSystemResources = {
@@ -691,6 +662,15 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
           <div><strong>PID：</strong>{task?.pid || '-'}</div>
           {task?.status === 'queued' && (
             <div><strong>排队：</strong>{task?.queue_position ? `第 ${task.queue_position} 位` : '等待中'}{task?.queue_reason ? `，${task.queue_reason}` : ''}</div>
+          )}
+          {Array.isArray(task?.temporary_outputs) && task.temporary_outputs.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <strong>临时输出：</strong>{task.temporary_outputs.length} 个，父任务成功后登记到数据管理
+              <div style={{ color: '#5f7088', fontSize: 12, marginTop: 4, maxHeight: 56, overflow: 'auto' }}>
+                {task.temporary_outputs.slice(0, 5).map((item) => item.name || item.path).join('；')}
+                {task.temporary_outputs.length > 5 ? `；...还有 ${task.temporary_outputs.length - 5} 个` : ''}
+              </div>
+            </div>
           )}
         </div>
 
@@ -1498,8 +1478,10 @@ export default function App() {
   const [dataFiles, setDataFiles] = useState([]);
   const [dataPreview, setDataPreview] = useState(null);
   const [dataPreviewLoading, setDataPreviewLoading] = useState(false);
+  const [dataPreviewScale, setDataPreviewScale] = useState(1);
+  const [dataPreviewScaleInput, setDataPreviewScaleInput] = useState('100');
 
-  const [activeTab, setActiveTab] = useState(() => getSavedActiveTab() || ADMIN_DEFAULT_TAB);
+  const [activeTab, setActiveTab] = useState(() => getSavedActiveTab() || 'module_mgmt');
   const [activeModuleByTool, setActiveModuleByTool] = useState({});
   const [expandedToolTypes, setExpandedToolTypes] = useState({ cloud: true, aerosol: true });
   const [cloudForms, setCloudForms] = useState({});
@@ -1507,6 +1489,7 @@ export default function App() {
   const [runtimeForms, setRuntimeForms] = useState({});
   const [moduleForm, setModuleForm] = useState(emptyModuleForm);
   const [editingModuleId, setEditingModuleId] = useState('');
+  const [moduleEditOpen, setModuleEditOpen] = useState(false);
   const [inputEditorOpen, setInputEditorOpen] = useState(false);
   const [inputEditorFields, setInputEditorFields] = useState([]);
   const [uploadToolType, setUploadToolType] = useState('');
@@ -1571,25 +1554,24 @@ export default function App() {
   const navItems = useMemo(() => {
     const arr = [];
 
+    // 顶部导航固定顺序：模块管理 → 云反演 → 气溶胶反演 → 任务管理 → 数据管理 → 用户管理。
     if (isAdmin) {
       arr.push({ key: 'module_mgmt', label: '模块管理' });
     }
 
-    const cloudToolbar = visibleToolbars.find((t) => t.key === 'cloud');
-    const aerosolToolbar = visibleToolbars.find((t) => t.key === 'aerosol');
-    const otherToolbars = visibleToolbars.filter((t) => !['cloud', 'aerosol'].includes(t.key));
+    const toolRank = (key) => {
+      if (key === 'cloud') return 0;
+      if (key === 'aerosol') return 1;
+      return 2;
+    };
 
-    if (cloudToolbar) {
-      arr.push({ key: `tool:${cloudToolbar.key}`, label: cloudToolbar.label });
-    }
-
-    if (aerosolToolbar) {
-      arr.push({ key: `tool:${aerosolToolbar.key}`, label: aerosolToolbar.label });
-    }
-
-    otherToolbars.forEach((t) => {
-      arr.push({ key: `tool:${t.key}`, label: t.label });
-    });
+    [...visibleToolbars]
+      .sort((a, b) => {
+        const rankDiff = toolRank(a.key) - toolRank(b.key);
+        if (rankDiff !== 0) return rankDiff;
+        return String(a.label || a.key).localeCompare(String(b.label || b.key), 'zh-CN');
+      })
+      .forEach((t) => arr.push({ key: `tool:${t.key}`, label: t.label }));
 
     arr.push({ key: 'tasks', label: '任务管理' });
     arr.push({ key: 'data_mgmt', label: '数据管理' });
@@ -1608,7 +1590,7 @@ export default function App() {
       try {
         const me = await getMe();
         setCurrentUser(me);
-        setActiveTab(getSavedActiveTab() || getDefaultActiveTab(me));
+        setActiveTab(getFirstActiveTabForUser(me));
 
         const [toolbarList, mods, taskList, dataList, resources] = await Promise.all([
           getToolbars(),
@@ -1666,33 +1648,25 @@ useEffect(() => {
 useEffect(() => {
   if (!currentUser) return;
 
-  // 工具栏还没加载完成时，不要把有效的默认页错误切走。
+  // 工具栏还没加载完成时，不要把 tool:cloud 错误切到任务管理或模块管理
   if (visibleToolbars.length === 0) return;
 
   const hasTool = (key) => visibleToolbars.some((tb) => tb.key === key);
   const firstKey = visibleToolbars[0]?.key || '';
-  const fallback = isAdmin
-    ? 'module_mgmt'
-    : hasTool('cloud')
-      ? 'tool:cloud'
-      : firstKey
-        ? `tool:${firstKey}`
-        : 'tasks';
-
-  let shouldFallback = false;
 
   if (activeTab.startsWith('tool:')) {
     const key = activeTab.slice('tool:'.length);
-    shouldFallback = !hasTool(key);
-  } else if (activeTab === 'module_mgmt' || activeTab === 'user_mgmt') {
-    shouldFallback = !isAdmin;
-  } else {
-    shouldFallback = !['tasks', 'data_mgmt'].includes(activeTab);
-  }
 
-  if (shouldFallback) {
-    setActiveTab(fallback);
-    saveActiveTab(fallback);
+    if (!hasTool(key)) {
+      const fallback = hasTool('cloud')
+        ? 'tool:cloud'
+        : firstKey
+          ? `tool:${firstKey}`
+          : 'tasks';
+
+      setActiveTab(fallback);
+      saveActiveTab(fallback);
+    }
   }
 
   if (!uploadToolType || !hasTool(uploadToolType)) {
@@ -1704,7 +1678,7 @@ useEffect(() => {
     if (!firstKey) return prev;
     return { ...prev, tool_type: firstKey };
   });
-}, [currentUser, isAdmin, visibleToolbars, activeTab, uploadToolType]);
+}, [currentUser, visibleToolbars, activeTab, uploadToolType]);
   useEffect(() => {
   if (!currentUser) return;
   saveActiveTab(activeTab);
@@ -1825,9 +1799,9 @@ useEffect(() => {
       const data = await login(loginForm.username, loginForm.password, loginType);
       setAuthToken(data.token);
       setCurrentUser(data.user);
-      const defaultTab = getDefaultActiveTab(data.user);
-      setActiveTab(defaultTab);
-      saveActiveTab(defaultTab);
+      const nextActiveTab = getDefaultActiveTabForRole(data.user?.role);
+      setActiveTab(nextActiveTab);
+      saveActiveTab(nextActiveTab);
 
       const [toolbarList, mods, taskList, dataList, resources] = await Promise.all([
         getToolbars(),
@@ -1910,7 +1884,7 @@ async function handleRegister() {
   async function browseModuleFolder() {
   try {
     const result = await chooseLocalDir({
-      title: '选择 C++ 可执行模块文件夹',
+      title: '选择可执行模块文件夹',
     });
 
     if (result?.path) {
@@ -2065,7 +2039,7 @@ function buildFetchFailedUploadMessage(error) {
   const msg = String(error?.message || '请求失败');
   if (msg.includes('Failed to fetch') || error?.status === 0) {
     return [
-      '请求没有到达后端，所以前端拿不到 module.json 的具体错误。',
+      '请求没有到达后端，所以前端拿不到 可执行模块配置的具体错误。',
       '请确认：1）后端服务正在运行；2）已经用新版 main.py 重启后端；3）前端请求地址和后端端口一致；4）浏览器控制台 Network 里 /api/admin/modules/validate-cpp-folder 不是红色网络失败。',
       `原始错误：${msg}`,
     ].join('\n');
@@ -2076,18 +2050,13 @@ function buildFetchFailedUploadMessage(error) {
 async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options = {}) {
   const path = String(pathValue || '').trim();
   if (!path) {
-    setUploadMsg('请选择 C++ 可执行模块文件夹');
+    setUploadMsg('请选择可执行模块文件夹');
     setCppValidation(null);
     return null;
   }
 
-  if (!uploadToolType) {
-    alert('请先选择模块所属工具栏');
-    return null;
-  }
-
   setCppValidationLoading(true);
-  if (!options.silent) setUploadMsg('正在检查 C++ 模块规范...');
+  if (!options.silent) setUploadMsg('正在检查可执行模块配置...');
 
   try {
     const data = await validateCppModuleFolder({
@@ -2102,9 +2071,9 @@ async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options
     const missingCount = Array.isArray(data?.missing_files) ? data.missing_files.length : 0;
 
     if (data?.can_install) {
-      setUploadMsg(`C++ 模块检查通过：错误 0 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。可以安装。`);
+      setUploadMsg(`可执行模块配置检查通过：错误 0 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。可以安装。`);
     } else {
-      setUploadMsg(`C++ 模块检查未通过：错误 ${errorCount} 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。请先按提示修改。`);
+      setUploadMsg(`可执行模块配置检查未通过：错误 ${errorCount} 个，警告 ${warningCount} 个，缺失 ${missingCount} 个。请先按提示修改。`);
     }
 
     return data;
@@ -2112,7 +2081,7 @@ async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options
     const detailReport = getCppValidationReportFromError(e);
     if (detailReport) {
       setCppValidation(detailReport);
-      setUploadMsg(detailReport.message || 'C++ 模块检查未通过，请按下方提示修改。');
+      setUploadMsg(detailReport.message || '可执行模块检查未通过，请按下方提示修改。');
       return detailReport;
     }
     setCppValidation(null);
@@ -2125,41 +2094,36 @@ async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options
 
 async function installModuleFolder() {
   if (!moduleFolderPath.trim()) {
-    setUploadMsg('请选择 C++ 可执行模块文件夹');
-    return;
-  }
-
-  if (!uploadToolType) {
-    alert('请先选择模块所属工具栏');
+    setUploadMsg('请选择可执行模块文件夹');
     return;
   }
 
   const validation = await validateCppModuleFolderPath(moduleFolderPath, { silent: true });
   if (!validation?.can_install) {
-    setUploadMsg('C++ 模块没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
+    setUploadMsg('可执行模块配置没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
     return;
   }
 
-  setUploadMsg('正在安装 C++ 可执行模块，并尝试自动收集运行时 DLL 依赖...');
+  setUploadMsg('正在安装可执行模块，并按 config.json 自动识别输入/输出参数...');
 
   try {
     await uploadModuleFolder({
       folder_path: moduleFolderPath.trim(),
       tool_type: uploadToolType,
-      runtime: 'cpp_native',
+      runtime: 'native',
       auto_collect_dependencies: true,
     });
 
     setModuleFolderPath('');
     setCppValidation(null);
-    setUploadMsg('C++ 可执行模块安装成功');
+    setUploadMsg('可执行模块安装成功');
 
     await Promise.all([refreshModules(), refreshToolbars(), refreshDropZipList()]);
   } catch (e) {
     const detailReport = getCppValidationReportFromError(e);
     if (detailReport) {
       setCppValidation(detailReport);
-      setUploadMsg(detailReport.message || 'C++ 可执行模块安装失败，请按下方提示修改。');
+      setUploadMsg(detailReport.message || '可执行模块安装失败，请按下方提示修改。');
       return;
     }
     setUploadMsg(buildFetchFailedUploadMessage(e));
@@ -2189,7 +2153,7 @@ async function installModuleFolder() {
     clearSavedActiveTab();
 
     setCurrentUser(null);
-    setActiveTab(ADMIN_DEFAULT_TAB);
+    setActiveTab('module_mgmt');
     setModules([]);
     setTasks([]);
     setUsers([]);
@@ -2402,6 +2366,8 @@ function addTaskWindow(task, title) {
     }
   }
 
+
+
   function fillModuleForm(module) {
     setEditingModuleId(module.id);
     setModuleForm({
@@ -2419,6 +2385,7 @@ function addTaskWindow(task, title) {
       extra_json_text: JSON.stringify(pickModuleExtraFields(module), null, 2),
       enabled: module.enabled !== false,
     });
+    setModuleEditOpen(true);
   }
 
   async function saveCurrentModule() {
@@ -2444,6 +2411,7 @@ function addTaskWindow(task, title) {
       });
       setModuleForm(emptyModuleForm);
       setEditingModuleId('');
+      setModuleEditOpen(false);
       await Promise.all([refreshModules(), refreshToolbars()]);
       alert('模块已保存');
     } catch (e) {
@@ -2596,7 +2564,7 @@ function renderCppValidationReport() {
       }}
     >
       <div style={{ fontWeight: 900, color: canInstall ? '#1f7f36' : '#b42318', marginBottom: 6 }}>
-        {canInstall ? 'C++ 模块检查通过，可以安装' : 'C++ 模块检查未通过，请先修改'}
+        {canInstall ? '可执行模块检查通过，可以安装' : '可执行模块检查未通过，请先修改'}
       </div>
       <div style={{ fontSize: 13, color: '#4f6682', wordBreak: 'break-all' }}>
         module.json：{cppValidation.module_json_path || '-'}
@@ -3051,7 +3019,7 @@ async function uploadPythonFolder() {
               }}
             >
               <div>本机 CPU 核数：<strong>{resourceInfo.cpu_count}</strong>；建议进程数：<strong>{resourceInfo.suggested_workers}</strong>；上限进程数：<strong>{resourceInfo.max_workers}</strong></div>
-              <div style={{ marginTop: 4 }}>建议值按重型遥感模块保守计算：默认最高 2；上限默认最高 8。后端仍会根据 CPU、内存、磁盘压力自动降低或排队。</div>
+              <div style={{ marginTop: 4 }}>建议值按重型遥感模块保守计算：默认最高 2；上限默认最高 4。后端仍会根据 CPU、内存、磁盘压力自动降低或排队。</div>
               <div>当前已占用进程槽：<strong>{resourceInfo.running_workers}/{resourceInfo.max_workers}</strong>；等待队列：<strong>{resourceInfo.queued_task_count}</strong></div>
               <div>系统 CPU 使用率：<strong>{resourceInfo.cpu_percent == null ? '-' : `${Number(resourceInfo.cpu_percent).toFixed(1)}%`}</strong>；模块进程 CPU：<strong>{resourceInfo.running_process_cpu_percent == null ? '-' : `${Number(resourceInfo.running_process_cpu_percent).toFixed(1)}%`}</strong></div>
               <div>内存：<strong>{resourceInfo.memory_percent == null ? '-' : `${Number(resourceInfo.memory_percent).toFixed(1)}%`}</strong>；可用内存：<strong>{resourceInfo.memory_available_gb == null ? '-' : `${Number(resourceInfo.memory_available_gb).toFixed(1)}GB`}</strong>；磁盘：<strong>{resourceInfo.disk_percent == null ? '-' : `${Number(resourceInfo.disk_percent).toFixed(1)}%`}</strong>；剩余：<strong>{resourceInfo.disk_free_gb == null ? '-' : `${Number(resourceInfo.disk_free_gb).toFixed(1)}GB`}</strong></div>
@@ -3210,9 +3178,65 @@ async function uploadPythonFolder() {
     );
   }
 
+  function renderModuleEditForm() {
+    return (
+      <div style={{ display: 'grid', gap: 12 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <select
+            value={moduleForm.tool_type}
+            onChange={(e) => setModuleForm({ ...moduleForm, tool_type: e.target.value })}
+            style={styles.input}
+          >
+            {renderToolbarOptions()}
+          </select>
+          <input
+            placeholder="ID"
+            value={moduleForm.id}
+            readOnly
+            style={{ ...styles.input, background: '#f3f7fb', color: '#62738a' }}
+          />
+          <input placeholder="名称" value={moduleForm.name} onChange={(e) => setModuleForm({ ...moduleForm, name: e.target.value })} style={styles.input} />
+          <input placeholder="可执行文件 / Python 解释器" value={moduleForm.executable} onChange={(e) => setModuleForm({ ...moduleForm, executable: e.target.value })} style={styles.input} />
+          <input placeholder="工作目录" value={moduleForm.working_dir} onChange={(e) => setModuleForm({ ...moduleForm, working_dir: e.target.value })} style={styles.input} />
+          <input placeholder="标签，英文逗号分隔" value={moduleForm.tags_text} onChange={(e) => setModuleForm({ ...moduleForm, tags_text: e.target.value })} style={styles.input} />
+          <textarea placeholder="描述" value={moduleForm.description} onChange={(e) => setModuleForm({ ...moduleForm, description: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 80 }} />
+          <textarea placeholder="命令模板(JSON数组)" value={moduleForm.command_template_text} onChange={(e) => setModuleForm({ ...moduleForm, command_template_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2' }} />
+          <textarea placeholder="输入字段(JSON数组)：包含输入/输出路径、是否用户可见、管理员预填 resources 等" value={moduleForm.inputs_text} onChange={(e) => setModuleForm({ ...moduleForm, inputs_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 180 }} />
+          <textarea placeholder="并行配置(JSON对象)，保存在 module.json 的 parallel 字段" value={moduleForm.parallel_json_text} onChange={(e) => setModuleForm({ ...moduleForm, parallel_json_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 110 }} />
+        </div>
+
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <button style={styles.blueBtn} onClick={saveCurrentModule}>保存模块</button>
+          <button style={styles.whiteBtn} onClick={openInputEditor}>编辑输入文件</button>
+          <button
+            style={styles.whiteBtn}
+            onClick={() => {
+              setModuleEditOpen(false);
+              setEditingModuleId('');
+              setModuleForm(emptyModuleForm);
+            }}
+          >
+            取消
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   function renderInstalledModulesTree() {
     return (
-      <div style={{ display: 'grid', gap: 10, marginTop: 12, maxHeight: 'calc(100vh - 520px)', overflow: 'auto' }}>
+      <div
+        style={{
+          display: 'grid',
+          gap: 10,
+          marginTop: 12,
+          flex: 1,
+          minHeight: 0,
+          overflow: 'auto',
+          alignContent: 'start',
+          paddingRight: 4,
+        }}
+      >
         {visibleToolbars.map((tb) => {
           const list = modulesByTool[tb.key] || [];
           const expanded = expandedToolTypes[tb.key] !== false;
@@ -3401,6 +3425,8 @@ function renderDataManagementPage() {
     try {
       setDataPreviewLoading(true);
       const data = await previewDataFile(file.id);
+      setDataPreviewScale(1);
+      setDataPreviewScaleInput('100');
       setDataPreview(data);
     } catch (e) {
       alert(e?.message || '预览失败');
@@ -3546,41 +3572,243 @@ function renderDataManagementPage() {
 
       </section>
 
-      {dataPreview && (
-        <SimpleOverlay
-          title={`文件预览：${dataPreview.name || ''}`}
-          onClose={() => setDataPreview(null)}
-          width="min(1100px, 96vw)"
-        >
-          {dataPreviewLoading && <div>加载中...</div>}
+      {dataPreview && (() => {
+        const meta = dataPreview.meta || {};
+        const rawW = Number(meta.preview_width || meta.width || 900) || 900;
+        const rawH = Number(meta.preview_height || meta.height || 650) || 650;
+        const vw = typeof window !== 'undefined' ? window.innerWidth : 1400;
+        const vh = typeof window !== 'undefined' ? window.innerHeight : 900;
+        // 预览框默认接近数据管理表格中间区域大小。
+        // 图片默认按等比例“适应预览框”：小图会自动放大，大图会自动缩小，尽量铺满预览框且不变形。
+        const targetW = Math.floor(vw * 0.72);
+        const targetH = Math.floor(vh * 0.76);
+        const baseW = Math.min(Math.max(980, targetW), Math.floor(vw * 0.92));
+        const baseH = Math.min(Math.max(620, targetH), Math.floor(vh * 0.90));
+        const previewPanelW = Math.max(360, baseW - 64);
+        const previewPanelH = Math.max(360, baseH - 168);
+        const fitScale = Math.max(
+          0.01,
+          Math.min(
+            (previewPanelW - 28) / Math.max(1, rawW),
+            (previewPanelH - 28) / Math.max(1, rawH)
+          )
+        );
+        const renderedW = Math.max(1, Math.round(rawW * fitScale * dataPreviewScale));
+        const renderedH = Math.max(1, Math.round(rawH * fitScale * dataPreviewScale));
+        const actualPercent = Math.round(fitScale * dataPreviewScale * 100);
 
-          {dataPreview.type === 'image' && dataPreview.data_url ? (
-            <div>
-              <div style={{ marginBottom: 12, color: '#6a7f96', wordBreak: 'break-all' }}>
-                {dataPreview.path}
+        function clampPreviewScale(value) {
+          const n = Number(value);
+          if (!Number.isFinite(n)) return 1;
+          return Math.max(0.05, Math.min(20, n));
+        }
+
+        function formatScalePercent(scale) {
+          return String(Math.round(clampPreviewScale(scale) * 100));
+        }
+
+        function updatePreviewScale(next) {
+          const nextScale = clampPreviewScale(next);
+          setDataPreviewScale(nextScale);
+          setDataPreviewScaleInput(formatScalePercent(nextScale));
+        }
+
+        function updatePreviewScalePercentText(value) {
+          const raw = String(value ?? '').replace('%', '').trim();
+          setDataPreviewScaleInput(raw);
+
+          // 允许用户先清空输入框，再输入 120 这种数字。
+          // 只有输入的是有效数字时，才实时更新图片缩放。
+          if (raw === '') return;
+          const n = Number(raw);
+          if (!Number.isFinite(n)) return;
+          const nextScale = clampPreviewScale(n / 100);
+          setDataPreviewScale(nextScale);
+        }
+
+        function commitPreviewScalePercentText() {
+          const raw = String(dataPreviewScaleInput ?? '').replace('%', '').trim();
+          const n = Number(raw);
+          if (!raw || !Number.isFinite(n)) {
+            setDataPreviewScaleInput(formatScalePercent(dataPreviewScale));
+            return;
+          }
+          updatePreviewScale(n / 100);
+        }
+
+        return (
+          <div
+            style={{
+              position: 'fixed',
+              inset: 0,
+              background: 'rgba(7,22,44,0.32)',
+              zIndex: 7000,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: 12,
+            }}
+          >
+            <div
+              style={{
+                width: baseW,
+                height: baseH,
+                maxWidth: '96vw',
+                maxHeight: '94vh',
+                minWidth: 520,
+                minHeight: 380,
+                resize: 'both',
+                overflow: 'auto',
+                borderRadius: 18,
+                background: 'rgba(248,251,255,0.98)',
+                boxShadow: '0 22px 60px rgba(0,0,0,0.22)',
+                padding: 16,
+              }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, marginBottom: 14 }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 20, fontWeight: 900, color: '#102a4a', wordBreak: 'break-all' }}>
+                    文件预览：{dataPreview.name || ''}
+                  </div>
+                  <div style={{ fontSize: 13, color: '#6a7f96', marginTop: 4 }}>
+                    原始预览尺寸：{rawW} × {rawH}；默认已等比适应预览框；当前实际显示约为原图 {actualPercent}%
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                  {dataPreview.type === 'image' && dataPreview.data_url && (
+                    <>
+                      <button
+                        style={{ ...styles.whiteBtn, padding: '9px 14px', fontSize: 14 }}
+                        onClick={() => updatePreviewScale(dataPreviewScale - 0.1)}
+                      >
+                        缩小
+                      </button>
+
+                      <label
+                        style={{
+                          display: 'flex',
+                          flexDirection: 'row',
+                          alignItems: 'center',
+                          gap: 6,
+                          fontSize: 13,
+                          color: '#17406b',
+                          fontWeight: 800,
+                        }}
+                      >
+                        比例
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          value={dataPreviewScaleInput}
+                          onChange={(e) => updatePreviewScalePercentText(e.target.value)}
+                          onBlur={commitPreviewScalePercentText}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.currentTarget.blur();
+                            }
+                          }}
+                          placeholder="100"
+                          style={{
+                            width: 86,
+                            height: 36,
+                            borderRadius: 9,
+                            border: '1px solid #cdd8ea',
+                            padding: '0 8px',
+                            fontWeight: 800,
+                            color: '#17406b',
+                          }}
+                        />
+                        %
+                      </label>
+
+                      <button
+                        style={{ ...styles.whiteBtn, padding: '9px 14px', fontSize: 14 }}
+                        onClick={() => updatePreviewScale(dataPreviewScale + 0.1)}
+                      >
+                        放大
+                      </button>
+
+                      <button
+                        style={{ ...styles.whiteBtn, padding: '9px 14px', fontSize: 14 }}
+                        onClick={() => updatePreviewScale(1)}
+                      >
+                        适应窗口
+                      </button>
+                    </>
+                  )}
+                  <button
+                    style={{
+                      ...styles.redBtn,
+                      padding: '12px 22px',
+                      fontSize: 16,
+                      borderRadius: 12,
+                      boxShadow: '0 8px 18px rgba(197, 50, 50, 0.25)',
+                    }}
+                    onClick={() => setDataPreview(null)}
+                  >
+                    关闭预览
+                  </button>
+                </div>
               </div>
-              <img
-                src={dataPreview.data_url}
-                alt={dataPreview.name}
-                style={{
-                  maxWidth: '100%',
-                  maxHeight: '75vh',
-                  borderRadius: 12,
-                  border: '1px solid #d8e3f0',
-                  background: '#fff',
-                }}
-              />
+
+              {dataPreviewLoading && <div>加载中...</div>}
+
+              {dataPreview.type === 'image' && dataPreview.data_url ? (
+                <div>
+                  <div style={{ marginBottom: 10, color: '#6a7f96', wordBreak: 'break-all', fontSize: 12 }}>
+                    {dataPreview.path}
+                  </div>
+                  <div
+                    style={{
+                      height: previewPanelH,
+                      width: '100%',
+                      overflow: 'auto',
+                      border: '1px solid #d8e3f0',
+                      borderRadius: 14,
+                      background: '#f8fbff',
+                      padding: 14,
+                      boxSizing: 'border-box',
+                    }}
+                  >
+                    <div
+                      style={{
+                        minWidth: '100%',
+                        minHeight: '100%',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                      }}
+                    >
+                      <img
+                        src={dataPreview.data_url}
+                        alt={dataPreview.name}
+                        style={{
+                          width: renderedW,
+                          height: renderedH,
+                          maxWidth: 'none',
+                          maxHeight: 'none',
+                          objectFit: 'contain',
+                          borderRadius: 12,
+                          border: '1px solid #d8e3f0',
+                          background: '#fff',
+                          boxShadow: '0 6px 18px rgba(15,45,80,0.12)',
+                        }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ lineHeight: 1.8 }}>
+                  <div>{dataPreview.message || '该文件暂不支持在线预览'}</div>
+                  <div style={{ color: '#6a7f96', wordBreak: 'break-all', marginTop: 8 }}>
+                    {dataPreview.path}
+                  </div>
+                </div>
+              )}
             </div>
-          ) : (
-            <div style={{ lineHeight: 1.8 }}>
-              <div>{dataPreview.message || '该文件暂不支持在线预览'}</div>
-              <div style={{ color: '#6a7f96', wordBreak: 'break-all', marginTop: 8 }}>
-                {dataPreview.path}
-              </div>
-            </div>
-          )}
-        </SimpleOverlay>
-      )}
+          </div>
+        );
+      })()}
     </>
   );
 }
@@ -3634,7 +3862,7 @@ function renderTaskManagementPage() {
             </thead>
 
             <tbody>
-            {tasks.map((task, index) => (
+            {tasks.filter((item) => !item.parent_id).map((task, index) => (
                 <tr
                     key={task.id}
                     style={{
@@ -3652,7 +3880,7 @@ function renderTaskManagementPage() {
                   <td style={taskTdEllipsisStyle} title={task.module_name || '-'}>
                     {task.module_name}
                   </td>
-                  <td style={taskTdStyle}>{task.kind}</td>
+                  <td style={taskTdStyle}>{task.kind === 'parallel' || task.kind === 'batch_parent' ? 'module' : task.kind}</td>
                   <td style={taskTdStyle}>
                     {statusBadge(task.status)}
                     {task.status === 'queued' && (task.queue_position || task.queue_reason) && (
@@ -3704,7 +3932,7 @@ function renderTaskManagementPage() {
                 </tr>
               ))}
 
-              {tasks.length === 0 && (
+              {tasks.filter((item) => !item.parent_id).length === 0 && (
                 <tr>
                   <td colSpan={isAdmin ? 8 : 7} style={{...taskTdStyle, padding: 30, textAlign: 'center', color: '#6c8098'}}>
                     暂无任务
@@ -3791,8 +4019,24 @@ function renderTaskManagementPage() {
 
       <div style={{ padding: 12 }}>
         {activeTab === 'module_mgmt' && isAdmin && (
-          <section style={{ ...styles.card, padding: 16, minHeight: 'calc(100vh - 98px)' }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '380px minmax(0, 1fr)', gap: 16 }}>
+          <section
+            style={{
+              ...styles.card,
+              padding: 16,
+              minHeight: 'calc(100vh - 98px)',
+              display: 'flex',
+            }}
+          >
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '380px minmax(0, 1fr)',
+                gap: 16,
+                width: '100%',
+                minHeight: 'calc(100vh - 130px)',
+                alignItems: 'stretch',
+              }}
+            >
               <div style={{ ...styles.card, padding: 16 }}>
                 <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 16 }}>
                   模块管理功能
@@ -3807,24 +4051,18 @@ function renderTaskManagementPage() {
 
                   {renderModuleMgmtButton(
                     'cpp_upload',
-                    'C++ 可执行模块上传',
-                    '选择包含 module.json、编译好的 exe、resources 和 deps 的 C++ 可执行模块文件夹，先检查规范再安装。'
+                    '可执行模块上传',
+                    '选择包含 executable_module.json、config.json、可执行程序、resources 和 deps 的模块文件夹，输入方式与 Python 模块一致。'
                   )}
                   {renderModuleMgmtButton(
                     'installed_modules',
                     '已安装模块',
                     '查看当前已经安装到系统中的模块，并进行编辑或删除。'
                   )}
-
-                  {renderModuleMgmtButton(
-                    'toolbars',
-                    '工具栏',
-                    '管理云反演、气溶胶反演等顶部工具栏分类。'
-                  )}
                 </div>
               </div>
 
-              <div style={{ display: 'grid', gap: 16, minWidth: 0 }}>
+              <div style={{ display: 'grid', gap: 16, minWidth: 0, minHeight: 'calc(100vh - 130px)', alignItems: 'stretch' }}>
                 {moduleMgmtAction === 'python_upload' && (
                   <div style={{ ...styles.card, padding: 22 }}>
                     <div style={{ fontSize: 24, fontWeight: 900, color: '#12385f', marginBottom: 10 }}>
@@ -3986,12 +4224,13 @@ function renderTaskManagementPage() {
                 {moduleMgmtAction === 'cpp_upload' && (
                     <div style={{ ...styles.card, padding: 18 }}>
                       <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
-                        C++ 可执行模块上传
+                        可执行模块上传
                       </div>
 
                       <div style={{ color: '#6a7f96', lineHeight: 1.8, marginBottom: 14 }}>
-                        请选择一个已经准备好的 C++ 可执行模块文件夹。推荐目录结构为：module.json、编译后的 exe、resources 固定资源目录、deps 运行时 DLL 依赖目录。
-                        C++ 模块不需要上传源码；系统会先检查 module.json 是否规范、固定资源是否缺失、exe 是否存在，并尝试识别运行时 DLL 依赖。
+                        请选择一个已经准备好的可执行模块文件夹。新版可执行模块的输入方式与 Python 源码模块一致：
+                        文件夹中放 executable_module.json、config.json、可执行程序、resources 固定资源目录、deps 运行时依赖目录。
+                        系统会读取 config.json 自动生成输入文件夹、输出文件夹等表单；运行时把平台生成的 config.json 路径传给 exe。
                       </div>
 
                       <div
@@ -4007,27 +4246,13 @@ function renderTaskManagementPage() {
                       >
                         <div style={{ fontWeight: 900, color: '#12385f', marginBottom: 6 }}>依赖说明</div>
                         <div>deps 主要放 <strong>运行时 DLL 依赖</strong>，也就是 exe 启动时还需要但没有打进 exe 的动态库。</div>
-                        <div>C++ 模块这里按成品 exe 安装，不需要源码、头文件、静态库或 CMake 工程。deps 只放 exe 运行时还缺少的 DLL。</div>
-                        <div>自动收集只能尽力识别 exe 导入表中的 DLL；如果程序用 LoadLibrary 动态加载 DLL，仍建议手动放到 deps 并在 module.json 的 dependency_dirs 中声明。</div>
+                        <div>运行环境路径由用户在 executable_module.json 的 <strong>runtime_env_path</strong> 中填写，例如 MATLAB Runtime、OSGeo4W、其它 bin/runtime 目录；纯独立 exe 可以留空。</div>
+                        <div>输入文件夹、输出文件夹不再写 command_template/inputs，而是写在 config.json 里，系统会像 Python 模块一样自动识别并生成表单。</div>
                       </div>
 
                       <div style={{ display: 'grid', gap: 12 }}>
                         <div>
-                          <div style={labelStyle}>模块所属工具栏</div>
-                          <select
-                            value={uploadToolType}
-                            onChange={(e) => {
-                              setUploadToolType(e.target.value);
-                              setCppValidation(null);
-                            }}
-                            style={styles.input}
-                          >
-                            {renderToolbarOptions()}
-                          </select>
-                        </div>
-
-                        <div>
-                          <div style={labelStyle}>C++ 可执行模块文件夹</div>
+                          <div style={labelStyle}>可执行模块文件夹</div>
                           <div style={{ display: 'flex', gap: 10 }}>
                             <input
                               style={{ ...styles.input, flex: 1 }}
@@ -4036,7 +4261,7 @@ function renderTaskManagementPage() {
                                 setModuleFolderPath(e.target.value);
                                 setCppValidation(null);
                               }}
-                              placeholder="请选择或粘贴包含 module.json 和 exe 的 C++ 模块文件夹路径"
+                              placeholder="请选择或粘贴包含 executable_module.json、config.json 和可执行程序的模块文件夹路径"
                             />
                             <button style={styles.whiteBtn} onClick={browseModuleFolder}>
                               浏览并检查
@@ -4047,9 +4272,9 @@ function renderTaskManagementPage() {
                         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                           <button
                             style={styles.whiteBtn}
-                            onClick={() => downloadTextFile('cpp_module_template.json', getCppExecutableModuleTemplateText())}
+                            onClick={() => downloadTextFile('executable_module.json', getCppExecutableModuleTemplateText())}
                           >
-                            下载 module.json 模板
+                            下载 executable_module.json 模板
                           </button>
 
                           <button
@@ -4057,7 +4282,7 @@ function renderTaskManagementPage() {
                             onClick={async () => {
                               try {
                                 await navigator.clipboard.writeText(getCppExecutableModuleTemplateText());
-                                setUploadMsg('已复制 C++ 可执行模块 module.json 模板。用户需要把文件命名为 module.json，并放到 exe 同级目录。');
+                                setUploadMsg('已复制可执行模块 executable_module.json 模板。用户需要按自己的 exe、config.json、运行环境路径和资源目录修改。');
                               } catch {
                                 setUploadMsg(getCppExecutableModuleTemplateText());
                               }
@@ -4071,11 +4296,11 @@ function renderTaskManagementPage() {
                             onClick={() => validateCppModuleFolderPath(moduleFolderPath)}
                             disabled={cppValidationLoading}
                           >
-                            {cppValidationLoading ? '检查中...' : '检查模块规范'}
+                            {cppValidationLoading ? '检查中...' : '检查模块配置'}
                           </button>
 
                           <button style={styles.blueBtn} onClick={installModuleFolder} disabled={cppValidationLoading}>
-                            安装 C++ 可执行模块
+                            安装可执行模块
                           </button>
 
                           <button
@@ -4098,7 +4323,7 @@ function renderTaskManagementPage() {
                           </button>
 
                           <button style={styles.whiteBtn} onClick={() => setShowDropHint(true)}>
-                            C++ 可执行模块目录说明
+                            可执行模块目录说明
                           </button>
                         </div>
 
@@ -4132,7 +4357,7 @@ function renderTaskManagementPage() {
                             }}
                           >
                             <div style={{ fontWeight: 900, color: '#12385f', marginBottom: 8 }}>
-                              待投放 C++ 模块 zip：{dropInfo.items.length} 个
+                              待投放可执行模块 zip：{dropInfo.items.length} 个
                             </div>
                             <div style={{ display: 'grid', gap: 8 }}>
                               {dropInfo.items.map((item) => (
@@ -4165,83 +4390,23 @@ function renderTaskManagementPage() {
 
                 {moduleMgmtAction === 'installed_modules' && (
                   <>
-                    <div style={{ ...styles.card, padding: 18 }}>
-                      <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
+                    <div
+                      style={{
+                        ...styles.card,
+                        padding: 18,
+                        minHeight: 'calc(100vh - 150px)',
+                        height: '100%',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12, flexShrink: 0 }}>
                         已安装模块
                       </div>
                       {renderInstalledModulesTree()}
                     </div>
-
-                    <div style={{ ...styles.card, padding: 16 }}>
-                      <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
-                        {editingModuleId ? `编辑模块：${editingModuleId}` : '手工新增 / 更新模块'}
-                      </div>
-
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                        <select
-                          value={moduleForm.tool_type}
-                          onChange={(e) => setModuleForm({ ...moduleForm, tool_type: e.target.value })}
-                          style={styles.input}
-                        >
-                          {renderToolbarOptions()}
-                        </select>
-                        <input
-                          placeholder="ID"
-                          value={moduleForm.id}
-                          onChange={(e) => setModuleForm({ ...moduleForm, id: e.target.value })}
-                          style={styles.input}
-                        />
-                        <input placeholder="名称" value={moduleForm.name} onChange={(e) => setModuleForm({ ...moduleForm, name: e.target.value })} style={styles.input} />
-                        <input placeholder="可执行文件" value={moduleForm.executable} onChange={(e) => setModuleForm({ ...moduleForm, executable: e.target.value })} style={styles.input} />
-                        <input placeholder="工作目录" value={moduleForm.working_dir} onChange={(e) => setModuleForm({ ...moduleForm, working_dir: e.target.value })} style={styles.input} />
-                        <input placeholder="标签，英文逗号分隔" value={moduleForm.tags_text} onChange={(e) => setModuleForm({ ...moduleForm, tags_text: e.target.value })} style={styles.input} />
-                        <textarea placeholder="描述" value={moduleForm.description} onChange={(e) => setModuleForm({ ...moduleForm, description: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 80 }} />
-                        <textarea placeholder="命令模板(JSON数组)" value={moduleForm.command_template_text} onChange={(e) => setModuleForm({ ...moduleForm, command_template_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2' }} />
-                        <textarea placeholder="输入字段(JSON数组)：包含输入/输出路径、是否用户可见、管理员预填 resources 等" value={moduleForm.inputs_text} onChange={(e) => setModuleForm({ ...moduleForm, inputs_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 180 }} />
-                        <textarea placeholder="并行配置(JSON对象)，保存在 module.json 的 parallel 字段" value={moduleForm.parallel_json_text} onChange={(e) => setModuleForm({ ...moduleForm, parallel_json_text: e.target.value })} style={{ ...styles.textarea, gridColumn: '1 / span 2', minHeight: 110 }} />
-                      </div>
-
-                      <div style={{ display: 'flex', gap: 10, marginTop: 14, flexWrap: 'wrap' }}>
-                        <button style={styles.blueBtn} onClick={saveCurrentModule}>保存模块</button>
-                        <button style={styles.whiteBtn} onClick={openInputEditor}>编辑输入文件</button>
-                        <button
-                          style={styles.whiteBtn}
-                          onClick={() => {
-                            setEditingModuleId('');
-                            setModuleForm(emptyModuleForm);
-                          }}
-                        >
-                          新建空白
-                        </button>
-                      </div>
-                    </div>
                   </>
-                )}
-
-                {moduleMgmtAction === 'toolbars' && (
-                  <div style={{ ...styles.card, padding: 18 }}>
-                    <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
-                      工具栏列表
-                    </div>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8, marginBottom: 10 }}>
-                      <input
-                        placeholder="新增工具栏名称"
-                        value={newToolbarForm.label}
-                        onChange={(e) => setNewToolbarForm({ ...newToolbarForm, label: e.target.value })}
-                        style={{ ...styles.input, minHeight: 38, fontSize: 13 }}
-                      />
-                      <input
-                        placeholder="标识，可选"
-                        value={newToolbarForm.key}
-                        onChange={(e) => setNewToolbarForm({ ...newToolbarForm, key: e.target.value })}
-                        style={{ ...styles.input, minHeight: 38, fontSize: 13 }}
-                      />
-                      <button style={{ ...styles.blueBtn, padding: '8px 12px', fontSize: 13 }} onClick={handleAddToolbar}>
-                        添加
-                      </button>
-                    </div>
-                    {renderToolbarAdminList()}
-                  </div>
                 )}
               </div>
             </div>
@@ -4339,6 +4504,20 @@ function renderTaskManagementPage() {
             {renderTaskTrayPanel()}
           </TaskTrayFloatingWindow>
         )}
+
+      {moduleEditOpen && (
+        <SimpleOverlay
+          title={`编辑模块：${editingModuleId || moduleForm.id || ''}`}
+          onClose={() => {
+            setModuleEditOpen(false);
+            setEditingModuleId('');
+            setModuleForm(emptyModuleForm);
+          }}
+          width="min(1120px, 96vw)"
+        >
+          {renderModuleEditForm()}
+        </SimpleOverlay>
+      )}
 
 {inputEditorOpen && (
         <SimpleOverlay
@@ -4474,23 +4653,23 @@ function renderTaskManagementPage() {
 
       {showDropHint && (
         <SimpleOverlay
-          title="C++ 本地模块目录投放说明"
+          title="可执行模块目录投放说明"
           onClose={() => setShowDropHint(false)}
           width="min(820px, 96vw)"
         >
           <div style={{ lineHeight: 1.9, color: '#173353' }}>
-            <p>这里用于 C++ / 本地原生可执行模块投放。zip 内部需要包含 module.json、编译好的 exe、固定资源 resources，以及可选的运行时依赖 deps。C++ 模块不需要上传源码。</p>
+            <p>这里用于本地可执行模块投放。zip 内部建议包含 executable_module.json、config.json、可执行程序、固定资源 resources，以及可选的运行时依赖 deps。输入方式与 Python 模块一致：系统从 config.json 识别输入/输出表单，运行时传入平台生成的 config.json。</p>
             <p>
               当前后端会自动创建并扫描本地投放目录：
               <code>{dropInfo.drop_dir || '项目根目录/module_drop'}</code>
             </p>
             <ol>
-              <li>管理员先在“模块所属工具栏”里选择云反演、气溶胶反演或自定义工具类型。</li>
-              <li>把 C++ 可执行模块 zip 直接放进这个目录，不需要在网页里选择文件。</li>
-              <li>点击“扫描本地目录安装”，后端会先校验 module.json 和缺失文件，再安装通过的 zip。</li>
-              <li>系统会尝试从 exe 导入表识别 DLL，并把可找到的非系统 DLL 复制到 deps/auto。</li>
+              <li>在 executable_module.json 里填写 tool_type，例如 cloud 或 aerosol。</li>
+              <li>把可执行模块 zip 直接放进这个目录，不需要在网页里选择文件。</li>
+              <li>点击“扫描本地目录安装”，后端会先校验 executable_module.json/config.json 和缺失文件，再安装通过的 zip。</li>
+              <li>系统会把 dependency_dirs、dependency_search_dirs 和 runtime_env_path 加入运行 PATH，并可尝试识别 DLL。</li>
             </ol>
-            <p>注意：deps 是运行时依赖目录，只放 exe 运行时缺少的 DLL。源码、头文件、静态库、CMake/vcpkg 配置都不需要上传。</p>
+            <p>注意：deps 是运行时依赖目录，只放 exe 运行时缺少的 DLL。runtime_env_path 用来填写本机运行环境路径，例如 MATLAB Runtime 或其它运行库目录。</p>
           </div>
         </SimpleOverlay>
       )}
