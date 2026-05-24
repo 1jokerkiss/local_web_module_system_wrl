@@ -1,7 +1,7 @@
 [
   {
     "username": "admin",
-    "password_hash": "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9",
+    "password_hash": "c6f3ac57944a531490cd39902d0f777715fd005efac9a30622d5f5205e7f6894",
     "role": "admin",
     "enabled": true,
     "security_question": "管理员默认账号",

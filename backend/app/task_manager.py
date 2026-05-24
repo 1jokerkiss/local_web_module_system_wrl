@@ -651,6 +651,70 @@ class TaskManager:
             task.setdefault("logs", []).append(str(text))
         self._save_tasks()
 
+    def _extract_error_lines_for_parent(self, child_task: Dict[str, Any], max_lines: int = 35) -> List[str]:
+        """把子任务失败原因摘出来写回父任务日志。
+
+        任务管理页现在只展示父任务，子任务被隐藏后，如果不把子任务 stderr/traceback
+        汇总到父任务，用户只能看到“状态=failed”，无法定位算法报错。
+        """
+        logs = [str(x) for x in (child_task.get("logs") or [])]
+        if not logs:
+            return []
+
+        important: List[str] = []
+        capture_traceback = False
+        for line in logs:
+            text = str(line)
+            low = text.lower()
+            if (
+                "[stderr]" in low
+                or "traceback" in low
+                or "error" in low
+                or "exception" in low
+                or "failed" in low
+                or "错误" in text
+                or "失败" in text
+                or "nameerror" in low
+                or "filenotfounderror" in low
+                or "indexerror" in low
+                or "keyerror" in low
+                or "valueerror" in low
+                or "runtimeerror" in low
+            ):
+                important.append(text)
+                capture_traceback = "traceback" in low
+            elif capture_traceback and (text.startswith("[STDERR]") or text.startswith(" ") or text.startswith("[PYTHON-EXCEPTION]")):
+                important.append(text)
+
+        if not important:
+            important = logs[-max_lines:]
+        else:
+            important = important[-max_lines:]
+
+        cleaned: List[str] = []
+        for line in important:
+            if len(line) > 800:
+                line = line[:800] + " ..."
+            cleaned.append(line)
+        return cleaned
+
+    def _append_child_failure_to_parent(self, parent_id: str, child_id: str, label: str):
+        child_task = self.get_task(child_id) or {}
+        status = child_task.get("status")
+        return_code = child_task.get("return_code")
+        self.append_log(
+            parent_id,
+            f"[CHILD-FAILED] {label} 失败；子任务ID={child_id}；状态={status}；return_code={return_code}",
+        )
+        cmd = child_task.get("command") or []
+        if cmd:
+            try:
+                self.append_log(parent_id, "[CHILD-COMMAND] " + " ".join(str(x) for x in cmd))
+            except Exception:
+                pass
+        for line in self._extract_error_lines_for_parent(child_task):
+            self.append_log(parent_id, f"[CHILD-LOG] {line}")
+
 
     def _append_parallel_adjustment_log(self, task_id: str, inputs: Dict[str, Any] | None):
         inputs = inputs or {}
@@ -710,31 +774,42 @@ class TaskManager:
             max_workers: int = 2,
             owner_username: str = "",
     ) -> Dict[str, Any]:
-        max_workers = max(1, int(max_workers or 1))
+        requested_workers = max(1, int(max_workers or 1))
+        job_count = len(jobs)
+        effective_workers = max(1, min(requested_workers, max(1, job_count)))
+
+        parent_inputs = dict(inputs or {})
+        parent_inputs["parallel_workers"] = effective_workers
+        parent_inputs["_parallel_workers"] = effective_workers
+        parent_inputs["_requested_parallel_workers"] = requested_workers
+        parent_inputs["_effective_parallel_workers"] = effective_workers
+        if requested_workers != effective_workers:
+            parent_inputs["_parallel_worker_note"] = f"用户选择 {requested_workers} 个进程，但本次只有 {job_count} 个子任务，实际只申请 {effective_workers} 个 CPU 进程槽。"
+
         parent = self.create_task(
             module_id=module_id,
             module_name=module_name,
             command=[],
-            inputs=inputs,
+            inputs=parent_inputs,
             kind="parallel",
             extra={
-                "parallel_total": len(jobs),
+                "parallel_total": job_count,
                 "parallel_done": 0,
                 "parallel_failed": 0,
-                "max_workers": max_workers,
+                "max_workers": effective_workers,
+                "requested_workers": requested_workers,
                 "owner_username": str(owner_username or ""),
             },
         )
 
-        self._append_parallel_adjustment_log(parent["id"], inputs)
-        # 并行父任务必须按真实并行数申请进程槽。
-        # 旧版这里写成 requested_slots=1，导致任务日志显示只占 1 个槽，
-        # 但内部却可能启动 4/6/8 个子进程，系统负载统计和排队判断都会失真。
+        if requested_workers != effective_workers:
+            self.append_log(parent["id"], parent_inputs["_parallel_worker_note"])
+        self._append_parallel_adjustment_log(parent["id"], parent_inputs)
         self._enqueue_task_runner(
             parent["id"],
             self._run_parallel_task,
-            (parent["id"], jobs, max_workers),
-            requested_slots=max_workers,
+            (parent["id"], jobs, effective_workers),
+            requested_slots=effective_workers,
         )
         return self.get_task(parent["id"]) or parent
 
@@ -746,24 +821,43 @@ class TaskManager:
             max_parallel: int,
             owner_username: str = "",
     ) -> Dict[str, Any]:
-        """Submit a batch parent task using the old tested ThreadPoolExecutor process-pool style.
+        """Submit a batch parent task using a real stable process-pool style.
 
-        Each job becomes one child task. max_parallel controls how many child jobs are
-        executed at the same time. Closing a task window in the UI does not stop the
-        background job; cancel_task is still available to terminate running processes.
+        Each job becomes one hidden child task. The parent task is the only task shown
+        in task management. max_parallel controls how many child processes are allowed
+        to run at the same time. The parent must request the same number of CPU slots
+        as the real child-process concurrency, otherwise the scheduler will say it only
+        obtained 1 slot while the batch group actually launches multiple children.
         """
-        max_parallel = max(1, int(max_parallel or 1))
+        requested_parallel = max(1, int(max_parallel or 1))
+        job_count = len(jobs)
+        effective_parallel = max(1, min(requested_parallel, max(1, job_count)))
+
+        parent_inputs: Dict[str, Any] = {
+            "job_count": job_count,
+            "parallel_workers": effective_parallel,
+            "_parallel_workers": effective_parallel,
+            "_requested_parallel_workers": requested_parallel,
+            "_effective_parallel_workers": effective_parallel,
+        }
+        if requested_parallel != effective_parallel:
+            parent_inputs["_parallel_worker_note"] = (
+                f"用户选择 {requested_parallel} 个进程，但本次只有 {job_count} 个子任务，"
+                f"实际只申请 {effective_parallel} 个 CPU 进程槽。"
+            )
+
         parent = self.create_task(
             module_id=module_id,
             module_name=f"{module_name} 批处理",
             command=[],
-            inputs={"job_count": len(jobs), "parallel_workers": max_parallel},
+            inputs=parent_inputs,
             kind="batch_parent",
             extra={
-                "parallel_total": len(jobs),
+                "parallel_total": job_count,
                 "parallel_done": 0,
                 "parallel_failed": 0,
-                "max_workers": max_parallel,
+                "max_workers": effective_parallel,
+                "requested_workers": requested_parallel,
                 "owner_username": str(owner_username or ""),
             },
         )
@@ -774,7 +868,7 @@ class TaskManager:
         for idx, job in enumerate(jobs, start=1):
             child = self.create_task(
                 module_id=module_id,
-                module_name=f"{module_name} [{idx}/{len(jobs)}]",
+                module_name=f"{module_name} [{idx}/{job_count}]",
                 command=job["command"],
                 inputs=job["inputs"],
                 kind="module",
@@ -792,14 +886,18 @@ class TaskManager:
             self.tasks[parent["id"]]["children"] = child_ids
             self.tasks[parent["id"]]["status"] = "queued"
         self._save_tasks()
+
+        if parent_inputs.get("_parallel_worker_note"):
+            self.append_log(parent["id"], str(parent_inputs["_parallel_worker_note"]))
+
         first_job_inputs = next(iter(child_job_map.values()), {}).get("inputs") if child_job_map else None
         self._append_parallel_adjustment_log(parent["id"], first_job_inputs)
 
         self._enqueue_task_runner(
             parent["id"],
             self._run_batch_group,
-            (parent["id"], child_job_map, max_parallel),
-            requested_slots=1,
+            (parent["id"], child_job_map, effective_parallel),
+            requested_slots=effective_parallel,
         )
         return self.get_task(parent["id"]) or parent
 
@@ -826,6 +924,10 @@ class TaskManager:
         self.append_log(parent_id, "[SAFE] 启动新子进程前检查 CPU/内存/磁盘，真正接近危险阈值时才暂停补位。")
 
         job_items = list(child_job_map.items())
+        child_label_map: Dict[str, str] = {
+            child_id: str((job or {}).get("label") or child_id)
+            for child_id, job in job_items
+        }
         next_index = 0
         failures = 0
         done = 0
@@ -900,11 +1002,22 @@ class TaskManager:
                         return_code = task.get("return_code")
                         if status != "success":
                             failures += 1
+                            self._append_child_failure_to_parent(
+                                parent_id,
+                                child_id,
+                                child_label_map.get(child_id, child_id),
+                            )
                         self.append_log(parent_id, f"[INFO] 子任务完成: {child_id}, 状态={status}, return_code={return_code}")
                     except Exception as e:
                         failures += 1
                         self.append_log(parent_id, f"[ERROR] 子任务异常: {child_id} -> {repr(e)}")
                         self.append_log(parent_id, traceback.format_exc())
+                        if child_id:
+                            self._append_child_failure_to_parent(
+                                parent_id,
+                                child_id,
+                                child_label_map.get(child_id, child_id),
+                            )
 
                     done += 1
                     self.update_task(parent_id, parallel_done=done, parallel_failed=failures)
@@ -1160,7 +1273,7 @@ class TaskManager:
             max_workers=max_workers,
         )
 
-        self.append_log(parent_id, f"[PARALLEL] 并行任务启动：总任务数={total}，用户选择并行数={max_workers}")
+        self.append_log(parent_id, f"[PARALLEL] 并行任务启动：总任务数={total}，实际并行数={max_workers}")
         self.append_log(parent_id, "[POOL] 稳定进程池：最多同时运行 max_workers 个子任务；一个完成后补一个；检测到高负载时先等已有子任务完成，再决定是否补位。")
         self.append_log(parent_id, "[SAFE] 不再按模型文件大小直接降为 1；启动新子进程前检查 CPU/内存/磁盘，真正接近危险阈值时才暂停补位。")
 
@@ -1264,6 +1377,8 @@ class TaskManager:
                         child_id, status = result if result else (None, "cancelled")
                         if status != "success":
                             failures += 1
+                            if child_id:
+                                self._append_child_failure_to_parent(parent_id, child_id, label)
                         progress["done"] += 1
                         progress["failed"] = failures
                         self.update_task(parent_id, parallel_done=progress["done"], parallel_failed=progress["failed"])
