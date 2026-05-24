@@ -77,7 +77,7 @@ const emptyModuleForm = {
 const cppExecutableModuleTemplate = {
   module_id: 'my_executable_module',
   module_name: '我的可执行模块',
-  tool_type: 'cloud',
+  tool_type: '云反演',
   runtime: 'executable',
   entry_file: 'MyExecutableModule.exe',
   source_dir: '.',
@@ -106,7 +106,7 @@ function getCppExecutableModuleTemplateText() {
 const pythonModuleConfigTemplate = {
   module_id: 'H8_CLOUD_TYPE',
   module_name: '葵花8号云类型反演',
-  tool_type: 'cloud',
+  tool_type: '云反演',
   entry_file: 'CM_CTH.py',
   source_dir: '.',
   param_json_path: 'config.json',
@@ -224,9 +224,13 @@ function normalize(v) {
   return String(v || '').toLowerCase();
 }
 
-// 默认工具栏由后端首次初始化 toolbars.json 时提供。
-// 前端不再强制追加 cloud/aerosol，避免删除后又在页面上复活。
-const DEFAULT_TOOLBARS = [];
+// 固定业务工具栏：云反演 / 气溶胶反演不再依赖后端 toolbars.json。
+// 即使当前没有任何模块，刷新后顶部按钮也必须保留。
+const FIXED_TOOLBARS = [
+  { key: '云反演', label: '云反演', system: true },
+  { key: '气溶胶反演', label: '气溶胶反演', system: true },
+];
+const DEFAULT_TOOLBARS = FIXED_TOOLBARS;
 const ACTIVE_TAB_STORAGE_KEY = 'local_web_active_tab';
 
 function getSavedActiveTab() {
@@ -252,7 +256,7 @@ function clearSavedActiveTab() {
 }
 
 function getDefaultActiveTabForRole(role) {
-  return role === 'admin' ? 'module_mgmt' : 'tool:cloud';
+  return role === 'admin' ? 'module_mgmt' : 'tool:云反演';
 }
 
 function getFirstActiveTabForUser(user) {
@@ -260,11 +264,35 @@ function getFirstActiveTabForUser(user) {
   if (saved) return saved;
   return getDefaultActiveTabForRole(user?.role);
 }
+const TOOL_TYPE_LABELS = {
+  cloud: '云反演',
+  云: '云反演',
+  云反演: '云反演',
+  aerosol: '气溶胶反演',
+  aod: '气溶胶反演',
+  气溶胶: '气溶胶反演',
+  气溶胶反演: '气溶胶反演',
+};
+
+function canonicalToolType(v) {
+  const raw = String(v || '').trim();
+  if (!raw) return '';
+  const compact = raw.replace(/[_\-\s]+/g, '').toLowerCase();
+  return TOOL_TYPE_LABELS[compact] || raw;
+}
+
 function normalizeToolKey(v) {
-  return String(v || '')
+  return canonicalToolType(v)
     .trim()
     .replace(/\.\./g, '_')
     .replace(/[\\/\s]+/g, '_');
+}
+
+function toolSortRank(key) {
+  const normalized = normalizeToolKey(key);
+  if (normalized === '云反演') return 0;
+  if (normalized === '气溶胶反演') return 1;
+  return 2;
 }
 
 function guessToolType(module) {
@@ -273,13 +301,13 @@ function guessToolType(module) {
 
   const text = `${normalize(module?.id)} ${normalize(module?.name)} ${normalize(module?.description)} ${normalize((module?.tags || []).join(' '))}`;
 
-  if (['aod', 'aerosol', '气溶胶', 'h8', 'polar', '偏振'].some((x) => text.includes(x))) {
-    return 'aerosol';
+  if (['aod', 'aerosol', '气溶胶', 'polar', '偏振'].some((x) => text.includes(x))) {
+    return '气溶胶反演';
   }
-  if (['cloud', '云', 'cloud_type', 'cth'].some((x) => text.includes(x))) {
-    return 'cloud';
+  if (['cloud', '云', 'cloud_type', 'cth', 'h8'].some((x) => text.includes(x))) {
+    return '云反演';
   }
-  return 'cloud';
+  return '云反演';
 }
 
 function getModuleToolType(module) {
@@ -435,17 +463,36 @@ function pickModuleExtraFields(module) {
 
 function uniqToolbars(toolbars, modules) {
   const map = new Map();
+
+  // 先写入固定工具栏，保证刷新、无模块、后端 toolbars.json 为空时也不会消失。
+  FIXED_TOOLBARS.forEach((t) => {
+    const key = normalizeToolKey(t.key || t.label);
+    if (key) {
+      map.set(key, { key, label: canonicalToolType(t.label || key), system: true, fixed: true });
+    }
+  });
+
+  // 再合并后端返回的工具栏。cloud/aerosol 会统一归一化成中文，不会生成重复按钮。
   (toolbars || []).forEach((t) => {
     const key = normalizeToolKey(t.key || t.label);
-    if (key) map.set(key, { key, label: t.label || key, system: !!t.system });
+    if (!key) return;
+    const label = canonicalToolType(t.label || key);
+    if (map.has(key)) {
+      map.set(key, { ...map.get(key), label, system: true, fixed: true });
+    } else {
+      map.set(key, { key, label, system: !!t.system, fixed: false });
+    }
   });
+
+  // 最后根据已安装模块补充工具栏。即使没有模块，固定的两个工具栏也保留。
   (modules || []).forEach((m) => {
     const key = getModuleToolType(m);
-    if (key && !map.has(key)) map.set(key, { key, label: key, system: false });
+    if (key && !map.has(key)) map.set(key, { key, label: key, system: false, fixed: false });
   });
+
   return Array.from(map.values()).sort((a, b) => {
-    const aw = a.key === 'cloud' ? 0 : a.key === 'aerosol' ? 1 : 2;
-    const bw = b.key === 'cloud' ? 0 : b.key === 'aerosol' ? 1 : 2;
+    const aw = toolSortRank(a.key);
+    const bw = toolSortRank(b.key);
     if (aw !== bw) return aw - bw;
     return String(a.label).localeCompare(String(b.label), 'zh-CN');
   });
@@ -1483,7 +1530,7 @@ export default function App() {
 
   const [activeTab, setActiveTab] = useState(() => getSavedActiveTab() || 'module_mgmt');
   const [activeModuleByTool, setActiveModuleByTool] = useState({});
-  const [expandedToolTypes, setExpandedToolTypes] = useState({ cloud: true, aerosol: true });
+  const [expandedToolTypes, setExpandedToolTypes] = useState({ 云反演: true, 气溶胶反演: true });
   const [cloudForms, setCloudForms] = useState({});
 
   const [runtimeForms, setRuntimeForms] = useState({});
@@ -1559,11 +1606,7 @@ export default function App() {
       arr.push({ key: 'module_mgmt', label: '模块管理' });
     }
 
-    const toolRank = (key) => {
-      if (key === 'cloud') return 0;
-      if (key === 'aerosol') return 1;
-      return 2;
-    };
+    const toolRank = (key) => toolSortRank(key);
 
     [...visibleToolbars]
       .sort((a, b) => {
@@ -1658,8 +1701,8 @@ useEffect(() => {
     const key = activeTab.slice('tool:'.length);
 
     if (!hasTool(key)) {
-      const fallback = hasTool('cloud')
-        ? 'tool:cloud'
+      const fallback = hasTool('云反演')
+        ? 'tool:云反演'
         : firstKey
           ? `tool:${firstKey}`
           : 'tasks';
@@ -2365,8 +2408,6 @@ function addTaskWindow(task, title) {
       alert(e?.message || '运行失败');
     }
   }
-
-
 
   function fillModuleForm(module) {
     setEditingModuleId(module.id);
@@ -4664,7 +4705,7 @@ function renderTaskManagementPage() {
               <code>{dropInfo.drop_dir || '项目根目录/module_drop'}</code>
             </p>
             <ol>
-              <li>在 executable_module.json 里填写 tool_type，例如 cloud 或 aerosol。</li>
+              <li>在 executable_module.json 里填写 tool_type，例如 云反演 或 气溶胶反演。</li>
               <li>把可执行模块 zip 直接放进这个目录，不需要在网页里选择文件。</li>
               <li>点击“扫描本地目录安装”，后端会先校验 executable_module.json/config.json 和缺失文件，再安装通过的 zip。</li>
               <li>系统会把 dependency_dirs、dependency_search_dirs 和 runtime_env_path 加入运行 PATH，并可尝试识别 DLL。</li>

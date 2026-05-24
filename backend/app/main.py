@@ -223,9 +223,45 @@ DEFAULT_PARALLEL_PATTERNS = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
 # 初始默认工具栏。现在云反演 / 气溶胶反演也按普通动态工具栏处理，
 # 只在第一次创建 toolbars.json 时写入；之后不会强制重新合并回来。
 DEFAULT_TOOLBARS = [
-    {"key": "cloud", "label": "云反演", "system": False},
-    {"key": "aerosol", "label": "气溶胶反演", "system": False},
+    {"key": "云反演", "label": "云反演", "system": False},
+    {"key": "气溶胶反演", "label": "气溶胶反演", "system": False},
 ]
+
+TOOL_TYPE_ALIASES = {
+    "cloud": "云反演",
+    "云": "云反演",
+    "云反演": "云反演",
+    "aerosol": "气溶胶反演",
+    "aod": "气溶胶反演",
+    "气溶胶": "气溶胶反演",
+    "气溶胶反演": "气溶胶反演",
+}
+
+def canonical_tool_type(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    compact = "".join(raw.replace("_", " ").replace("-", " ").split()).lower()
+    return TOOL_TYPE_ALIASES.get(compact, raw)
+
+def tool_sort_rank(key: str) -> int:
+    key = canonical_tool_type(key)
+    if key == "云反演":
+        return 0
+    if key == "气溶胶反演":
+        return 1
+    return 2
+
+def cfg_get_alias(cfg: dict, *names: str, default=None):
+    """读取 module 配置字段，兼容 module_id / module id / module-id 三种写法。"""
+    if not isinstance(cfg, dict):
+        return default
+    for name in names:
+        candidates = [name, name.replace("_", " "), name.replace("_", "-")]
+        for candidate in candidates:
+            if candidate in cfg:
+                return cfg.get(candidate)
+    return default
 
 def to_project_relative_path(path: Path) -> str:
     """
@@ -278,7 +314,8 @@ def resolve_packaged_module_path(raw_value: str, module_id: str, target_dir: Pat
     # working_dir 是绝对路径时，最后兜底用模块根目录
     return default_path
 def normalize_tool_key(value: str) -> str:
-    """把工具栏 key 规范化，允许中文名称，但过滤路径和分隔符。"""
+    """把工具类型规范化。现在内置工具类型统一使用中文：云反演 / 气溶胶反演。"""
+    value = canonical_tool_type(value)
     value = (value or "").strip()
     if not value:
         return ""
@@ -328,7 +365,7 @@ def load_toolbars() -> List[dict]:
         }
 
     result = list(merged.values())
-    result.sort(key=lambda x: (0 if x.get("key") in {"cloud", "aerosol"} else 1, x.get("label", "")))
+    result.sort(key=lambda x: (tool_sort_rank(x.get("key", "")), x.get("label", "")))
     return result
 
 def save_toolbars(toolbars: List[dict]):
@@ -472,7 +509,7 @@ def delete_toolbar(key: str) -> dict:
     }
 
 def ensure_toolbar_exists(key: str, label: str | None = None):
-    key = normalize_tool_key(key) or "cloud"
+    key = normalize_tool_key(key) or "云反演"
     toolbars = load_toolbars()
     if any(t.get("key") == key for t in toolbars):
         return
@@ -495,11 +532,11 @@ def guess_module_tool_type(module: dict) -> str:
         ]
     ).lower()
 
-    if any(k in text for k in ["aod", "aerosol", "气溶胶", "h8", "polar", "偏振"]):
-        return "aerosol"
-    if any(k in text for k in ["cloud", "云", "cloud_type", "cth"]):
-        return "cloud"
-    return "cloud"
+    if any(k in text for k in ["aod", "aerosol", "气溶胶", "polar", "偏振"]):
+        return "气溶胶反演"
+    if any(k in text for k in ["cloud", "云", "cloud_type", "cth", "h8"]):
+        return "云反演"
+    return "云反演"
 
 
 def normalize_parallel_config(module: dict) -> dict:
@@ -1309,7 +1346,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
     return task
 def upsert_module(module_data: dict):
     module_data = normalize_module_record(module_data)
-    ensure_toolbar_exists(module_data.get("tool_type") or "cloud")
+    ensure_toolbar_exists(module_data.get("tool_type") or "云反演")
     modules = load_modules()
     found = False
     for i, module in enumerate(modules):
@@ -1333,10 +1370,160 @@ def _is_path_inside(child: Path, parent: Path) -> bool:
         return False
 
 
+
+def _make_path_writable(path: Path):
+    '''把文件/目录改成可写，解决 Windows 只读文件导致的删除失败。'''
+    try:
+        if path.exists():
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+    except Exception:
+        pass
+
+
+def _rmtree_onerror(func, path, exc_info):
+    '''shutil.rmtree 的 Windows 兜底：先改权限，再重试一次。'''
+    try:
+        target = Path(path)
+        _make_path_writable(target)
+        func(path)
+    except Exception:
+        pass
+
+
+def _stop_tracked_module_tasks(module_id: str) -> list[str]:
+    '''删除模块前，先取消调度器里属于该模块的 running/queued 任务。'''
+    stopped: list[str] = []
+    try:
+        lock = getattr(task_manager, "lock", None)
+        if lock is None:
+            return stopped
+        with lock:
+            tasks = getattr(task_manager, "tasks", {}) or {}
+            processes = getattr(task_manager, "processes", {}) or {}
+            cancel_flags = getattr(task_manager, "cancel_flags", None)
+
+            for task_id, task in list(tasks.items()):
+                if not isinstance(task, dict):
+                    continue
+                if str(task.get("module_id") or "") != str(module_id):
+                    continue
+                if task.get("status") in {"running", "queued"}:
+                    task["status"] = "cancelled"
+                    task["ended_at"] = now_iso()
+                    task.setdefault("logs", []).append("[SYSTEM] 删除模块前已自动取消该模块任务")
+                    stopped.append(str(task_id))
+                    if cancel_flags is not None:
+                        try:
+                            cancel_flags.add(str(task_id))
+                        except Exception:
+                            pass
+
+                proc = processes.get(str(task_id))
+                if proc is not None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    try:
+                        processes.pop(str(task_id), None)
+                    except Exception:
+                        pass
+        try:
+            task_manager._save_tasks()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return stopped
+
+
+def _stop_processes_from_dir(target_dir: Path) -> list[str]:
+    '''Windows 下按 ExecutablePath 精确终止正在从模块目录运行的 exe，避免 AOD_AHI.exe 被占用无法删除。'''
+    killed: list[str] = []
+    if os.name != "nt":
+        return killed
+
+    root = str(target_dir.resolve())
+    # 用 PowerShell 按进程 ExecutablePath 前缀匹配，尽量只杀当前模块目录里的进程，不误杀其它同名 exe。
+    ps_script = rf'''
+$root = {json.dumps(root)}
+$rootLower = $root.ToLower()
+Get-CimInstance Win32_Process | Where-Object {{
+    $_.ExecutablePath -and $_.ExecutablePath.ToLower().StartsWith($rootLower)
+}} | ForEach-Object {{
+    try {{
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+        Write-Output ($_.ProcessId.ToString() + "|" + $_.Name + "|" + $_.ExecutablePath)
+    }} catch {{
+        Write-Output ("FAILED|" + $_.ProcessId.ToString() + "|" + $_.Name + "|" + $_.ExecutablePath + "|" + $_.Exception.Message)
+    }}
+}}
+'''
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=10,
+            shell=False,
+        )
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if line:
+                killed.append(line)
+    except Exception:
+        pass
+
+    return killed
+
+
+def _delete_with_retry(path: Path) -> dict:
+    '''删除文件/目录，处理 Windows 文件占用释放慢的问题。'''
+    path = path.resolve()
+    if not path.exists():
+        return {"path": str(path), "status": "missing"}
+
+    last_error: Exception | None = None
+    for attempt in range(1, 6):
+        try:
+            if path.is_dir():
+                # 先把目录树里的文件尽量改成可写。
+                for item in path.rglob("*"):
+                    _make_path_writable(item)
+                _make_path_writable(path)
+                shutil.rmtree(path, onerror=_rmtree_onerror)
+            else:
+                _make_path_writable(path)
+                path.unlink()
+            return {"path": str(path), "status": "deleted", "attempts": attempt}
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.4 * attempt)
+
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            f"删除模块本地文件失败: {path}，原因: {last_error}。"
+            "如果提示 WinError 32，说明 exe 或资源文件仍被进程占用。"
+            "请先停止该模块任务，或在任务管理器结束对应 exe 后重试。"
+        ),
+    )
+
+
 def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
-    """
+    '''
     只允许删除指定安全目录下的文件或文件夹。
-    """
+    删除前会尝试停止从该目录启动的 native exe，解决 Windows 下 AOD_AHI.exe 被占用无法删除的问题。
+    '''
     path = path.resolve()
 
     if not path.exists():
@@ -1351,31 +1538,22 @@ def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
             detail=f"拒绝删除非模块目录路径: {path}",
         )
 
-    try:
-        if path.is_dir():
-            shutil.rmtree(path, ignore_errors=False)
-        else:
-            path.unlink()
-
-        return {
-            "path": str(path),
-            "status": "deleted",
-        }
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"删除模块本地文件失败: {path}，原因: {exc}",
-        )
+    killed = _stop_processes_from_dir(path)
+    result = _delete_with_retry(path)
+    if killed:
+        result["killed_processes"] = killed
+    return result
 
 
 def remove_module(module_id: str) -> dict:
-    """
+    '''
     删除模块：
-    1. 从 modules.json 移除模块记录；
-    2. 删除 backend/installed_modules/{module_id}；
-    3. 删除 backend/module_envs/{module_id}；
-    4. 不删除任务记录、不删除数据管理中的输出结果文件。
-    """
+    1. 取消该模块正在运行/排队的任务；
+    2. 终止从模块安装目录启动的 exe 进程；
+    3. 删除 backend/installed_modules/{module_id}；
+    4. 删除 backend/module_envs/{module_id}；
+    5. 从 modules.json 移除模块记录。
+    '''
     modules = load_modules()
 
     target_module = None
@@ -1405,27 +1583,25 @@ def remove_module(module_id: str) -> dict:
         PYTHON_MODULE_ENVS_DIR,
     ]
 
+    cancelled_tasks = _stop_tracked_module_tasks(module_id)
+
+    # 再额外终止模块安装目录下运行的 native exe。这个能处理 AOD_AHI.exe 仍在占用自身文件的问题。
+    killed_processes = _stop_processes_from_dir(installed_dir)
+    time.sleep(0.8)
+
     deleted_paths = []
+    deleted_paths.append(_remove_path_safely(installed_dir, allowed_roots))
+    deleted_paths.append(_remove_path_safely(env_dir, allowed_roots))
 
-    # 删除模块安装目录：backend/installed_modules/{module_id}
-    deleted_paths.append(
-        _remove_path_safely(installed_dir, allowed_roots)
-    )
-
-    # 删除 Python 独立环境目录：backend/module_envs/{module_id}
-    deleted_paths.append(
-        _remove_path_safely(env_dir, allowed_roots)
-    )
-
-    # 本地文件删除成功后，再删除 modules.json 中的记录
     save_modules(new_modules)
 
     return {
         "removed": True,
         "module_id": module_id,
+        "cancelled_tasks": cancelled_tasks,
+        "killed_processes": killed_processes,
         "deleted_paths": deleted_paths,
     }
-
 
 def format_command(template: List[str], values: Dict[str, Any]) -> List[str]:
     formatted = []
@@ -2006,21 +2182,19 @@ def load_python_module_config(raw_path: str) -> tuple[dict, Path]:
     # 2. 写在 module 下面：{"module": {...}}
     module_cfg = data.get("module") if isinstance(data.get("module"), dict) else data
 
-    module_id = str(module_cfg.get("module_id") or module_cfg.get("id") or "").strip()
-    module_name = str(module_cfg.get("module_name") or module_cfg.get("name") or "").strip()
-    source_dir_raw = str(module_cfg.get("source_dir") or module_cfg.get("python_source_dir") or "").strip()
-    entry_file = str(module_cfg.get("entry_file") or "main.py").strip()
-    tool_type = str(module_cfg.get("tool_type") or "").strip()
+    module_id = str(cfg_get_alias(module_cfg, "module_id", "id", default="") or "").strip()
+    module_name = str(cfg_get_alias(module_cfg, "module_name", "name", default="") or "").strip()
+    source_dir_raw = str(cfg_get_alias(module_cfg, "source_dir", "python_source_dir", default="") or "").strip()
+    entry_file = str(cfg_get_alias(module_cfg, "entry_file", default="main.py") or "main.py").strip()
+    tool_type = str(cfg_get_alias(module_cfg, "tool_type", default="") or "").strip()
     description = str(module_cfg.get("description") or "").strip()
     python_executable = str(
-        module_cfg.get("python_executable")
-        or module_cfg.get("python")
-        or module_cfg.get("python_path")
+        cfg_get_alias(module_cfg, "python_executable", "python", "python_path", default="")
         or ""
     ).strip()
 
     python_env_mode = str(
-        module_cfg.get("python_env_mode")
+        cfg_get_alias(module_cfg, "python_env_mode", default="")
         or module_cfg.get("env_mode")
         or "create_venv"
     ).strip().lower() or "create_venv"
@@ -2271,7 +2445,7 @@ def install_python_venv_module_from_values(
         }
 
         selected_tool_type = (
-            normalize_tool_key(tool_type or "")
+            normalize_tool_key(module_data.get("tool_type") or tool_type or "")
             or guess_module_tool_type(module_data)
         )
 
@@ -2957,14 +3131,14 @@ def _is_unified_executable_config(module_data: dict, config_path: Path | None = 
     if not isinstance(module_data, dict):
         return False
     cfg = module_data.get("module") if isinstance(module_data.get("module"), dict) else module_data
-    runtime = str(cfg.get("runtime") or cfg.get("runtime_type") or "").strip().lower()
+    runtime = str(cfg_get_alias(cfg, "runtime", "runtime_type", default="") or "").strip().lower()
     if runtime in {"executable", "native_executable", "exe_module", "binary_executable"}:
         return True
     # 新版字段：module_id + entry_file + param_json_path/source_dir
     return bool(
-        (cfg.get("module_id") or cfg.get("module_name") or cfg.get("entry_file"))
-        and not cfg.get("command_template")
-        and not cfg.get("inputs")
+        (cfg_get_alias(cfg, "module_id", "module_name", "entry_file"))
+        and not cfg_get_alias(cfg, "command_template")
+        and not cfg_get_alias(cfg, "inputs")
     )
 
 
@@ -2982,10 +3156,10 @@ def _normalize_unified_executable_config(module_root: Path, raw_data: dict, repo
     """把新版可执行模块配置转换成系统内部 Module 记录。\n\n    新版输入方式与 Python 源码模块一致：\n    - executable_module.json / module.json 只描述模块基本信息和运行环境路径；\n    - config.json 描述用户输入参数，系统自动识别输入/输出表单；\n    - 运行时统一执行：entry_file config.json。\n    """
     cfg = raw_data.get("module") if isinstance(raw_data.get("module"), dict) else raw_data
 
-    module_id = str(cfg.get("module_id") or cfg.get("id") or "").strip()
-    module_name = str(cfg.get("module_name") or cfg.get("name") or "").strip()
-    source_dir_raw = str(cfg.get("source_dir") or ".").strip() or "."
-    entry_file = str(cfg.get("entry_file") or cfg.get("entry") or cfg.get("executable") or "").strip()
+    module_id = str(cfg_get_alias(cfg, "module_id", "id", default="") or "").strip()
+    module_name = str(cfg_get_alias(cfg, "module_name", "name", default="") or "").strip()
+    source_dir_raw = str(cfg_get_alias(cfg, "source_dir", default=".") or ".").strip() or "."
+    entry_file = str(cfg_get_alias(cfg, "entry_file", "entry", "executable", default="") or "").strip()
     description = str(cfg.get("description") or "").strip()
 
     if not module_id:
@@ -3017,7 +3191,7 @@ def _normalize_unified_executable_config(module_root: Path, raw_data: dict, repo
     if isinstance(param_template, dict):
         param_json = param_template
     else:
-        param_json_raw = str(cfg.get("param_json_path") or cfg.get("config_json") or "config.json").strip() or "config.json"
+        param_json_raw = str(cfg_get_alias(cfg, "param_json_path", "config_json", default="config.json") or "config.json").strip() or "config.json"
         param_json_path = _resolve_module_reference(source_dir, param_json_raw, module_id, source_dir)
         if not param_json_path.exists() or not param_json_path.is_file():
             _add_error(report, "param_json_path", f"参数 JSON 文件不存在：{param_json_raw}", "在模块文件夹中放置 config.json，或修改 param_json_path。")
@@ -3035,7 +3209,7 @@ def _normalize_unified_executable_config(module_root: Path, raw_data: dict, repo
         inputs = infer_inputs_from_param_json(param_json)
 
     selected_tool_type = (
-        normalize_tool_key(tool_type or cfg.get("tool_type") or "")
+        normalize_tool_key(cfg_get_alias(cfg, "tool_type", default="") or tool_type or "")
         or guess_module_tool_type({"id": module_id, "name": module_name, "description": description, "tags": cfg.get("tags") or []})
     )
 
@@ -3044,11 +3218,7 @@ def _normalize_unified_executable_config(module_root: Path, raw_data: dict, repo
     dependency_search_dirs = _as_str_list(cfg.get("dependency_search_dirs"), [])
 
     runtime_env_path = str(
-        cfg.get("runtime_env_path")
-        or cfg.get("environment_path")
-        or cfg.get("env_path")
-        or cfg.get("runtime_path")
-        or ""
+        cfg_get_alias(cfg, "runtime_env_path", "environment_path", "env_path", "runtime_path", default="") or ""
     ).strip()
     if runtime_env_path:
         runtime_env_dirs = _as_str_list(runtime_env_path, [])
@@ -3473,7 +3643,7 @@ def validate_cpp_module_folder(folder_path: Path, tool_type: str | None = None, 
             module_data = normalized
     else:
         selected_tool_type = (
-            normalize_tool_key(tool_type or module_data.get("tool_type") or "")
+            normalize_tool_key(module_data.get("tool_type") or tool_type or "")
             or guess_module_tool_type(module_data)
         )
         module_data["tool_type"] = selected_tool_type
@@ -3569,7 +3739,7 @@ def install_uploaded_zip(zip_path: Path, tool_type: str | None = None, collect_d
         module_data = validation["module"]
         module_root = Path(validation["module_root"])
         selected_tool_type = (
-            normalize_tool_key(tool_type or module_data.get("tool_type") or "")
+            normalize_tool_key(module_data.get("tool_type") or tool_type or "")
             or guess_module_tool_type(module_data)
         )
         module_data["tool_type"] = selected_tool_type
@@ -3906,7 +4076,7 @@ def install_module_from_folder(
     module_data = validation["module"]
     module_root = Path(validation["module_root"])
     selected_tool_type = (
-        normalize_tool_key(tool_type or module_data.get("tool_type") or "")
+        normalize_tool_key(module_data.get("tool_type") or tool_type or "")
         or guess_module_tool_type(module_data)
     )
     module_data["tool_type"] = selected_tool_type
@@ -4055,7 +4225,7 @@ def api_upload_python_module(
             }
 
         selected_tool_type = (
-            normalize_tool_key(tool_type or module_data.get("tool_type") or "")
+            normalize_tool_key(module_data.get("tool_type") or tool_type or "")
             or guess_module_tool_type(module_data)
         )
 
@@ -4373,7 +4543,7 @@ def api_upload_module_zip(
 ):
     require_admin(authorization)
 
-    selected_tool_type = normalize_tool_key(tool_type) or "cloud"
+    selected_tool_type = normalize_tool_key(tool_type) or "云反演"
     ensure_toolbar_exists(selected_tool_type)
 
     suffix = Path(file.filename or "module.zip").suffix or ".zip"
@@ -4536,7 +4706,7 @@ def api_install_modules_from_local_drop(
     require_admin(authorization)
     MODULE_DROP_DIR.mkdir(parents=True, exist_ok=True)
 
-    selected_tool_type = normalize_tool_key(payload.tool_type) or "cloud"
+    selected_tool_type = normalize_tool_key(payload.tool_type) or "云反演"
     ensure_toolbar_exists(selected_tool_type)
 
     if payload.filename:
