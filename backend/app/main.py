@@ -4768,6 +4768,41 @@ def unique_chunk_filename(src: Path, used: set[str]) -> str:
         idx += 1
 
 
+def is_parasol_jd_pair_module(module: dict) -> bool:
+    """PARASOL AOD 专用：目录里 JD/JL 成对出现，但 exe 只需要传 JD 文件。
+
+    只对 PARASOL 模块启用，避免影响其它模块的普通文件夹并行逻辑。
+    """
+    tags = module.get("tags") or []
+    text = " ".join([
+        str(module.get("id") or ""),
+        str(module.get("name") or ""),
+        str(module.get("description") or ""),
+        str(module.get("executable") or module.get("entry") or ""),
+        " ".join(str(x) for x in tags),
+    ]).lower()
+    return "parasol" in text
+
+
+def is_parasol_jd_input_file(path: Path) -> bool:
+    """识别 PARASOL 主输入 JD 文件。
+
+    示例：P3L1TBG1017047JD_n45_00_N35_00_e115_00_E125_00
+    配套 JL 文件会由算法/exe 自己按文件名匹配，不应单独生成任务。
+    """
+    name = path.name.upper()
+    return bool(re.search(r"JD(?=[_.-])", name))
+
+
+def filter_parasol_jd_files_for_jobs(module: dict, files: list[Path]) -> list[Path]:
+    if not is_parasol_jd_pair_module(module):
+        return files
+
+    jd_files = [item for item in files if is_parasol_jd_input_file(item)]
+    # 只有在确实识别到 JD 文件时才过滤；否则保持原逻辑，避免误伤其它 PARASOL 变体数据。
+    return jd_files or files
+
+
 def is_probably_dir_output(module: dict, output_key: str, output_value: str) -> bool:
     meta = field_meta(module, output_key)
     k = output_key.lower()
@@ -4854,6 +4889,8 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
 
     patterns = parse_parallel_patterns(normalize_parallel_config(module).get("file_patterns"))
     files = discover_batch_files(str(input_value), patterns)
+    files_before_parasol_filter = len(files)
+    files = filter_parasol_jd_files_for_jobs(module, files)
     if not files:
         raise HTTPException(status_code=400, detail=f"未匹配到可并行处理的文件，匹配规则: {';'.join(patterns)}")
 
@@ -4913,6 +4950,8 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
 
             job_inputs = dict(inputs)
             job_inputs[input_key] = str(chunk_dir.resolve())
+            if is_parasol_jd_pair_module(module) and files_before_parasol_filter != len(files):
+                job_inputs["_parasol_jd_filter"] = f"目录中共 {files_before_parasol_filter} 个文件，仅 JD 主输入生成 {len(files)} 个任务；JL 文件由模块自动匹配"
             job_inputs["_parallel_workers"] = 1
             job_inputs["_parallel_index"] = idx
             job_inputs["_parallel_total"] = len(job_units)
@@ -5332,6 +5371,14 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
     used_by_role: dict[str, set[str]] = {role: set() for role in role_files}
 
     primary_files = role_files[primary_role]
+    primary_files_before_parasol_filter = len(primary_files)
+    primary_files = filter_parasol_jd_files_for_jobs(module, primary_files)
+    if not primary_files:
+        raise HTTPException(
+            status_code=400,
+            detail="PARASOL 输入目录中没有识别到 JD 主输入文件，无法生成任务。请检查文件名是否包含 JD_。",
+        )
+    role_files[primary_role] = primary_files
     total = len(primary_files)
 
     for idx, primary_path in enumerate(primary_files, start=1):
@@ -5402,11 +5449,16 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
         job_inputs["_batch_index"] = idx
         job_inputs["_batch_total"] = total
         job_inputs["_batch_slot"] = slot
+        if is_parasol_jd_pair_module(module) and primary_files_before_parasol_filter != len(primary_files):
+            job_inputs["_parasol_jd_filter"] = (
+                f"目录中共 {primary_files_before_parasol_filter} 个文件，仅 JD 主输入生成 {len(primary_files)} 个任务；"
+                "JL 文件由模块自动匹配"
+            )
 
         # 不把平台内部字段写给 exe，除非模块显式要求。
         exe_inputs = {
             k: v for k, v in job_inputs.items()
-            if not str(k).startswith("_batch_")
+            if not (str(k).startswith("_batch_") or str(k).startswith("_parasol_"))
         }
 
         command, working_dir, runtime_env = build_runtime_for_module(module, exe_inputs)
