@@ -1993,6 +1993,24 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
 
     command = format_command(command_template, values)
 
+    # 兼容修复：旧版/误装的可执行模块记录可能把 command_template 保存成
+    # ["{executable}", "{executable}", "{config_json}"]，导致实际命令变成：
+    #   AOD_AHI.exe AOD_AHI.exe config.json
+    # 这类新版“像 Python 一样传 config.json”的 exe 只需要：
+    #   AOD_AHI.exe config.json
+    # 因此在真正启动前去掉重复的第二个 executable。这样不用重新安装旧模块也能生效。
+    try:
+        if len(command) >= 2:
+            first_norm = os.path.normcase(os.path.abspath(str(command[0])))
+            second_norm = os.path.normcase(os.path.abspath(str(command[1])))
+            exe_norm = os.path.normcase(os.path.abspath(str(exe_path)))
+            if first_norm == second_norm == exe_norm:
+                command = [command[0]] + command[2:]
+                runtime_env["LOCAL_WEB_COMMAND_DEDUPED"] = "1"
+                runtime_env["LOCAL_WEB_COMMAND_DEDUPED_REASON"] = "removed duplicated executable argument"
+    except Exception:
+        pass
+
     # 强制 cwd 为模块目录
     return command, str(module_dir), runtime_env
 def build_python_source_to_exe(
@@ -5717,6 +5735,97 @@ def _make_batch_output_value(module: dict, base_inputs: dict, slot: str, primary
     return job_inputs, out_path.resolve()
 
 
+
+def _is_h8aod_executable_module(module: dict) -> bool:
+    """判断是否为 H8 AOD 的 AOD_AHI.exe 模块。只对这个模块做字段名兼容。"""
+    text = " ".join(str(x or "") for x in [
+        module.get("id"),
+        module.get("module_id"),
+        module.get("name"),
+        module.get("module_name"),
+        module.get("description"),
+        module.get("executable"),
+        module.get("entry"),
+        module.get("entry_file"),
+    ]).lower()
+    return ("h8aod" in text) or ("aod_ahi" in text) or ("h8 aod" in text)
+
+
+def _find_first_resource_file(module_dir: Path, patterns: list[str]) -> Optional[Path]:
+    """在模块目录和 resources 目录下按模式找第一个固定资源文件。"""
+    search_roots = []
+    try:
+        search_roots.append(module_dir)
+        resources_dir = module_dir / "resources"
+        if resources_dir.exists() and resources_dir.is_dir():
+            search_roots.insert(0, resources_dir)
+    except Exception:
+        search_roots = [module_dir]
+
+    for root in search_roots:
+        try:
+            for pattern in patterns:
+                matches = sorted([x for x in root.rglob(pattern) if x.is_file()])
+                if matches:
+                    return matches[0].resolve()
+        except Exception:
+            continue
+    return None
+
+
+def _normalize_h8aod_config_for_exe(module: dict, job_inputs: dict) -> dict:
+    """把旧界面里 B01_dir/B03_dir/B06_dir/SOLAR_dir/output_dir 转成 AOD_AHI.exe 需要的字段。
+
+    AOD_AHI.exe 的 JSON 模式需要的是：
+    B01_file / B03_file / B06_file / SOLAR_file / GEO1_file / IGBP_file / LUT_file / DEM_file / OUT_file。
+    旧版页面为了让用户选择目录，字段叫 B01_dir/B03_dir/B06_dir/SOLAR_dir/output_dir。
+    批处理拆分后这些 *_dir 字段实际已经变成了单个文件路径，所以这里仅在运行 H8 AOD 时做一次字段映射。
+    """
+    if not _is_h8aod_executable_module(module):
+        return job_inputs
+
+    result = dict(job_inputs or {})
+
+    alias_map = {
+        "B01_dir": "B01_file",
+        "B03_dir": "B03_file",
+        "B06_dir": "B06_file",
+        "SOLAR_dir": "SOLAR_file",
+        "solar_dir": "SOLAR_file",
+        "output_dir": "OUT_file",
+        "out_dir": "OUT_file",
+        "outpath": "OUT_file",
+    }
+    for old_key, new_key in alias_map.items():
+        if new_key not in result and old_key in result and result.get(old_key) not in ("", None):
+            result[new_key] = result.get(old_key)
+
+    # 如果用户在 config.json 里已经写了固定资源字段，则优先使用用户值。
+    # 如果没写，就只对 H8 AOD 模块在 resources 中按常见文件名自动查找。
+    try:
+        module_dir = resolve_module_dir(module)
+    except Exception:
+        module_dir = Path(str(module.get("working_dir") or ".")).resolve()
+
+    auto_resources = {
+        "GEO1_file": ["*GEO1*", "*geo1*", "*GEO*", "*geo*"],
+        "IGBP_file": ["*IGBP*", "*igbp*"],
+        "LUT_file": ["*LUT*", "*lut*"],
+        "DEM_file": ["*DEM*", "*dem*"],
+    }
+    for key, patterns in auto_resources.items():
+        if result.get(key) not in ("", None):
+            continue
+        found = _find_first_resource_file(module_dir, patterns)
+        if found:
+            result[key] = str(found)
+
+    # 去掉旧字段，避免 exe 里做严格字段校验时受干扰。
+    for old_key in alias_map.keys():
+        result.pop(old_key, None)
+
+    return result
+
 def _format_batch_validation_error(message: str, missing: list[dict] | None = None, extras: list[dict] | None = None) -> str:
     parts = [message]
     if missing:
@@ -5870,6 +5979,11 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
             k: v for k, v in job_inputs.items()
             if not (str(k).startswith("_batch_") or str(k).startswith("_parasol_"))
         }
+
+        # H8 AOD 的 AOD_AHI.exe JSON 模式使用 *_file / OUT_file 字段，
+        # 但页面为了让用户选择目录，字段通常是 *_dir / output_dir。
+        # 批处理拆分后再统一转换，避免用户界面变复杂。
+        exe_inputs = _normalize_h8aod_config_for_exe(module, exe_inputs)
 
         command, working_dir, runtime_env = build_runtime_for_module(module, exe_inputs)
         jobs.append({
