@@ -224,6 +224,101 @@ function normalize(v) {
   return String(v || '').toLowerCase();
 }
 
+function containsChineseChar(value) {
+  return /[\u4e00-\u9fff]/.test(String(value ?? ''));
+}
+
+function isPathLikeKey(key) {
+  return /(path|dir|file|folder|executable|working_dir|source_dir|outpath|out_dir|output|input|config|runtime_env|python_executable|python_path)/i.test(String(key || ''));
+}
+
+function isPathLikeValue(value) {
+  const s = String(value ?? '').trim();
+  if (!s) return false;
+  return (
+    /^[A-Za-z]:[\\/]/.test(s) ||
+    s.startsWith('\\\\') ||
+    s.includes('\\') ||
+    s.includes('/') ||
+    s.startsWith('./') ||
+    s.startsWith('../') ||
+    s.startsWith('.\\') ||
+    s.startsWith('..\\')
+  );
+}
+
+function collectChinesePathItems(value, prefix = '路径') {
+  const items = [];
+
+  function walk(v, keyPath) {
+    if (v == null) return;
+
+    if (typeof v === 'string') {
+      const text = v.trim();
+      if (
+        text &&
+        containsChineseChar(text) &&
+        (isPathLikeValue(text) || isPathLikeKey(keyPath))
+      ) {
+        items.push({
+          field: keyPath || '路径',
+          path: text,
+        });
+      }
+      return;
+    }
+
+    if (Array.isArray(v)) {
+      v.forEach((item, index) => walk(item, `${keyPath}[${index}]`));
+      return;
+    }
+
+    if (typeof v === 'object') {
+      Object.entries(v).forEach(([key, item]) => {
+        const nextKey = keyPath ? `${keyPath}.${key}` : key;
+        walk(item, nextKey);
+      });
+    }
+  }
+
+  walk(value, prefix);
+  return items;
+}
+
+function showChinesePathWarning(items) {
+  if (!items.length) return false;
+
+  const lines = items.slice(0, 8).map((item, index) => {
+    return `${index + 1}. ${item.field}：${item.path}`;
+  });
+
+  const more = items.length > 8 ? `\n……还有 ${items.length - 8} 条中文路径` : '';
+
+  alert(
+    [
+      '检测到中文路径，当前系统暂不支持中文路径运行。',
+      '',
+      '为避免 netCDF4、xarray、GDAL、HDF5 等底层库读取失败，请把数据、模块和输出目录放到纯英文路径下。',
+      '',
+      '建议示例：',
+      'D:\\H8\\input',
+      'D:\\H8\\output',
+      'D:\\local_web_modules\\H8_CLOUD_TYPE',
+      '',
+      '检测到的中文路径：',
+      ...lines,
+      more,
+    ].filter(Boolean).join('\n')
+  );
+
+  return true;
+}
+
+function blockIfChinesePath(value, prefix = '路径') {
+  return showChinesePathWarning(collectChinesePathItems(value, prefix));
+}
+
+
 // 默认工具栏由后端首次初始化 toolbars.json 时提供。
 // 前端不再强制追加 cloud/aerosol，避免删除后又在页面上复活。
 const DEFAULT_TOOLBARS = [];
@@ -265,41 +360,6 @@ function normalizeToolKey(v) {
     .trim()
     .replace(/\.\./g, '_')
     .replace(/[\\/\s]+/g, '_');
-}
-
-function normalizeModuleIdForCompare(v) {
-  return normalizeToolKey(v).toLowerCase();
-}
-
-function getValidationModuleId(validation) {
-  return (
-    validation?.module?.id ||
-    validation?.module?.module_id ||
-    validation?.module_id ||
-    ''
-  );
-}
-
-function appendDuplicateModuleErrorToValidation(validation, moduleId, existingModule) {
-  const duplicateItem = {
-    field: 'module_id',
-    message: `模块 ID 已存在：${moduleId}`,
-    suggestion: '请先在模块管理中删除旧模块，或修改新模块配置中的 module_id / id 后再安装。',
-    existing_module: existingModule
-      ? {
-          id: existingModule.id,
-          name: existingModule.name,
-          tool_type: existingModule.tool_type,
-        }
-      : null,
-  };
-
-  return {
-    ...(validation || {}),
-    ok: false,
-    can_install: false,
-    errors: [duplicateItem, ...((validation && Array.isArray(validation.errors)) ? validation.errors : [])],
-  };
 }
 
 function guessToolType(module) {
@@ -1564,24 +1624,6 @@ export default function App() {
   const isAdmin = currentUser?.role === 'admin';
   const minimizedTaskCount = windows.filter((w) => w.minimized).length;
 
-  function findDuplicateModule(moduleId, exceptModuleId = '') {
-    const target = normalizeModuleIdForCompare(moduleId);
-    const except = normalizeModuleIdForCompare(exceptModuleId);
-    if (!target) return null;
-
-    return (
-      modules.find((module) => {
-        const current = normalizeModuleIdForCompare(module?.id);
-        return current === target && current !== except;
-      }) || null
-    );
-  }
-
-  function duplicateModuleMessage(moduleId, existingModule) {
-    const name = existingModule?.name ? `（${existingModule.name}）` : '';
-    return `模块 ID“${moduleId}”已存在${name}，不能重复添加同一个模块。请先删除旧模块，或修改新模块配置中的 module_id / id。`;
-  }
-
   const taskTrayReserveStyle = {
     boxSizing: 'border-box',
   };
@@ -1941,6 +1983,7 @@ async function handleRegister() {
     });
 
     if (result?.path) {
+      if (blockIfChinesePath(result.path, '可执行模块文件夹')) return;
       setModuleFolderPath(result.path);
       setCppValidation(null);
       await validateCppModuleFolderPath(result.path, { silent: false });
@@ -1957,6 +2000,7 @@ async function browsePythonModuleConfigJson() {
     });
 
     if (!result?.path) return;
+    if (blockIfChinesePath(result.path, 'Python 模块配置 JSON')) return;
 
     setPythonModuleConfigPath(result.path);
     await validatePythonModuleConfigPath(result.path, { silent: false });
@@ -1971,6 +2015,7 @@ async function browsePythonModuleFolder() {
     });
 
     if (!result?.path) return;
+    if (blockIfChinesePath(result.path, 'Python 模块文件夹')) return;
 
     setPythonSourceDir(result.path);
     setPythonModuleConfigPath('');
@@ -1987,6 +2032,14 @@ async function validatePythonModuleConfigPath(pathValue = pythonModuleConfigPath
   const path = String(pathValue || '').trim();
   if (!path) {
     setPythonUploadMsg('请选择 Python 模块配置 JSON');
+    setPythonValidation(null);
+    setPythonModuleConfigPreview(null);
+    setPythonParamInputs([]);
+    return null;
+  }
+
+  if (blockIfChinesePath(path, 'Python 模块配置 JSON')) {
+    setPythonUploadMsg('检测到中文路径，请把 Python 模块配置 JSON 放到纯英文路径后再检查。');
     setPythonValidation(null);
     setPythonModuleConfigPreview(null);
     setPythonParamInputs([]);
@@ -2029,6 +2082,14 @@ async function validatePythonModuleFolderPath(pathValue = pythonSourceDir, optio
 
   if (!folderPath) {
     setPythonUploadMsg('请选择 Python 模块文件夹');
+    setPythonValidation(null);
+    setPythonModuleConfigPreview(null);
+    setPythonParamInputs([]);
+    return null;
+  }
+
+  if (blockIfChinesePath(folderPath, 'Python 模块文件夹')) {
+    setPythonUploadMsg('检测到中文路径，请把 Python 模块文件夹放到纯英文路径后再检查。');
     setPythonValidation(null);
     setPythonModuleConfigPreview(null);
     setPythonParamInputs([]);
@@ -2108,6 +2169,12 @@ async function validateCppModuleFolderPath(pathValue = moduleFolderPath, options
     return null;
   }
 
+  if (blockIfChinesePath(path, '可执行模块文件夹')) {
+    setUploadMsg('检测到中文路径，请把可执行模块文件夹放到纯英文路径后再检查。');
+    setCppValidation(null);
+    return null;
+  }
+
   setCppValidationLoading(true);
   if (!options.silent) setUploadMsg('正在检查可执行模块配置...');
 
@@ -2151,17 +2218,14 @@ async function installModuleFolder() {
     return;
   }
 
-  const validation = await validateCppModuleFolderPath(moduleFolderPath, { silent: true });
-  if (!validation?.can_install) {
-    setUploadMsg('可执行模块配置没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
+  if (blockIfChinesePath(moduleFolderPath, '可执行模块文件夹')) {
+    setUploadMsg('检测到中文路径，请把可执行模块文件夹放到纯英文路径后再安装。');
     return;
   }
 
-  const moduleId = getValidationModuleId(validation);
-  const duplicate = findDuplicateModule(moduleId);
-  if (duplicate) {
-    setCppValidation(appendDuplicateModuleErrorToValidation(validation, moduleId, duplicate));
-    setUploadMsg(duplicateModuleMessage(moduleId, duplicate));
+  const validation = await validateCppModuleFolderPath(moduleFolderPath, { silent: true });
+  if (!validation?.can_install) {
+    setUploadMsg('可执行模块配置没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
     return;
   }
 
@@ -2336,6 +2400,7 @@ function addTaskWindow(task, title) {
         title: field === 'output_dir' ? '选择输出文件夹' : '选择输入文件夹',
       });
       if (result?.path) {
+        if (blockIfChinesePath(result.path, field === 'output_dir' ? '输出文件夹' : '输入文件夹')) return;
         setCloudForms((prev) => ({
           ...prev,
           [key]: {
@@ -2371,6 +2436,7 @@ function addTaskWindow(task, title) {
       }
 
       if (result?.path) {
+        if (blockIfChinesePath(result.path, field.label || field.key || '模块参数路径')) return;
         setRuntimeForms((prev) => ({
           ...prev,
           [module.id]: {
@@ -2399,6 +2465,8 @@ function addTaskWindow(task, title) {
       if (inputField) inputs[inputField.key] = form.input_path;
       if (outputField) inputs[outputField.key] = form.output_dir;
 
+      if (blockIfChinesePath(inputs, `${item.title || item.module.name || '模块'} 参数`)) return;
+
       const task = await runModule(item.module.id, inputs);
       const detail = await getTask(task.id);
       addTaskWindow(detail, form.task_name || item.title);
@@ -2417,6 +2485,8 @@ function addTaskWindow(task, title) {
       const parallelWorkers = clampParallelWorkersValue(form._parallel_workers, systemResources.max_workers);
       delete inputs.task_name;
       delete inputs._parallel_workers;
+
+      if (blockIfChinesePath(inputs, `${module.name || module.id || '模块'} 参数`)) return;
 
       const task = await runModule(module.id, inputs, parallelWorkers);
       const detail = await getTask(task.id);
@@ -2451,15 +2521,8 @@ function addTaskWindow(task, title) {
 
   async function saveCurrentModule() {
     try {
-      const nextModuleId = moduleForm.id.trim();
-      const duplicate = findDuplicateModule(nextModuleId, editingModuleId);
-      if (duplicate) {
-        alert(duplicateModuleMessage(nextModuleId, duplicate));
-        return;
-      }
-
       const extraModuleFields = JSON.parse(moduleForm.extra_json_text || '{}');
-      await saveModule({
+      const modulePayload = {
         ...extraModuleFields,
         id: moduleForm.id.trim(),
         name: moduleForm.name.trim(),
@@ -2476,7 +2539,17 @@ function addTaskWindow(task, title) {
         tool_type: moduleForm.tool_type || visibleToolbars[0]?.key || 'uncategorized',
         parallel: JSON.parse(moduleForm.parallel_json_text || '{}'),
         enabled: moduleForm.enabled,
-      });
+      };
+
+      const pathCheckPayload = {
+        executable: modulePayload.executable,
+        working_dir: modulePayload.working_dir,
+        command_template: modulePayload.command_template,
+        inputs: modulePayload.inputs,
+      };
+      if (blockIfChinesePath(pathCheckPayload, '模块配置路径')) return;
+
+      await saveModule(modulePayload);
       setModuleForm(emptyModuleForm);
       setEditingModuleId('');
       setModuleEditOpen(false);
@@ -2486,7 +2559,6 @@ function addTaskWindow(task, title) {
       alert(e?.message || '保存模块失败');
     }
   }
-
 
 function renderValidationItems(title, items, color = '#4f6682') {
   if (!Array.isArray(items) || items.length === 0) return null;
@@ -2748,17 +2820,14 @@ async function uploadPythonConfigJson() {
     return;
   }
 
-  const validation = await validatePythonModuleConfigPath(pythonModuleConfigPath, { silent: true });
-  if (!validation?.can_install) {
-    setPythonUploadMsg('Python 配置 JSON 没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
+  if (blockIfChinesePath(pythonModuleConfigPath, 'Python 模块配置 JSON')) {
+    setPythonUploadMsg('检测到中文路径，请把 Python 模块配置 JSON 放到纯英文路径后再安装。');
     return;
   }
 
-  const moduleId = getValidationModuleId(validation);
-  const duplicate = findDuplicateModule(moduleId);
-  if (duplicate) {
-    setPythonValidation(appendDuplicateModuleErrorToValidation(validation, moduleId, duplicate));
-    setPythonUploadMsg(duplicateModuleMessage(moduleId, duplicate));
+  const validation = await validatePythonModuleConfigPath(pythonModuleConfigPath, { silent: true });
+  if (!validation?.can_install) {
+    setPythonUploadMsg('Python 配置 JSON 没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
     return;
   }
 
@@ -2788,17 +2857,14 @@ async function uploadPythonFolder() {
     return;
   }
 
-  const validation = await validatePythonModuleFolderPath(folderPath, { silent: true });
-  if (!validation?.can_install) {
-    setPythonUploadMsg('Python 模块文件夹没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
+  if (blockIfChinesePath(folderPath, 'Python 模块文件夹')) {
+    setPythonUploadMsg('检测到中文路径，请把 Python 模块文件夹放到纯英文路径后再安装。');
     return;
   }
 
-  const moduleId = getValidationModuleId(validation);
-  const duplicate = findDuplicateModule(moduleId);
-  if (duplicate) {
-    setPythonValidation(appendDuplicateModuleErrorToValidation(validation, moduleId, duplicate));
-    setPythonUploadMsg(duplicateModuleMessage(moduleId, duplicate));
+  const validation = await validatePythonModuleFolderPath(folderPath, { silent: true });
+  if (!validation?.can_install) {
+    setPythonUploadMsg('Python 模块文件夹没有通过检查，已阻止安装。请根据下方错误、缺失文件和修改建议处理后再安装。');
     return;
   }
 

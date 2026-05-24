@@ -263,7 +263,7 @@
     "runtime_type": "python_venv",
     "python_env_mode": "create_venv",
     "base_python_executable": "D:\\Python\\Python38\\python.exe",
-    "install_release": "20260517_204857",
+    "install_release": "20260524_153639",
     "config_mode": "config_json",
     "command_template": [
       "{executable}",
@@ -305,13 +305,13 @@
         "default": "D:\\NEPU\\NC_1"
       }
     ],
-    "param_template": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260517_204857/param_template.json",
-    "source_dir": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260517_204857/source",
+    "param_template": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260524_153639/param_template.json",
+    "source_dir": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260524_153639/source",
     "entry_file": "CM_CTH.py",
-    "entry_script": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260517_204857/source/CM_CTH.py",
-    "python_env_dir": "backend/module_envs/H8_CLOUD_TYPE_20260517_204857",
-    "executable": "backend/module_envs/H8_CLOUD_TYPE_20260517_204857/Scripts/python.exe",
-    "working_dir": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260517_204857/source",
+    "entry_script": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260524_153639/source/CM_CTH.py",
+    "python_env_dir": "backend/module_envs/H8_CLOUD_TYPE_20260524_153639",
+    "executable": "backend/module_envs/H8_CLOUD_TYPE_20260524_153639/Scripts/python.exe",
+    "working_dir": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260524_153639/source",
     "parallel": {
       "mode": "auto",
       "input_key": "",
