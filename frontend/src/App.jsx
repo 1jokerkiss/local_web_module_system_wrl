@@ -261,6 +261,12 @@ function normalize(v) {
 // 前端不再强制追加 cloud/aerosol，避免删除后又在页面上复活。
 const DEFAULT_TOOLBARS = [];
 const ACTIVE_TAB_STORAGE_KEY = 'local_web_active_tab';
+const ADMIN_DEFAULT_TAB = 'module_mgmt';
+const USER_DEFAULT_TAB = 'tool:cloud';
+
+function getDefaultActiveTab(user) {
+  return user?.role === 'admin' ? ADMIN_DEFAULT_TAB : USER_DEFAULT_TAB;
+}
 
 function getSavedActiveTab() {
   try {
@@ -1493,7 +1499,7 @@ export default function App() {
   const [dataPreview, setDataPreview] = useState(null);
   const [dataPreviewLoading, setDataPreviewLoading] = useState(false);
 
-  const [activeTab, setActiveTab] = useState(() => getSavedActiveTab() || 'tool:cloud');
+  const [activeTab, setActiveTab] = useState(() => getSavedActiveTab() || ADMIN_DEFAULT_TAB);
   const [activeModuleByTool, setActiveModuleByTool] = useState({});
   const [expandedToolTypes, setExpandedToolTypes] = useState({ cloud: true, aerosol: true });
   const [cloudForms, setCloudForms] = useState({});
@@ -1564,13 +1570,34 @@ export default function App() {
 
   const navItems = useMemo(() => {
     const arr = [];
+
     if (isAdmin) {
       arr.push({ key: 'module_mgmt', label: '模块管理' });
+    }
+
+    const cloudToolbar = visibleToolbars.find((t) => t.key === 'cloud');
+    const aerosolToolbar = visibleToolbars.find((t) => t.key === 'aerosol');
+    const otherToolbars = visibleToolbars.filter((t) => !['cloud', 'aerosol'].includes(t.key));
+
+    if (cloudToolbar) {
+      arr.push({ key: `tool:${cloudToolbar.key}`, label: cloudToolbar.label });
+    }
+
+    if (aerosolToolbar) {
+      arr.push({ key: `tool:${aerosolToolbar.key}`, label: aerosolToolbar.label });
+    }
+
+    otherToolbars.forEach((t) => {
+      arr.push({ key: `tool:${t.key}`, label: t.label });
+    });
+
+    arr.push({ key: 'tasks', label: '任务管理' });
+    arr.push({ key: 'data_mgmt', label: '数据管理' });
+
+    if (isAdmin) {
       arr.push({ key: 'user_mgmt', label: '用户管理' });
     }
-    visibleToolbars.forEach((t) => arr.push({ key: `tool:${t.key}`, label: t.label }));
-    arr.push({ key: 'data_mgmt', label: '数据管理' });
-    arr.push({ key: 'tasks', label: '任务管理' });
+
     return arr;
   }, [isAdmin, visibleToolbars]);
 
@@ -1581,7 +1608,7 @@ export default function App() {
       try {
         const me = await getMe();
         setCurrentUser(me);
-        setActiveTab(getSavedActiveTab() || 'tool:cloud');
+        setActiveTab(getSavedActiveTab() || getDefaultActiveTab(me));
 
         const [toolbarList, mods, taskList, dataList, resources] = await Promise.all([
           getToolbars(),
@@ -1639,25 +1666,33 @@ useEffect(() => {
 useEffect(() => {
   if (!currentUser) return;
 
-  // 工具栏还没加载完成时，不要把 tool:cloud 错误切到任务管理或模块管理
+  // 工具栏还没加载完成时，不要把有效的默认页错误切走。
   if (visibleToolbars.length === 0) return;
 
   const hasTool = (key) => visibleToolbars.some((tb) => tb.key === key);
   const firstKey = visibleToolbars[0]?.key || '';
+  const fallback = isAdmin
+    ? 'module_mgmt'
+    : hasTool('cloud')
+      ? 'tool:cloud'
+      : firstKey
+        ? `tool:${firstKey}`
+        : 'tasks';
+
+  let shouldFallback = false;
 
   if (activeTab.startsWith('tool:')) {
     const key = activeTab.slice('tool:'.length);
+    shouldFallback = !hasTool(key);
+  } else if (activeTab === 'module_mgmt' || activeTab === 'user_mgmt') {
+    shouldFallback = !isAdmin;
+  } else {
+    shouldFallback = !['tasks', 'data_mgmt'].includes(activeTab);
+  }
 
-    if (!hasTool(key)) {
-      const fallback = hasTool('cloud')
-        ? 'tool:cloud'
-        : firstKey
-          ? `tool:${firstKey}`
-          : 'tasks';
-
-      setActiveTab(fallback);
-      saveActiveTab(fallback);
-    }
+  if (shouldFallback) {
+    setActiveTab(fallback);
+    saveActiveTab(fallback);
   }
 
   if (!uploadToolType || !hasTool(uploadToolType)) {
@@ -1669,7 +1704,7 @@ useEffect(() => {
     if (!firstKey) return prev;
     return { ...prev, tool_type: firstKey };
   });
-}, [currentUser, visibleToolbars, activeTab, uploadToolType]);
+}, [currentUser, isAdmin, visibleToolbars, activeTab, uploadToolType]);
   useEffect(() => {
   if (!currentUser) return;
   saveActiveTab(activeTab);
@@ -1790,8 +1825,9 @@ useEffect(() => {
       const data = await login(loginForm.username, loginForm.password, loginType);
       setAuthToken(data.token);
       setCurrentUser(data.user);
-      setActiveTab('tool:cloud');
-      saveActiveTab('tool:cloud');
+      const defaultTab = getDefaultActiveTab(data.user);
+      setActiveTab(defaultTab);
+      saveActiveTab(defaultTab);
 
       const [toolbarList, mods, taskList, dataList, resources] = await Promise.all([
         getToolbars(),
@@ -2153,7 +2189,7 @@ async function installModuleFolder() {
     clearSavedActiveTab();
 
     setCurrentUser(null);
-    setActiveTab('tool:cloud');
+    setActiveTab(ADMIN_DEFAULT_TAB);
     setModules([]);
     setTasks([]);
     setUsers([]);
