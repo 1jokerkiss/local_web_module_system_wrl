@@ -223,45 +223,9 @@ DEFAULT_PARALLEL_PATTERNS = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
 # 初始默认工具栏。现在云反演 / 气溶胶反演也按普通动态工具栏处理，
 # 只在第一次创建 toolbars.json 时写入；之后不会强制重新合并回来。
 DEFAULT_TOOLBARS = [
-    {"key": "云反演", "label": "云反演", "system": False},
-    {"key": "气溶胶反演", "label": "气溶胶反演", "system": False},
+    {"key": "cloud", "label": "云反演", "system": False},
+    {"key": "aerosol", "label": "气溶胶反演", "system": False},
 ]
-
-TOOL_TYPE_ALIASES = {
-    "cloud": "云反演",
-    "云": "云反演",
-    "云反演": "云反演",
-    "aerosol": "气溶胶反演",
-    "aod": "气溶胶反演",
-    "气溶胶": "气溶胶反演",
-    "气溶胶反演": "气溶胶反演",
-}
-
-def canonical_tool_type(value: str) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    compact = "".join(raw.replace("_", " ").replace("-", " ").split()).lower()
-    return TOOL_TYPE_ALIASES.get(compact, raw)
-
-def tool_sort_rank(key: str) -> int:
-    key = canonical_tool_type(key)
-    if key == "云反演":
-        return 0
-    if key == "气溶胶反演":
-        return 1
-    return 2
-
-def cfg_get_alias(cfg: dict, *names: str, default=None):
-    """读取 module 配置字段，兼容 module_id / module id / module-id 三种写法。"""
-    if not isinstance(cfg, dict):
-        return default
-    for name in names:
-        candidates = [name, name.replace("_", " "), name.replace("_", "-")]
-        for candidate in candidates:
-            if candidate in cfg:
-                return cfg.get(candidate)
-    return default
 
 def to_project_relative_path(path: Path) -> str:
     """
@@ -314,8 +278,7 @@ def resolve_packaged_module_path(raw_value: str, module_id: str, target_dir: Pat
     # working_dir 是绝对路径时，最后兜底用模块根目录
     return default_path
 def normalize_tool_key(value: str) -> str:
-    """把工具类型规范化。现在内置工具类型统一使用中文：云反演 / 气溶胶反演。"""
-    value = canonical_tool_type(value)
+    """把工具栏 key 规范化，允许中文名称，但过滤路径和分隔符。"""
     value = (value or "").strip()
     if not value:
         return ""
@@ -365,7 +328,7 @@ def load_toolbars() -> List[dict]:
         }
 
     result = list(merged.values())
-    result.sort(key=lambda x: (tool_sort_rank(x.get("key", "")), x.get("label", "")))
+    result.sort(key=lambda x: (0 if x.get("key") in {"cloud", "aerosol"} else 1, x.get("label", "")))
     return result
 
 def save_toolbars(toolbars: List[dict]):
@@ -509,7 +472,7 @@ def delete_toolbar(key: str) -> dict:
     }
 
 def ensure_toolbar_exists(key: str, label: str | None = None):
-    key = normalize_tool_key(key) or "云反演"
+    key = normalize_tool_key(key) or "cloud"
     toolbars = load_toolbars()
     if any(t.get("key") == key for t in toolbars):
         return
@@ -532,11 +495,11 @@ def guess_module_tool_type(module: dict) -> str:
         ]
     ).lower()
 
-    if any(k in text for k in ["aod", "aerosol", "气溶胶", "polar", "偏振"]):
-        return "气溶胶反演"
-    if any(k in text for k in ["cloud", "云", "cloud_type", "cth", "h8"]):
-        return "云反演"
-    return "云反演"
+    if any(k in text for k in ["aod", "aerosol", "气溶胶", "h8", "polar", "偏振"]):
+        return "aerosol"
+    if any(k in text for k in ["cloud", "云", "cloud_type", "cth"]):
+        return "cloud"
+    return "cloud"
 
 
 def normalize_parallel_config(module: dict) -> dict:
@@ -1445,7 +1408,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
     return task
 def upsert_module(module_data: dict):
     module_data = normalize_module_record(module_data)
-    ensure_toolbar_exists(module_data.get("tool_type") or "云反演")
+    ensure_toolbar_exists(module_data.get("tool_type") or "cloud")
     modules = load_modules()
     found = False
     for i, module in enumerate(modules):
@@ -1469,160 +1432,10 @@ def _is_path_inside(child: Path, parent: Path) -> bool:
         return False
 
 
-
-def _make_path_writable(path: Path):
-    '''把文件/目录改成可写，解决 Windows 只读文件导致的删除失败。'''
-    try:
-        if path.exists():
-            os.chmod(path, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
-    except Exception:
-        pass
-
-
-def _rmtree_onerror(func, path, exc_info):
-    '''shutil.rmtree 的 Windows 兜底：先改权限，再重试一次。'''
-    try:
-        target = Path(path)
-        _make_path_writable(target)
-        func(path)
-    except Exception:
-        pass
-
-
-def _stop_tracked_module_tasks(module_id: str) -> list[str]:
-    '''删除模块前，先取消调度器里属于该模块的 running/queued 任务。'''
-    stopped: list[str] = []
-    try:
-        lock = getattr(task_manager, "lock", None)
-        if lock is None:
-            return stopped
-        with lock:
-            tasks = getattr(task_manager, "tasks", {}) or {}
-            processes = getattr(task_manager, "processes", {}) or {}
-            cancel_flags = getattr(task_manager, "cancel_flags", None)
-
-            for task_id, task in list(tasks.items()):
-                if not isinstance(task, dict):
-                    continue
-                if str(task.get("module_id") or "") != str(module_id):
-                    continue
-                if task.get("status") in {"running", "queued"}:
-                    task["status"] = "cancelled"
-                    task["ended_at"] = now_iso()
-                    task.setdefault("logs", []).append("[SYSTEM] 删除模块前已自动取消该模块任务")
-                    stopped.append(str(task_id))
-                    if cancel_flags is not None:
-                        try:
-                            cancel_flags.add(str(task_id))
-                        except Exception:
-                            pass
-
-                proc = processes.get(str(task_id))
-                if proc is not None:
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
-                    try:
-                        proc.wait(timeout=2)
-                    except Exception:
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                    try:
-                        processes.pop(str(task_id), None)
-                    except Exception:
-                        pass
-        try:
-            task_manager._save_tasks()
-        except Exception:
-            pass
-    except Exception:
-        pass
-    return stopped
-
-
-def _stop_processes_from_dir(target_dir: Path) -> list[str]:
-    '''Windows 下按 ExecutablePath 精确终止正在从模块目录运行的 exe，避免 AOD_AHI.exe 被占用无法删除。'''
-    killed: list[str] = []
-    if os.name != "nt":
-        return killed
-
-    root = str(target_dir.resolve())
-    # 用 PowerShell 按进程 ExecutablePath 前缀匹配，尽量只杀当前模块目录里的进程，不误杀其它同名 exe。
-    ps_script = rf'''
-$root = {json.dumps(root)}
-$rootLower = $root.ToLower()
-Get-CimInstance Win32_Process | Where-Object {{
-    $_.ExecutablePath -and $_.ExecutablePath.ToLower().StartsWith($rootLower)
-}} | ForEach-Object {{
-    try {{
-        Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
-        Write-Output ($_.ProcessId.ToString() + "|" + $_.Name + "|" + $_.ExecutablePath)
-    }} catch {{
-        Write-Output ("FAILED|" + $_.ProcessId.ToString() + "|" + $_.Name + "|" + $_.ExecutablePath + "|" + $_.Exception.Message)
-    }}
-}}
-'''
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            timeout=10,
-            shell=False,
-        )
-        for line in (result.stdout or "").splitlines():
-            line = line.strip()
-            if line:
-                killed.append(line)
-    except Exception:
-        pass
-
-    return killed
-
-
-def _delete_with_retry(path: Path) -> dict:
-    '''删除文件/目录，处理 Windows 文件占用释放慢的问题。'''
-    path = path.resolve()
-    if not path.exists():
-        return {"path": str(path), "status": "missing"}
-
-    last_error: Exception | None = None
-    for attempt in range(1, 6):
-        try:
-            if path.is_dir():
-                # 先把目录树里的文件尽量改成可写。
-                for item in path.rglob("*"):
-                    _make_path_writable(item)
-                _make_path_writable(path)
-                shutil.rmtree(path, onerror=_rmtree_onerror)
-            else:
-                _make_path_writable(path)
-                path.unlink()
-            return {"path": str(path), "status": "deleted", "attempts": attempt}
-        except Exception as exc:
-            last_error = exc
-            time.sleep(0.4 * attempt)
-
-    raise HTTPException(
-        status_code=500,
-        detail=(
-            f"删除模块本地文件失败: {path}，原因: {last_error}。"
-            "如果提示 WinError 32，说明 exe 或资源文件仍被进程占用。"
-            "请先停止该模块任务，或在任务管理器结束对应 exe 后重试。"
-        ),
-    )
-
-
 def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
-    '''
+    """
     只允许删除指定安全目录下的文件或文件夹。
-    删除前会尝试停止从该目录启动的 native exe，解决 Windows 下 AOD_AHI.exe 被占用无法删除的问题。
-    '''
+    """
     path = path.resolve()
 
     if not path.exists():
@@ -1637,22 +1450,31 @@ def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
             detail=f"拒绝删除非模块目录路径: {path}",
         )
 
-    killed = _stop_processes_from_dir(path)
-    result = _delete_with_retry(path)
-    if killed:
-        result["killed_processes"] = killed
-    return result
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=False)
+        else:
+            path.unlink()
+
+        return {
+            "path": str(path),
+            "status": "deleted",
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"删除模块本地文件失败: {path}，原因: {exc}",
+        )
 
 
 def remove_module(module_id: str) -> dict:
-    '''
+    """
     删除模块：
-    1. 取消该模块正在运行/排队的任务；
-    2. 终止从模块安装目录启动的 exe 进程；
-    3. 删除 backend/installed_modules/{module_id}；
-    4. 删除 backend/module_envs/{module_id}；
-    5. 从 modules.json 移除模块记录。
-    '''
+    1. 从 modules.json 移除模块记录；
+    2. 删除 backend/installed_modules/{module_id}；
+    3. 删除 backend/module_envs/{module_id}；
+    4. 不删除任务记录、不删除数据管理中的输出结果文件。
+    """
     modules = load_modules()
 
     target_module = None
@@ -1682,25 +1504,27 @@ def remove_module(module_id: str) -> dict:
         PYTHON_MODULE_ENVS_DIR,
     ]
 
-    cancelled_tasks = _stop_tracked_module_tasks(module_id)
-
-    # 再额外终止模块安装目录下运行的 native exe。这个能处理 AOD_AHI.exe 仍在占用自身文件的问题。
-    killed_processes = _stop_processes_from_dir(installed_dir)
-    time.sleep(0.8)
-
     deleted_paths = []
-    deleted_paths.append(_remove_path_safely(installed_dir, allowed_roots))
-    deleted_paths.append(_remove_path_safely(env_dir, allowed_roots))
 
+    # 删除模块安装目录：backend/installed_modules/{module_id}
+    deleted_paths.append(
+        _remove_path_safely(installed_dir, allowed_roots)
+    )
+
+    # 删除 Python 独立环境目录：backend/module_envs/{module_id}
+    deleted_paths.append(
+        _remove_path_safely(env_dir, allowed_roots)
+    )
+
+    # 本地文件删除成功后，再删除 modules.json 中的记录
     save_modules(new_modules)
 
     return {
         "removed": True,
         "module_id": module_id,
-        "cancelled_tasks": cancelled_tasks,
-        "killed_processes": killed_processes,
         "deleted_paths": deleted_paths,
     }
+
 
 def format_command(template: List[str], values: Dict[str, Any]) -> List[str]:
     formatted = []
@@ -1928,40 +1752,9 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
     dll_search_dirs = [str(module_dir)]
 
     for dep in dependency_dirs:
-        dep_path = Path(str(dep)).expanduser()
-        if not dep_path.is_absolute():
-            dep_path = (module_dir / dep_path).resolve()
-        else:
-            dep_path = dep_path.resolve()
+        dep_path = (module_dir / dep).resolve()
         if dep_path.exists() and dep_path.is_dir():
             dll_search_dirs.append(str(dep_path))
-
-    # 可执行模块运行环境路径：例如 MATLAB Runtime/bin、OSGeo4W/bin、其它 DLL 目录。
-    # 新版“像 Python 一样”的可执行模块由用户在 runtime_env_path / dependency_search_dirs 中填写。
-    extra_search_dirs = []
-    for key in ["dependency_search_dirs", "runtime_env_path", "environment_path", "env_path"]:
-        raw_value = module.get(key)
-        if not raw_value:
-            continue
-        if isinstance(raw_value, str):
-            raw_items = [raw_value]
-        elif isinstance(raw_value, list):
-            raw_items = raw_value
-        else:
-            raw_items = []
-        for item in raw_items:
-            item_text = str(item or "").strip()
-            if not item_text:
-                continue
-            p = Path(item_text).expanduser()
-            if not p.is_absolute():
-                p = (module_dir / p).resolve()
-            else:
-                p = p.resolve()
-            if p.exists() and p.is_dir():
-                extra_search_dirs.append(str(p))
-
-    dll_search_dirs.extend(extra_search_dirs)
 
     # 去重，保持顺序
     seen = set()
@@ -2091,24 +1884,6 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
             command_template = ["{executable}"]
 
     command = format_command(command_template, values)
-
-    # 兼容修复：旧版/误装的可执行模块记录可能把 command_template 保存成
-    # ["{executable}", "{executable}", "{config_json}"]，导致实际命令变成：
-    #   AOD_AHI.exe AOD_AHI.exe config.json
-    # 这类新版“像 Python 一样传 config.json”的 exe 只需要：
-    #   AOD_AHI.exe config.json
-    # 因此在真正启动前去掉重复的第二个 executable。这样不用重新安装旧模块也能生效。
-    try:
-        if len(command) >= 2:
-            first_norm = os.path.normcase(os.path.abspath(str(command[0])))
-            second_norm = os.path.normcase(os.path.abspath(str(command[1])))
-            exe_norm = os.path.normcase(os.path.abspath(str(exe_path)))
-            if first_norm == second_norm == exe_norm:
-                command = [command[0]] + command[2:]
-                runtime_env["LOCAL_WEB_COMMAND_DEDUPED"] = "1"
-                runtime_env["LOCAL_WEB_COMMAND_DEDUPED_REASON"] = "removed duplicated executable argument"
-    except Exception:
-        pass
 
     # 强制 cwd 为模块目录
     return command, str(module_dir), runtime_env
@@ -2299,19 +2074,21 @@ def load_python_module_config(raw_path: str) -> tuple[dict, Path]:
     # 2. 写在 module 下面：{"module": {...}}
     module_cfg = data.get("module") if isinstance(data.get("module"), dict) else data
 
-    module_id = str(cfg_get_alias(module_cfg, "module_id", "id", default="") or "").strip()
-    module_name = str(cfg_get_alias(module_cfg, "module_name", "name", default="") or "").strip()
-    source_dir_raw = str(cfg_get_alias(module_cfg, "source_dir", "python_source_dir", default="") or "").strip()
-    entry_file = str(cfg_get_alias(module_cfg, "entry_file", default="main.py") or "main.py").strip()
-    tool_type = str(cfg_get_alias(module_cfg, "tool_type", default="") or "").strip()
+    module_id = str(module_cfg.get("module_id") or module_cfg.get("id") or "").strip()
+    module_name = str(module_cfg.get("module_name") or module_cfg.get("name") or "").strip()
+    source_dir_raw = str(module_cfg.get("source_dir") or module_cfg.get("python_source_dir") or "").strip()
+    entry_file = str(module_cfg.get("entry_file") or "main.py").strip()
+    tool_type = str(module_cfg.get("tool_type") or "").strip()
     description = str(module_cfg.get("description") or "").strip()
     python_executable = str(
-        cfg_get_alias(module_cfg, "python_executable", "python", "python_path", default="")
+        module_cfg.get("python_executable")
+        or module_cfg.get("python")
+        or module_cfg.get("python_path")
         or ""
     ).strip()
 
     python_env_mode = str(
-        cfg_get_alias(module_cfg, "python_env_mode", default="")
+        module_cfg.get("python_env_mode")
         or module_cfg.get("env_mode")
         or "create_venv"
     ).strip().lower() or "create_venv"
@@ -2564,7 +2341,7 @@ def install_python_venv_module_from_values(
         }
 
         selected_tool_type = (
-            normalize_tool_key(module_data.get("tool_type") or tool_type or "")
+            normalize_tool_key(tool_type or "")
             or guess_module_tool_type(module_data)
         )
 
@@ -3166,51 +2943,21 @@ def _load_module_json_for_validation(module_json_path: Path, report: dict) -> di
 
 
 def _find_module_json(folder_path: Path, report: dict) -> Path | None:
-    """查找统一模块配置文件。
+    direct = folder_path / "module.json"
+    if direct.exists() and direct.is_file():
+        return direct
 
-    新版推荐使用 executable_module.json，输入方式与 Python 源码模块一致：
-    module_id/module_name/source_dir/entry_file/param_json_path/runtime_env_path。
-    为兼容旧模块，仍然支持 module.json。
-    """
-    for filename in ("executable_module.json", "module.json"):
-        direct = folder_path / filename
-        if direct.exists() and direct.is_file():
-            return direct
-
-    candidates: list[Path] = []
-    for filename in ("executable_module.json", "module.json"):
-        candidates.extend([p for p in folder_path.rglob(filename) if p.is_file()])
-
+    candidates = [p for p in folder_path.rglob("module.json") if p.is_file()]
     if not candidates:
-        _add_error(
-            report,
-            "executable_module.json",
-            "模块文件夹中未找到 executable_module.json 或 module.json",
-            "新版可执行模块建议把 executable_module.json 放在模块根目录，和 exe、config.json、resources、deps 放在同一级。",
-        )
-        _add_missing(
-            report,
-            folder_path / "executable_module.json",
-            "缺少统一模块配置文件",
-            "新增 executable_module.json，填写 module_id、module_name、entry_file、source_dir、param_json_path、runtime_env_path 等字段。",
-        )
+        _add_error(report, "module.json", "模块文件夹中未找到 module.json", "把 module.json 放在模块根目录，和 exe、resources、deps 等目录放在同一级。")
+        _add_missing(report, folder_path / "module.json", "缺少模块清单文件", "新增 module.json，并填写 id、name、executable、command_template、inputs。")
         return None
 
-    candidates.sort(key=lambda x: (len(x.parts), 0 if x.name == "executable_module.json" else 1))
+    candidates.sort(key=lambda x: len(x.parts))
     if len(candidates) > 1:
-        _add_warning(
-            report,
-            "module_config",
-            f"检测到 {len(candidates)} 个模块配置文件，系统会使用最靠近根目录的这个：{candidates[0]}",
-            "建议一个模块包只保留一个 executable_module.json 或 module.json，避免安装错模块。",
-        )
+        _add_warning(report, "module.json", f"检测到 {len(candidates)} 个 module.json，系统会使用最靠近根目录的这个：{candidates[0]}", "建议一个模块包只保留一个 module.json，避免安装错模块。")
     else:
-        _add_warning(
-            report,
-            "module_config",
-            f"模块配置文件不在选择目录根部，当前使用：{candidates[0]}",
-            "建议把 executable_module.json 放到你选择的模块文件夹根目录。",
-        )
+        _add_warning(report, "module.json", f"module.json 不在选择目录根部，当前使用：{candidates[0]}", "建议把 module.json 放到你选择的模块文件夹根目录。")
     return candidates[0]
 
 
@@ -3236,182 +2983,12 @@ def _resolve_module_reference(module_root: Path, raw_value: Any, module_id: str 
     return (module_root / p).resolve()
 
 
-
-
-def _path_relative_to_root_or_abs(path: Path, root: Path) -> str:
-    try:
-        return path.resolve().relative_to(root.resolve()).as_posix()
-    except Exception:
-        return str(path.resolve())
-
-
-def _is_unified_executable_config(module_data: dict, config_path: Path | None = None) -> bool:
-    """判断是否是新版“像 Python 一样”的可执行模块配置。"""
-    if not isinstance(module_data, dict):
-        return False
-    cfg = module_data.get("module") if isinstance(module_data.get("module"), dict) else module_data
-    runtime = str(cfg_get_alias(cfg, "runtime", "runtime_type", default="") or "").strip().lower()
-    if runtime in {"executable", "native_executable", "exe_module", "binary_executable"}:
-        return True
-    # 新版字段：module_id + entry_file + param_json_path/source_dir
-    return bool(
-        (cfg_get_alias(cfg, "module_id", "module_name", "entry_file"))
-        and not cfg_get_alias(cfg, "command_template")
-        and not cfg_get_alias(cfg, "inputs")
-    )
-
-
-def _as_str_list(value: Any, default: list[str] | None = None) -> list[str]:
-    if value is None:
-        return list(default or [])
-    if isinstance(value, str):
-        return [value] if value.strip() else list(default or [])
-    if isinstance(value, list):
-        return [str(x).strip() for x in value if str(x or "").strip()]
-    return list(default or [])
-
-
-def _normalize_unified_executable_config(module_root: Path, raw_data: dict, report: dict, tool_type: str | None = None) -> dict | None:
-    """把新版可执行模块配置转换成系统内部 Module 记录。\n\n    新版输入方式与 Python 源码模块一致：\n    - executable_module.json / module.json 只描述模块基本信息和运行环境路径；\n    - config.json 描述用户输入参数，系统自动识别输入/输出表单；\n    - 运行时统一执行：entry_file config.json。\n    """
-    cfg = raw_data.get("module") if isinstance(raw_data.get("module"), dict) else raw_data
-
-    module_id = str(cfg_get_alias(cfg, "module_id", "id", default="") or "").strip()
-    module_name = str(cfg_get_alias(cfg, "module_name", "name", default="") or "").strip()
-    source_dir_raw = str(cfg_get_alias(cfg, "source_dir", default=".") or ".").strip() or "."
-    entry_file = str(cfg_get_alias(cfg, "entry_file", "entry", "executable", default="") or "").strip()
-    description = str(cfg.get("description") or "").strip()
-
-    if not module_id:
-        _add_error(report, "module_id", "缺少 module_id", "添加例如：\"module_id\": \"my_exe_module\"。")
-    elif not re.match(r"^[A-Za-z0-9_\-\.]+$", module_id):
-        _add_error(report, "module_id", f"module_id 不建议包含空格、中文或特殊符号：{module_id}", "建议只使用英文、数字、下划线、中划线或点。")
-
-    if not module_name:
-        _add_error(report, "module_name", "缺少 module_name", "添加例如：\"module_name\": \"我的可执行模块\"。")
-
-    source_dir = _resolve_module_reference(module_root, source_dir_raw, module_id, module_root)
-    if not source_dir.exists() or not source_dir.is_dir():
-        _add_error(report, "source_dir", f"模块文件夹不存在：{source_dir_raw}", "source_dir 通常写 \".\"，表示 executable_module.json 所在文件夹。")
-        _add_missing(report, source_dir, "source_dir 指向的目录不存在", "创建该目录，或把 source_dir 改为 \".\"。")
-
-    if not entry_file:
-        _add_error(report, "entry_file", "缺少 entry_file", "填写可执行程序文件名，例如：\"entry_file\": \"MyModule.exe\"。")
-        entry_path = source_dir
-    else:
-        entry_path = _resolve_module_reference(source_dir, entry_file, module_id, source_dir)
-        if not entry_path.exists() or not entry_path.is_file():
-            _add_error(report, "entry_file", f"可执行文件不存在：{entry_file}", "确认 exe 放在 source_dir 中，或把 entry_file 改成正确相对路径。")
-            _add_missing(report, entry_path, "entry_file 指向的可执行文件不存在", "把 exe 放入模块文件夹，或修改 entry_file。")
-        elif sys.platform.startswith("win") and entry_path.suffix.lower() not in {".exe", ".bat", ".cmd"}:
-            _add_warning(report, "entry_file", f"Windows 下建议 entry_file 指向 .exe/.bat/.cmd，当前是：{entry_path.name}", "如果这是可执行脚本，请确认系统可以直接运行。")
-
-    param_template = cfg.get("param_template")
-    param_json_path = None
-    if isinstance(param_template, dict):
-        param_json = param_template
-    else:
-        param_json_raw = str(cfg_get_alias(cfg, "param_json_path", "config_json", default="config.json") or "config.json").strip() or "config.json"
-        param_json_path = _resolve_module_reference(source_dir, param_json_raw, module_id, source_dir)
-        if not param_json_path.exists() or not param_json_path.is_file():
-            _add_error(report, "param_json_path", f"参数 JSON 文件不存在：{param_json_raw}", "在模块文件夹中放置 config.json，或修改 param_json_path。")
-            _add_missing(report, param_json_path, "缺少参数 JSON", "新增 config.json，用它描述输入文件夹、输出文件夹等参数默认值。")
-            param_json = {}
-        else:
-            try:
-                param_json = load_param_json_file(str(param_json_path))
-            except Exception as exc:
-                _add_error(report, "param_json_path", f"参数 JSON 解析失败：{type(exc).__name__}: {exc}", "检查 config.json 必须是合法 JSON 对象，不能有注释或尾随逗号。")
-                param_json = {}
-
-    inputs = cfg.get("inputs")
-    if not isinstance(inputs, list):
-        inputs = infer_inputs_from_param_json(param_json)
-
-    selected_tool_type = (
-        normalize_tool_key(cfg_get_alias(cfg, "tool_type", default="") or tool_type or "")
-        or guess_module_tool_type({"id": module_id, "name": module_name, "description": description, "tags": cfg.get("tags") or []})
-    )
-
-    dependency_dirs = _as_str_list(cfg.get("dependency_dirs"), ["deps"])
-    resource_dirs = _as_str_list(cfg.get("resource_dirs"), ["resources"])
-    dependency_search_dirs = _as_str_list(cfg.get("dependency_search_dirs"), [])
-
-    runtime_env_path = str(
-        cfg_get_alias(cfg, "runtime_env_path", "environment_path", "env_path", "runtime_path", default="") or ""
-    ).strip()
-    if runtime_env_path:
-        runtime_env_dirs = _as_str_list(runtime_env_path, [])
-        for env_dir in runtime_env_dirs:
-            env_path = Path(env_dir).expanduser()
-            if not env_path.is_absolute():
-                env_path = (module_root / env_path).resolve()
-            else:
-                env_path = env_path.resolve()
-            dependency_search_dirs.append(str(env_path))
-            if not env_path.exists() or not env_path.is_dir():
-                _add_warning(report, "runtime_env_path", f"运行环境路径不存在：{env_path}", "如果该 exe 需要 MATLAB Runtime、OSGeo4W、Python 打包运行库等，请填写真实存在的 bin/runtime 目录；不需要可留空。")
-    else:
-        _add_warning(report, "runtime_env_path", "未填写运行环境路径", "如果 exe 依赖 MATLAB Runtime、OSGeo4W 或其它运行库，请在 runtime_env_path 中填写对应 bin/runtime 目录；纯独立 exe 可以留空。")
-
-    for dirname in dependency_dirs:
-        dep_path = _resolve_module_reference(source_dir, dirname, module_id, source_dir)
-        if not dep_path.exists() or not dep_path.is_dir():
-            _add_warning(report, "dependency_dirs", f"依赖目录不存在：{dirname}", "如果没有额外 DLL 可以忽略；如果有运行时 DLL，请创建 deps 并放入依赖。")
-
-    for dirname in resource_dirs:
-        res_path = _resolve_module_reference(source_dir, dirname, module_id, source_dir)
-        if not res_path.exists() or not res_path.is_dir():
-            _add_warning(report, "resource_dirs", f"固定资源目录不存在：{dirname}", "如果模块没有固定资源可以忽略；如果有模型、XML、LUT、DEM 等，请放到 resources 或对应目录。")
-
-    parallel = cfg.get("parallel") if isinstance(cfg.get("parallel"), dict) else {}
-    if not parallel:
-        parallel = {
-            "mode": "auto",
-            "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
-            "output_suffix": ".tif",
-            "output_naming": "source_stem",
-        }
-
-    command_template = cfg.get("command_template")
-    if not isinstance(command_template, list) or not all(isinstance(x, str) and x.strip() for x in command_template):
-        # 新版默认：像 Python 源码模块一样，平台生成 config.json，然后把 config 路径传给 exe。
-        command_template = ["{executable}", "{config_json}"]
-
-    module_data = {
-        "id": module_id,
-        "name": module_name or module_id,
-        "description": description or "本地可执行模块",
-        "tool_type": selected_tool_type,
-        "runtime": "native",
-        "runtime_type": "executable_config",
-        "entry_file": entry_file,
-        "source_dir": _path_relative_to_root_or_abs(source_dir, module_root),
-        "executable": _path_relative_to_root_or_abs(entry_path, module_root),
-        "working_dir": _path_relative_to_root_or_abs(source_dir, module_root),
-        "config_mode": "config_json",
-        "param_json_path": _path_relative_to_root_or_abs(param_json_path, module_root) if param_json_path else "",
-        "config_template_json": param_json,
-        "command_template": command_template,
-        "inputs": inputs,
-        "parallel": parallel,
-        "dependency_dirs": dependency_dirs,
-        "dependency_search_dirs": dependency_search_dirs,
-        "resource_dirs": resource_dirs,
-        "fixed_resources": cfg.get("fixed_resources") if isinstance(cfg.get("fixed_resources"), list) else [],
-        "runtime_env_path": runtime_env_path,
-        "tags": cfg.get("tags") if isinstance(cfg.get("tags"), list) else ["executable", "native"],
-        "enabled": cfg.get("enabled", True) is not False,
-        "auto_collect_deps": cfg.get("auto_collect_deps", True) is not False,
-    }
-
-    return module_data
-
 def _module_json_error_detail(report: dict) -> dict:
     _dedupe_report_items(report)
     report["ok"] = False
     report["can_install"] = False
     return {
-        "message": "可执行模块校验失败，请按下面提示修改后再安装。",
+        "message": "C++ 可执行模块校验失败，请按下面提示修改后再安装。",
         **report,
     }
 
@@ -3756,20 +3333,15 @@ def validate_cpp_module_folder(folder_path: Path, tool_type: str | None = None, 
         _dedupe_report_items(report)
         return report
 
-    if _is_unified_executable_config(module_data, module_json_path):
-        normalized = _normalize_unified_executable_config(module_root, module_data, report, tool_type=tool_type)
-        if normalized is not None:
-            module_data = normalized
-    else:
-        selected_tool_type = (
-            normalize_tool_key(module_data.get("tool_type") or tool_type or "")
-            or guess_module_tool_type(module_data)
-        )
-        module_data["tool_type"] = selected_tool_type
-        if str(module_data.get("runtime") or "").strip() == "":
-            module_data["runtime"] = "cpp_native"
+    selected_tool_type = (
+        normalize_tool_key(tool_type or module_data.get("tool_type") or "")
+        or guess_module_tool_type(module_data)
+    )
+    module_data["tool_type"] = selected_tool_type
+    if str(module_data.get("runtime") or "").strip() == "":
+        module_data["runtime"] = "cpp_native"
 
-        _validate_cpp_module_structure(module_root, module_data, report)
+    _validate_cpp_module_structure(module_root, module_data, report)
 
     module_id = str(module_data.get("id") or "").strip()
     if module_id:
@@ -3866,7 +3438,7 @@ def install_uploaded_zip(zip_path: Path, tool_type: str | None = None, collect_d
         module_data = validation["module"]
         module_root = Path(validation["module_root"])
         selected_tool_type = (
-            normalize_tool_key(module_data.get("tool_type") or tool_type or "")
+            normalize_tool_key(tool_type or module_data.get("tool_type") or "")
             or guess_module_tool_type(module_data)
         )
         module_data["tool_type"] = selected_tool_type
@@ -4206,7 +3778,7 @@ def install_module_from_folder(
     module_data = validation["module"]
     module_root = Path(validation["module_root"])
     selected_tool_type = (
-        normalize_tool_key(module_data.get("tool_type") or tool_type or "")
+        normalize_tool_key(tool_type or module_data.get("tool_type") or "")
         or guess_module_tool_type(module_data)
     )
     module_data["tool_type"] = selected_tool_type
@@ -4248,7 +3820,7 @@ def api_validate_cpp_module_folder(
 
     return {
         "ok": bool(report.get("ok")),
-        "message": "可执行模块校验通过" if report.get("ok") else "可执行模块校验未通过",
+        "message": "C++ 可执行模块校验通过" if report.get("ok") else "C++ 可执行模块校验未通过",
         **report,
     }
 
@@ -4281,7 +3853,7 @@ def api_install_module_folder(
 
     return {
         "ok": True,
-        "message": "可执行模块文件夹安装成功",
+        "message": "C++ 模块文件夹安装成功",
         "module": module_data,
     }
 """新增 /api/admin/modules/upload-python
@@ -4357,7 +3929,7 @@ def api_upload_python_module(
             }
 
         selected_tool_type = (
-            normalize_tool_key(module_data.get("tool_type") or tool_type or "")
+            normalize_tool_key(tool_type or module_data.get("tool_type") or "")
             or guess_module_tool_type(module_data)
         )
 
@@ -4675,7 +4247,7 @@ def api_upload_module_zip(
 ):
     require_admin(authorization)
 
-    selected_tool_type = normalize_tool_key(tool_type) or "云反演"
+    selected_tool_type = normalize_tool_key(tool_type) or "cloud"
     ensure_toolbar_exists(selected_tool_type)
 
     suffix = Path(file.filename or "module.zip").suffix or ".zip"
@@ -4838,7 +4410,7 @@ def api_install_modules_from_local_drop(
     require_admin(authorization)
     MODULE_DROP_DIR.mkdir(parents=True, exist_ok=True)
 
-    selected_tool_type = normalize_tool_key(payload.tool_type) or "云反演"
+    selected_tool_type = normalize_tool_key(payload.tool_type) or "cloud"
     ensure_toolbar_exists(selected_tool_type)
 
     if payload.filename:
@@ -5310,41 +4882,6 @@ def unique_chunk_filename(src: Path, used: set[str]) -> str:
         idx += 1
 
 
-def is_parasol_jd_pair_module(module: dict) -> bool:
-    """PARASOL AOD 专用：目录里 JD/JL 成对出现，但 exe 只需要传 JD 文件。
-
-    只对 PARASOL 模块启用，避免影响其它模块的普通文件夹并行逻辑。
-    """
-    tags = module.get("tags") or []
-    text = " ".join([
-        str(module.get("id") or ""),
-        str(module.get("name") or ""),
-        str(module.get("description") or ""),
-        str(module.get("executable") or module.get("entry") or ""),
-        " ".join(str(x) for x in tags),
-    ]).lower()
-    return "parasol" in text
-
-
-def is_parasol_jd_input_file(path: Path) -> bool:
-    """识别 PARASOL 主输入 JD 文件。
-
-    示例：P3L1TBG1017047JD_n45_00_N35_00_e115_00_E125_00
-    配套 JL 文件会由算法/exe 自己按文件名匹配，不应单独生成任务。
-    """
-    name = path.name.upper()
-    return bool(re.search(r"JD(?=[_.-])", name))
-
-
-def filter_parasol_jd_files_for_jobs(module: dict, files: list[Path]) -> list[Path]:
-    if not is_parasol_jd_pair_module(module):
-        return files
-
-    jd_files = [item for item in files if is_parasol_jd_input_file(item)]
-    # 只有在确实识别到 JD 文件时才过滤；否则保持原逻辑，避免误伤其它 PARASOL 变体数据。
-    return jd_files or files
-
-
 def is_probably_dir_output(module: dict, output_key: str, output_value: str) -> bool:
     meta = field_meta(module, output_key)
     k = output_key.lower()
@@ -5431,8 +4968,6 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
 
     patterns = parse_parallel_patterns(normalize_parallel_config(module).get("file_patterns"))
     files = discover_batch_files(str(input_value), patterns)
-    files_before_parasol_filter = len(files)
-    files = filter_parasol_jd_files_for_jobs(module, files)
     if not files:
         raise HTTPException(status_code=400, detail=f"未匹配到可并行处理的文件，匹配规则: {';'.join(patterns)}")
 
@@ -5492,8 +5027,6 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
 
             job_inputs = dict(inputs)
             job_inputs[input_key] = str(chunk_dir.resolve())
-            if is_parasol_jd_pair_module(module) and files_before_parasol_filter != len(files):
-                job_inputs["_parasol_jd_filter"] = f"目录中共 {files_before_parasol_filter} 个文件，仅 JD 主输入生成 {len(files)} 个任务；JL 文件由模块自动匹配"
             job_inputs["_parallel_workers"] = 1
             job_inputs["_parallel_index"] = idx
             job_inputs["_parallel_total"] = len(job_units)
@@ -5849,97 +5382,6 @@ def _make_batch_output_value(module: dict, base_inputs: dict, slot: str, primary
     return job_inputs, out_path.resolve()
 
 
-
-def _is_h8aod_executable_module(module: dict) -> bool:
-    """判断是否为 H8 AOD 的 AOD_AHI.exe 模块。只对这个模块做字段名兼容。"""
-    text = " ".join(str(x or "") for x in [
-        module.get("id"),
-        module.get("module_id"),
-        module.get("name"),
-        module.get("module_name"),
-        module.get("description"),
-        module.get("executable"),
-        module.get("entry"),
-        module.get("entry_file"),
-    ]).lower()
-    return ("h8aod" in text) or ("aod_ahi" in text) or ("h8 aod" in text)
-
-
-def _find_first_resource_file(module_dir: Path, patterns: list[str]) -> Optional[Path]:
-    """在模块目录和 resources 目录下按模式找第一个固定资源文件。"""
-    search_roots = []
-    try:
-        search_roots.append(module_dir)
-        resources_dir = module_dir / "resources"
-        if resources_dir.exists() and resources_dir.is_dir():
-            search_roots.insert(0, resources_dir)
-    except Exception:
-        search_roots = [module_dir]
-
-    for root in search_roots:
-        try:
-            for pattern in patterns:
-                matches = sorted([x for x in root.rglob(pattern) if x.is_file()])
-                if matches:
-                    return matches[0].resolve()
-        except Exception:
-            continue
-    return None
-
-
-def _normalize_h8aod_config_for_exe(module: dict, job_inputs: dict) -> dict:
-    """把旧界面里 B01_dir/B03_dir/B06_dir/SOLAR_dir/output_dir 转成 AOD_AHI.exe 需要的字段。
-
-    AOD_AHI.exe 的 JSON 模式需要的是：
-    B01_file / B03_file / B06_file / SOLAR_file / GEO1_file / IGBP_file / LUT_file / DEM_file / OUT_file。
-    旧版页面为了让用户选择目录，字段叫 B01_dir/B03_dir/B06_dir/SOLAR_dir/output_dir。
-    批处理拆分后这些 *_dir 字段实际已经变成了单个文件路径，所以这里仅在运行 H8 AOD 时做一次字段映射。
-    """
-    if not _is_h8aod_executable_module(module):
-        return job_inputs
-
-    result = dict(job_inputs or {})
-
-    alias_map = {
-        "B01_dir": "B01_file",
-        "B03_dir": "B03_file",
-        "B06_dir": "B06_file",
-        "SOLAR_dir": "SOLAR_file",
-        "solar_dir": "SOLAR_file",
-        "output_dir": "OUT_file",
-        "out_dir": "OUT_file",
-        "outpath": "OUT_file",
-    }
-    for old_key, new_key in alias_map.items():
-        if new_key not in result and old_key in result and result.get(old_key) not in ("", None):
-            result[new_key] = result.get(old_key)
-
-    # 如果用户在 config.json 里已经写了固定资源字段，则优先使用用户值。
-    # 如果没写，就只对 H8 AOD 模块在 resources 中按常见文件名自动查找。
-    try:
-        module_dir = resolve_module_dir(module)
-    except Exception:
-        module_dir = Path(str(module.get("working_dir") or ".")).resolve()
-
-    auto_resources = {
-        "GEO1_file": ["*GEO1*", "*geo1*", "*GEO*", "*geo*"],
-        "IGBP_file": ["*IGBP*", "*igbp*"],
-        "LUT_file": ["*LUT*", "*lut*"],
-        "DEM_file": ["*DEM*", "*dem*"],
-    }
-    for key, patterns in auto_resources.items():
-        if result.get(key) not in ("", None):
-            continue
-        found = _find_first_resource_file(module_dir, patterns)
-        if found:
-            result[key] = str(found)
-
-    # 去掉旧字段，避免 exe 里做严格字段校验时受干扰。
-    for old_key in alias_map.keys():
-        result.pop(old_key, None)
-
-    return result
-
 def _format_batch_validation_error(message: str, missing: list[dict] | None = None, extras: list[dict] | None = None) -> str:
     parts = [message]
     if missing:
@@ -6004,14 +5446,6 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
     used_by_role: dict[str, set[str]] = {role: set() for role in role_files}
 
     primary_files = role_files[primary_role]
-    primary_files_before_parasol_filter = len(primary_files)
-    primary_files = filter_parasol_jd_files_for_jobs(module, primary_files)
-    if not primary_files:
-        raise HTTPException(
-            status_code=400,
-            detail="PARASOL 输入目录中没有识别到 JD 主输入文件，无法生成任务。请检查文件名是否包含 JD_。",
-        )
-    role_files[primary_role] = primary_files
     total = len(primary_files)
 
     for idx, primary_path in enumerate(primary_files, start=1):
@@ -6082,22 +5516,12 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
         job_inputs["_batch_index"] = idx
         job_inputs["_batch_total"] = total
         job_inputs["_batch_slot"] = slot
-        if is_parasol_jd_pair_module(module) and primary_files_before_parasol_filter != len(primary_files):
-            job_inputs["_parasol_jd_filter"] = (
-                f"目录中共 {primary_files_before_parasol_filter} 个文件，仅 JD 主输入生成 {len(primary_files)} 个任务；"
-                "JL 文件由模块自动匹配"
-            )
 
         # 不把平台内部字段写给 exe，除非模块显式要求。
         exe_inputs = {
             k: v for k, v in job_inputs.items()
-            if not (str(k).startswith("_batch_") or str(k).startswith("_parasol_"))
+            if not str(k).startswith("_batch_")
         }
-
-        # H8 AOD 的 AOD_AHI.exe JSON 模式使用 *_file / OUT_file 字段，
-        # 但页面为了让用户选择目录，字段通常是 *_dir / output_dir。
-        # 批处理拆分后再统一转换，避免用户界面变复杂。
-        exe_inputs = _normalize_h8aod_config_for_exe(module, exe_inputs)
 
         command, working_dir, runtime_env = build_runtime_for_module(module, exe_inputs)
         jobs.append({
