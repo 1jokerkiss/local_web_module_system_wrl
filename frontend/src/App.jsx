@@ -1666,7 +1666,9 @@ export default function App() {
         }
       } catch (e) {
         clearAuthToken();
-        setStartupError(e?.message || '系统初始化失败');
+        if (e?.status !== 401) {
+          setStartupError(e?.message || '系统初始化失败');
+        }
       }
     };
     init();

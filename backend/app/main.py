@@ -2903,14 +2903,15 @@ def _json_error_snippet(text: str, line_no: int, col_no: int, window: int = 2) -
 
 
 def _load_module_json_for_validation(module_json_path: Path, report: dict) -> dict | None:
+    display_name = module_json_path.name or "module.json"
     try:
         text, encoding = _read_text_with_encoding(module_json_path)
     except Exception as exc:
         _add_error(
             report,
-            "module.json",
-            f"读取 module.json 失败：{type(exc).__name__}: {exc}",
-            "确认 module.json 没有被其他程序占用，并且文件编码建议保存为 UTF-8。",
+            display_name,
+            f"读取 {display_name} 失败：{type(exc).__name__}: {exc}",
+            f"确认 {display_name} 没有被其他程序占用，并且文件编码建议保存为 UTF-8。",
         )
         return None
 
@@ -2920,7 +2921,7 @@ def _load_module_json_for_validation(module_json_path: Path, report: dict) -> di
         snippet = _json_error_snippet(text, exc.lineno, exc.colno)
         _add_error(
             report,
-            f"module.json 第 {exc.lineno} 行，第 {exc.colno} 列",
+            f"{display_name} 第 {exc.lineno} 行，第 {exc.colno} 列",
             f"JSON 语法错误：{exc.msg}",
             "按箭头位置检查：常见问题是少逗号、多逗号、用了中文引号、字符串没有双引号、数组或对象括号没有闭合。JSON 不能写注释。",
             line=exc.lineno,
@@ -2933,35 +2934,57 @@ def _load_module_json_for_validation(module_json_path: Path, report: dict) -> di
     except Exception as exc:
         _add_error(
             report,
-            "module.json",
+            display_name,
             f"JSON 解析失败：{type(exc).__name__}: {exc}",
-            "用 JSON 校验工具检查 module.json，注意不能有注释、尾随逗号或非法引号。",
+            f"用 JSON 校验工具检查 {display_name}，注意不能有注释、尾随逗号或非法引号。",
         )
         return None
 
     if not isinstance(data, dict):
-        _add_error(report, "module.json", "顶层必须是 JSON 对象", "module.json 顶层应写成 { ... }，不能是数组或字符串。")
+        _add_error(report, display_name, "顶层必须是 JSON 对象", f"{display_name} 顶层应写成 {{ ... }}，不能是数组或字符串。")
         return None
 
     return data
 
 
 def _find_module_json(folder_path: Path, report: dict) -> Path | None:
-    direct = folder_path / "module.json"
-    if direct.exists() and direct.is_file():
-        return direct
+    """查找可执行模块配置文件。
 
-    candidates = [p for p in folder_path.rglob("module.json") if p.is_file()]
+    新版可执行模块使用 executable_module.json + config.json，
+    旧版仍兼容 module.json。优先使用 executable_module.json。
+    """
+    direct_new = folder_path / "executable_module.json"
+    if direct_new.exists() and direct_new.is_file():
+        return direct_new
+
+    direct_old = folder_path / "module.json"
+    if direct_old.exists() and direct_old.is_file():
+        return direct_old
+
+    candidates = [p for p in folder_path.rglob("executable_module.json") if p.is_file()]
     if not candidates:
-        _add_error(report, "module.json", "模块文件夹中未找到 module.json", "把 module.json 放在模块根目录，和 exe、resources、deps 等目录放在同一级。")
-        _add_missing(report, folder_path / "module.json", "缺少模块清单文件", "新增 module.json，并填写 id、name、executable、command_template、inputs。")
+        candidates = [p for p in folder_path.rglob("module.json") if p.is_file()]
+
+    if not candidates:
+        _add_error(
+            report,
+            "executable_module.json",
+            "模块文件夹中未找到 executable_module.json 或 module.json",
+            "把 executable_module.json 放在模块根目录，和 config.json、exe、resources、deps 等目录放在同一级。",
+        )
+        _add_missing(
+            report,
+            folder_path / "executable_module.json",
+            "缺少可执行模块配置文件",
+            "新增 executable_module.json，并填写 module_id、module_name、entry_file、param_json_path 等字段。",
+        )
         return None
 
-    candidates.sort(key=lambda x: len(x.parts))
+    candidates.sort(key=lambda x: (0 if x.name.lower() == "executable_module.json" else 1, len(x.parts)))
     if len(candidates) > 1:
-        _add_warning(report, "module.json", f"检测到 {len(candidates)} 个 module.json，系统会使用最靠近根目录的这个：{candidates[0]}", "建议一个模块包只保留一个 module.json，避免安装错模块。")
-    else:
-        _add_warning(report, "module.json", f"module.json 不在选择目录根部，当前使用：{candidates[0]}", "建议把 module.json 放到你选择的模块文件夹根目录。")
+        _add_warning(report, candidates[0].name, f"检测到多个模块配置文件，系统会使用这个：{candidates[0]}", "建议一个模块包只保留一个 executable_module.json，避免安装错模块。")
+    elif candidates[0].parent != folder_path:
+        _add_warning(report, candidates[0].name, f"配置文件不在选择目录根部，当前使用：{candidates[0]}", "建议把 executable_module.json 放到你选择的模块文件夹根目录。")
     return candidates[0]
 
 
@@ -2987,12 +3010,194 @@ def _resolve_module_reference(module_root: Path, raw_value: Any, module_id: str 
     return (module_root / p).resolve()
 
 
+
+def _cfg_alias_value(cfg: dict, *names: str, default=None):
+    """兼容 executable_module.json 中的 module_id/module id/module-id 等写法。"""
+    if not isinstance(cfg, dict):
+        return default
+    for name in names:
+        candidates = [name, name.replace("_", " "), name.replace("_", "-")]
+        for candidate in candidates:
+            if candidate in cfg and cfg.get(candidate) not in (None, ""):
+                return cfg.get(candidate)
+    return default
+
+
+def _is_new_executable_manifest(manifest_path: Path, data: dict) -> bool:
+    if manifest_path.name.lower() == "executable_module.json":
+        return True
+    return any(k in data for k in ["module_id", "module id", "module-name", "module_name", "entry_file", "entry file", "param_json_path", "param json path"])
+
+
+def _infer_executable_inputs_from_config(param_json: dict, module_root: Path, module_data: dict) -> list[dict]:
+    """从新版 config.json 自动生成输入表单，并补充批处理/固定资源属性。"""
+    inputs = infer_inputs_from_param_json(param_json)
+    parallel_cfg = module_data.get("parallel") if isinstance(module_data.get("parallel"), dict) else {}
+    parallel_patterns = parallel_cfg.get("file_patterns") or parallel_cfg.get("patterns") or "*"
+
+    for item in inputs:
+        key = str(item.get("key") or "")
+        lower = key.lower()
+        value = param_json.get(key)
+        value_text = str(value or "")
+
+        # 输出目录/输出文件
+        if any(x in lower for x in ["out", "output", "result", "save", "输出"]):
+            item["io_role"] = "output"
+            item["batch_role"] = "output"
+            if item.get("type") not in {"file_path", "dir_path"}:
+                item["type"] = "dir_path"
+            continue
+
+        # 固定配置/资源文件：config_xml、LUT、IGBP、DEM 等默认隐藏，按模块目录解析。
+        is_resource_like = (
+            lower in {"config_xml", "xml", "lut", "lut_file", "igbp", "igbp_file", "dem", "dem_file", "geo", "geo1", "geo1_file"}
+            or any(x in lower for x in ["xml", "lut", "igbp", "dem", "geo"])
+        )
+        if is_resource_like and value_text:
+            p = Path(value_text)
+            if not p.is_absolute():
+                p = (module_root / p).resolve()
+            if p.exists():
+                item["visible_to_user"] = False
+                item["admin_fixed"] = True
+                item["path_mode"] = "relative_to_module"
+                item["io_role"] = "input"
+                item["type"] = "file_path" if p.is_file() else "dir_path"
+                item["batch_role"] = ""
+                continue
+
+        # 主要输入目录/输入文件。新版 exe 和 Python 风格一致：用户只填目录，系统可按文件拆任务。
+        if item.get("type") in {"file_path", "dir_path"}:
+            item["io_role"] = "input"
+            if any(x in lower for x in ["input", "file", "dir", "folder", "输入"]):
+                item["batch_role"] = "input"
+                item["match_mode"] = "each_file"
+                item["file_patterns"] = parallel_patterns
+                item["batch_allow_all_files"] = True
+                item["batch_allow_no_extension"] = True
+
+    return inputs
+
+
+def _normalize_new_executable_manifest(module_root: Path, manifest_path: Path, raw_data: dict, report: dict) -> dict:
+    """把新版 executable_module.json 转成系统内部沿用的 module.json 记录。"""
+    if not _is_new_executable_manifest(manifest_path, raw_data):
+        return raw_data
+
+    module_id = str(_cfg_alias_value(raw_data, "module_id", "id", default="") or "").strip()
+    module_name = str(_cfg_alias_value(raw_data, "module_name", "name", default="") or "").strip()
+    entry_file = str(_cfg_alias_value(raw_data, "entry_file", "entry", "executable", default="") or "").strip()
+    source_dir = str(_cfg_alias_value(raw_data, "source_dir", "working_dir", default=".") or ".").strip() or "."
+    param_json_name = str(_cfg_alias_value(raw_data, "param_json_path", "config_json", "config_path", default="config.json") or "config.json").strip() or "config.json"
+    description = str(_cfg_alias_value(raw_data, "description", default="") or "").strip()
+    tool_type = str(_cfg_alias_value(raw_data, "tool_type", "category", default="") or "").strip()
+
+    source_path = _resolve_module_reference(module_root, source_dir, module_id, module_root)
+    if not source_path.exists() or not source_path.is_dir():
+        _add_error(report, "source_dir", f"source_dir 指向的目录不存在：{source_dir}", "如果 exe、config.json 和资源都在模块根目录，source_dir 写 \".\"。")
+        _add_missing(report, source_path, "source_dir 指向的目录不存在", "创建该目录，或修改 source_dir。")
+        source_path = module_root
+
+    entry_path = _resolve_module_reference(source_path, entry_file, module_id, source_path) if entry_file else source_path
+    if not entry_file:
+        _add_error(report, "entry_file", "缺少 entry_file", "在 executable_module.json 中添加例如：\"entry_file\": \"ParasolAOD.exe\"。")
+    elif not entry_path.exists() or not entry_path.is_file():
+        _add_error(report, "entry_file", f"入口可执行文件不存在：{entry_file}", "把 exe 放到模块目录，或修改 entry_file。")
+        _add_missing(report, entry_path, "entry_file 指向的 exe 不存在", "把编译好的 exe 放到该位置。")
+
+    param_json_path = _resolve_module_reference(source_path, param_json_name, module_id, source_path)
+    param_json = None
+    if not param_json_path.exists() or not param_json_path.is_file():
+        _add_error(report, "param_json_path", f"参数 config.json 不存在：{param_json_path}", "把 config.json 放到模块目录，或修改 param_json_path。")
+        _add_missing(report, param_json_path, "缺少运行参数 config.json", "新增 config.json，用它生成前端输入/输出表单。")
+    else:
+        param_json = _load_json_for_validation(param_json_path, report, param_json_path.name)
+        if param_json is not None and not isinstance(param_json, dict):
+            _add_error(report, "param_json_path", "config.json 顶层必须是对象", "例如 {\"input_file\": \"...\", \"output_dir\": \"...\"}。")
+            param_json = None
+
+    if not module_id:
+        _add_error(report, "module_id", "缺少 module_id", "在 executable_module.json 中添加例如：\"module_id\": \"parasol_aod\"。")
+    elif not re.match(r"^[A-Za-z0-9_\-\.]+$", module_id):
+        _add_error(report, "module_id", f"module_id 不建议包含空格、中文或特殊符号：{module_id}", "建议只使用英文、数字、下划线、中划线或点。")
+    if not module_name:
+        _add_error(report, "module_name", "缺少 module_name", "在 executable_module.json 中添加例如：\"module_name\": \"PARASOL AOD 反演\"。")
+
+    dependency_dirs = _cfg_alias_value(raw_data, "dependency_dirs", default=[])
+    if isinstance(dependency_dirs, str):
+        dependency_dirs = [dependency_dirs]
+    if not isinstance(dependency_dirs, list):
+        dependency_dirs = []
+
+    resource_dirs = _cfg_alias_value(raw_data, "resource_dirs", default=[])
+    if isinstance(resource_dirs, str):
+        resource_dirs = [resource_dirs]
+    if not isinstance(resource_dirs, list):
+        resource_dirs = []
+
+    runtime_env_path = _cfg_alias_value(raw_data, "runtime_env_path", "environment_path", "env_path", default="")
+    dependency_search_dirs = _cfg_alias_value(raw_data, "dependency_search_dirs", default=[])
+    if isinstance(dependency_search_dirs, str):
+        dependency_search_dirs = [dependency_search_dirs]
+    if runtime_env_path:
+        dependency_search_dirs = list(dependency_search_dirs or []) + [runtime_env_path]
+
+    parallel_cfg = raw_data.get("parallel") if isinstance(raw_data.get("parallel"), dict) else {}
+    if not parallel_cfg:
+        parallel_cfg = {
+            "mode": "auto",
+            "file_patterns": "*",
+            "output_suffix": ".tif",
+            "output_naming": "source_stem",
+        }
+
+    inputs = _infer_executable_inputs_from_config(param_json or {}, source_path, {"parallel": parallel_cfg})
+
+    # 如果声明了 JD/JL 配对，确保输入字段只按 JD 生成任务。
+    if isinstance(parallel_cfg, dict) and (parallel_cfg.get("jd_jl_pair") is True or parallel_cfg.get("jd_only") is True):
+        for item in inputs:
+            if item.get("batch_role") == "input":
+                item["file_patterns"] = parallel_cfg.get("file_patterns") or "*jd*;*JD*"
+                item["batch_include_regex"] = r"(?i)jd(?=[_.-])"
+
+    # 内部 module 记录仍沿用 executable 字段。
+    # 如果 source_dir 不是根目录，executable 需要保存为相对模块根目录的路径，
+    # 这样安装复制后仍能正确定位 exe。
+    try:
+        executable_rel = str((Path(source_dir) / entry_file).as_posix()) if source_dir not in {"", "."} else entry_file
+    except Exception:
+        executable_rel = entry_file
+
+    module_data = {
+        "id": module_id,
+        "name": module_name,
+        "description": description,
+        "runtime": "cpp_native",
+        "entry": executable_rel,
+        "executable": executable_rel,
+        "working_dir": source_dir,
+        "config_mode": "json_file",
+        "command_template": ["{executable}", "{config_json}"],
+        "dependency_dirs": dependency_dirs,
+        "dependency_search_dirs": dependency_search_dirs,
+        "resource_dirs": resource_dirs,
+        "parallel": parallel_cfg,
+        "tags": raw_data.get("tags") if isinstance(raw_data.get("tags"), list) else ["executable", "native"],
+        "tool_type": tool_type or "气溶胶反演",
+        "enabled": bool(raw_data.get("enabled", True)),
+        "inputs": inputs,
+        "_manifest_format": "executable_module_json",
+        "_param_json_path": str(param_json_path),
+    }
+    return module_data
+
 def _module_json_error_detail(report: dict) -> dict:
     _dedupe_report_items(report)
     report["ok"] = False
     report["can_install"] = False
     return {
-        "message": "C++ 可执行模块校验失败，请按下面提示修改后再安装。",
+        "message": "可执行模块校验失败，请按下面提示修改后再安装。",
         **report,
     }
 
@@ -3336,6 +3541,8 @@ def validate_cpp_module_folder(folder_path: Path, tool_type: str | None = None, 
     if module_data is None:
         _dedupe_report_items(report)
         return report
+
+    module_data = _normalize_new_executable_manifest(module_root, module_json_path, module_data, report)
 
     selected_tool_type = (
         normalize_tool_key(tool_type or module_data.get("tool_type") or "")
@@ -3824,7 +4031,7 @@ def api_validate_cpp_module_folder(
 
     return {
         "ok": bool(report.get("ok")),
-        "message": "C++ 可执行模块校验通过" if report.get("ok") else "C++ 可执行模块校验未通过",
+        "message": "可执行模块校验通过" if report.get("ok") else "可执行模块校验未通过",
         **report,
     }
 
@@ -3857,7 +4064,7 @@ def api_install_module_folder(
 
     return {
         "ok": True,
-        "message": "C++ 模块文件夹安装成功",
+        "message": "可执行模块文件夹安装成功",
         "module": module_data,
     }
 """新增 /api/admin/modules/upload-python

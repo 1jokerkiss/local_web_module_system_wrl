@@ -176,85 +176,6 @@
     }
   },
   {
-    "id": "parasol_aod",
-    "name": "PARASOL AOD 反演",
-    "description": "PARASOL AOD 本地原生模块。用户选择 PARASOL 输入文件目录和输出目录，管理员固定配置 XML、LUT 和 IGBP 资源。",
-    "runtime": "native",
-    "entry": "ParasolAOD.exe",
-    "executable": "backend/installed_modules/parasol_aod/ParasolAOD.exe",
-    "working_dir": "backend/installed_modules/parasol_aod",
-    "config_mode": "none",
-    "dependency_dirs": [
-      "deps"
-    ],
-    "command_template": [
-      "{executable}",
-      "{input_file}",
-      "{output_dir}",
-      "{config_xml}"
-    ],
-    "parallel": {
-      "mode": "auto",
-      "input_key": "",
-      "output_key": "",
-      "file_patterns": "*.*",
-      "output_suffix": ".tif"
-    },
-    "tags": [
-      "parasol",
-      "aod",
-      "remote-sensing",
-      "native"
-    ],
-    "enabled": true,
-    "inputs": [
-      {
-        "key": "input_file",
-        "label": "PARASOL 输入文件目录",
-        "type": "dir_path",
-        "required": true,
-        "placeholder": "请选择 PARASOL Level-1 输入文件所在目录",
-        "default": "",
-        "help_text": "选择一个目录，平台会把目录中的输入文件拆成多个 job 并行运行。",
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "batch_role": "parasol",
-        "match_mode": "each_file"
-      },
-      {
-        "key": "output_dir",
-        "label": "输出目录",
-        "type": "dir_path",
-        "required": true,
-        "placeholder": "请选择输出目录",
-        "default": "",
-        "help_text": "程序会在该目录下生成输出文件。",
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "batch_role": "",
-        "match_mode": "none",
-        "output_ext": ".tif"
-      },
-      {
-        "key": "config_xml",
-        "label": "PARASOL 配置 XML",
-        "type": "file_path",
-        "required": true,
-        "placeholder": "",
-        "default": "resources/ConfigXMLFile.xml",
-        "help_text": "管理员固定输入，用户界面隐藏。XML 中配置 LUT 和 IGBP 文件路径。",
-        "visible_to_user": false,
-        "admin_fixed": true,
-        "path_mode": "relative_to_module",
-        "batch_role": "",
-        "match_mode": "none"
-      }
-    ],
-    "tool_type": "aerosol"
-  },
-  {
     "id": "H8_CLOUD_TYPE",
     "name": "葵花8号云类型反演",
     "description": "葵花8号卫星云类型反演 Python 源码模块",
@@ -319,5 +240,84 @@
       "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
       "output_suffix": ".tif"
     }
+  },
+  {
+    "id": "parasol_aod",
+    "name": "PARASOL AOD 反演",
+    "description": "PARASOL AOD 本地可执行模块。用户选择 PARASOL 输入目录和输出目录，管理员固定配置 XML、LUT 和 IGBP 资源。JD/JL 文件为配套文件，系统只按 JD 文件生成任务，JL 文件由模块自动匹配。",
+    "executable": "backend/installed_modules/parasol_aod/ParasolAOD.exe",
+    "working_dir": "backend/installed_modules/parasol_aod",
+    "config_mode": "json_file",
+    "command_template": [
+      "{executable}",
+      "{config_json}"
+    ],
+    "inputs": [
+      {
+        "key": "input_file",
+        "label": "input_file",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/yan1study/AOD_test/AOD_model/ParasolAOD/test_data",
+        "batch_role": "input",
+        "match_mode": "each_file",
+        "file_patterns": "*jd*;*JD*",
+        "batch_allow_all_files": true,
+        "batch_allow_no_extension": true,
+        "batch_include_regex": "(?i)jd(?=[_.-])"
+      },
+      {
+        "key": "output_dir",
+        "label": "output_dir",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "D:/yan1study/AOD_test/AOD_model/ParasolAOD/web_test_out",
+        "batch_role": "output"
+      },
+      {
+        "key": "config_xml",
+        "label": "config_xml",
+        "type": "file_path",
+        "required": true,
+        "visible_to_user": false,
+        "admin_fixed": true,
+        "path_mode": "relative_to_module",
+        "io_role": "input",
+        "default": "resources/ConfigXMLFile.xml",
+        "batch_role": ""
+      }
+    ],
+    "tags": [
+      "executable",
+      "native"
+    ],
+    "tool_type": "aerosol",
+    "parallel": {
+      "mode": "auto",
+      "input_key": "",
+      "output_key": "",
+      "file_patterns": "*jd*;*JD*",
+      "output_suffix": ".tif"
+    },
+    "enabled": true,
+    "runtime": "cpp_native",
+    "entry": "ParasolAOD.exe",
+    "dependency_dirs": [
+      "deps"
+    ],
+    "dependency_search_dirs": [],
+    "resource_dirs": [
+      "resources"
+    ],
+    "_manifest_format": "executable_module_json",
+    "_param_json_path": "D:\\local_module_web_system\\local_module_web_system\\parasol\\config.json"
   }
 ]
