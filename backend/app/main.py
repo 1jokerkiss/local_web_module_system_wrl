@@ -227,6 +227,107 @@ DEFAULT_TOOLBARS = [
     {"key": "aerosol", "label": "气溶胶反演", "system": False},
 ]
 
+
+CHINESE_PATH_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+PATH_LIKE_KEY_PATTERN = re.compile(
+    r"(path|dir|file|folder|executable|working_dir|source_dir|outpath|out_dir|output|input|config|runtime_env|python_executable|python_path)",
+    re.IGNORECASE,
+)
+
+
+def contains_chinese_text(value: Any) -> bool:
+    return bool(CHINESE_PATH_PATTERN.search(str(value or "")))
+
+
+def is_path_like_key(key: str) -> bool:
+    return bool(PATH_LIKE_KEY_PATTERN.search(str(key or "")))
+
+
+def is_path_like_value(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return (
+        bool(re.match(r"^[A-Za-z]:[\\/]", text))
+        or text.startswith("\\\\")
+        or "\\" in text
+        or "/" in text
+        or text.startswith("./")
+        or text.startswith("../")
+        or text.startswith(".\\")
+        or text.startswith("..\\")
+    )
+
+
+def collect_chinese_path_items(value: Any, prefix: str = "路径") -> list[dict]:
+    items: list[dict] = []
+
+    def walk(v: Any, key_path: str):
+        if v is None:
+            return
+
+        if isinstance(v, str):
+            text = v.strip()
+            if text and contains_chinese_text(text) and (is_path_like_value(text) or is_path_like_key(key_path)):
+                items.append({"field": key_path or "路径", "path": text})
+            return
+
+        if isinstance(v, dict):
+            for key, item in v.items():
+                next_key = f"{key_path}.{key}" if key_path else str(key)
+                walk(item, next_key)
+            return
+
+        if isinstance(v, (list, tuple)):
+            for idx, item in enumerate(v):
+                walk(item, f"{key_path}[{idx}]")
+            return
+
+    walk(value, prefix)
+    return items
+
+
+def chinese_path_error_detail(items: list[dict]) -> dict:
+    errors = []
+    for item in items[:20]:
+        field = str(item.get("field") or "路径")
+        path = str(item.get("path") or "")
+        errors.append({
+            "field": field,
+            "message": f"检测到中文路径：{path}",
+            "suggestion": "当前系统暂不支持中文路径运行。请把数据、模块和输出目录放到纯英文路径下，例如 D:/H8/input、D:/H8/output。",
+        })
+
+    return {
+        "message": "检测到中文路径，当前系统暂不支持中文路径。请改为纯英文路径后再继续。",
+        "errors": errors,
+        "suggestions": [
+            "请将输入数据目录、输出目录、模块目录和 Python 解释器路径改为纯英文路径。",
+            "推荐示例：D:/H8/input、D:/H8/output、D:/local_web_modules/H8_CLOUD_TYPE。",
+        ],
+    }
+
+
+def raise_if_chinese_paths(value: Any, prefix: str = "路径"):
+    items = collect_chinese_path_items(value, prefix)
+    if items:
+        raise HTTPException(status_code=400, detail=chinese_path_error_detail(items))
+
+
+def add_chinese_path_errors_to_report(report: dict, value: Any, prefix: str = "路径") -> bool:
+    items = collect_chinese_path_items(value, prefix)
+    for item in items:
+        _add_error(
+            report,
+            str(item.get("field") or prefix),
+            f"检测到中文路径：{item.get('path')}",
+            "当前系统暂不支持中文路径运行。请把该路径改为纯英文路径，例如 D:/H8/input 或 D:/local_web_modules/module_name。",
+        )
+    if items:
+        _dedupe_report_items(report)
+    return bool(items)
+
+
 def to_project_relative_path(path: Path) -> str:
     """
     项目内部路径保存为相对于项目根目录的路径。
@@ -558,30 +659,8 @@ def sanitize_filename(name: str) -> str:
     return name.replace("..", "_").replace("/", "_").replace("\\", "_")
 
 def save_modules(modules: List[dict]):
-    """
-    保存模块列表时顺便按模块 ID 去重。
-    这样即使历史 modules.json 中已经出现重复模块，也会在下次保存时自动清理。
-    同一 ID 只保留第一条记录，避免后来误装的重复模块覆盖原模块。
-    """
-    cleaned: List[dict] = []
-    seen_ids = set()
-
-    for module in modules or []:
-        if not isinstance(module, dict):
-            continue
-
-        key = _normalize_module_id_for_compare(str(module.get("id") or ""))
-        if not key:
-            continue
-
-        if key in seen_ids:
-            continue
-
-        seen_ids.add(key)
-        cleaned.append(module)
-
     MODULES_FILE.write_text(
-        json.dumps(cleaned, ensure_ascii=False, indent=2),
+        json.dumps(modules, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -591,83 +670,6 @@ def get_module(module_id: str) -> Optional[dict]:
         if module.get("id") == module_id:
             return module
     return None
-
-
-def _normalize_module_id_for_compare(module_id: str) -> str:
-    """
-    模块 ID 用作 installed_modules/{module_id} 目录名。
-    Windows 路径大小写不敏感，所以这里按清理后的 ID 小写比较，避免
-    H8_CLOUD_TYPE / h8_cloud_type 被当成两个模块反复安装。
-    """
-    return sanitize_filename(str(module_id or "").strip()).lower()
-
-
-def find_existing_module_by_id(module_id: str) -> Optional[dict]:
-    target = _normalize_module_id_for_compare(module_id)
-    if not target:
-        return None
-
-    for module in load_modules():
-        current = _normalize_module_id_for_compare(str(module.get("id") or ""))
-        if current == target:
-            return module
-
-    return None
-
-
-def module_id_exists(module_id: str) -> bool:
-    return find_existing_module_by_id(module_id) is not None
-
-
-def _duplicate_module_detail(module_id: str, existing: dict | None = None) -> dict:
-    existing = existing or find_existing_module_by_id(module_id) or {}
-    return {
-        "message": (
-            f"模块 ID“{module_id}”已存在，不能重复添加同一个模块。"
-            "请先在模块管理中删除旧模块，或修改新模块配置中的 module_id / id 后再安装。"
-        ),
-        "errors": [
-            {
-                "field": "module_id",
-                "message": f"模块 ID 已存在：{module_id}",
-                "suggestion": "删除旧模块后再安装，或把新模块配置中的 module_id / id 改成新的唯一值。",
-                "existing_module": {
-                    "id": existing.get("id"),
-                    "name": existing.get("name"),
-                    "tool_type": existing.get("tool_type"),
-                },
-            }
-        ],
-        "existing_module": {
-            "id": existing.get("id"),
-            "name": existing.get("name"),
-            "tool_type": existing.get("tool_type"),
-        },
-    }
-
-
-def assert_new_module_id(module_id: str):
-    existing = find_existing_module_by_id(module_id)
-    if existing:
-        raise HTTPException(status_code=409, detail=_duplicate_module_detail(module_id, existing))
-
-
-def add_duplicate_module_error_to_report(report: dict, module_id: str):
-    existing = find_existing_module_by_id(module_id)
-    if not existing:
-        return
-
-    _add_error(
-        report,
-        "module_id",
-        f"模块 ID 已存在：{module_id}",
-        "请先在模块管理中删除旧模块，或修改新模块配置中的 module_id / id 后再安装。",
-        existing_module={
-            "id": existing.get("id"),
-            "name": existing.get("name"),
-            "tool_type": existing.get("tool_type"),
-        },
-    )
 
 
 def is_tif_path(path: Path) -> bool:
@@ -1276,6 +1278,9 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
     # 1. 合并输入参数
     inputs = merge_admin_fixed_inputs(module, payload.inputs or {})
     inputs = coerce_json_marked_inputs(module, inputs)
+
+    # 当前版本不支持中文路径：运行前统一拦截，避免 netCDF4/xarray/GDAL/HDF5 在 Windows 下读取失败。
+    raise_if_chinese_paths(inputs, f"模块 {module.get('name') or module.get('id') or ''} 输入参数")
 
     requested_workers = clamp_parallel_workers(
         payload.parallel_workers,
@@ -2257,8 +2262,6 @@ def install_python_venv_module_from_values(
     safe_module_id = sanitize_filename(module_id).strip()
     if not safe_module_id:
         raise HTTPException(status_code=400, detail="模块 ID 不能为空")
-
-    assert_new_module_id(safe_module_id)
 
     python_env_mode = str(python_env_mode or "create_venv").strip().lower()
     if python_env_mode not in {"create_venv", "existing"}:
@@ -3313,6 +3316,9 @@ def collect_cpp_runtime_dependencies(module_root: Path, exe_path: Path, module_d
 def validate_cpp_module_folder(folder_path: Path, tool_type: str | None = None, collect_dependencies: bool = False, copy_dependencies: bool = False) -> dict:
     report = make_cpp_validation_report(folder_path)
 
+    if add_chinese_path_errors_to_report(report, {"模块文件夹": str(folder_path)}, "可执行模块路径"):
+        return report
+
     if not folder_path.exists() or not folder_path.is_dir():
         _add_error(report, "folder_path", f"模块文件夹不存在：{folder_path}", "请选择包含 module.json 的模块根目录。")
         _add_missing(report, folder_path, "选择的模块文件夹不存在", "重新选择正确的本地文件夹路径。")
@@ -3341,11 +3347,20 @@ def validate_cpp_module_folder(folder_path: Path, tool_type: str | None = None, 
     if str(module_data.get("runtime") or "").strip() == "":
         module_data["runtime"] = "cpp_native"
 
-    _validate_cpp_module_structure(module_root, module_data, report)
+    add_chinese_path_errors_to_report(
+        report,
+        {
+            "module_root": str(module_root),
+            "executable": module_data.get("executable") or module_data.get("entry"),
+            "working_dir": module_data.get("working_dir"),
+            "runtime_env_path": module_data.get("runtime_env_path"),
+            "dependency_search_dirs": module_data.get("dependency_search_dirs"),
+            "inputs": module_data.get("inputs"),
+        },
+        "可执行模块配置路径",
+    )
 
-    module_id = str(module_data.get("id") or "").strip()
-    if module_id:
-        add_duplicate_module_error_to_report(report, module_id)
+    _validate_cpp_module_structure(module_root, module_data, report)
 
     executable = str(module_data.get("executable") or module_data.get("entry") or "").strip()
     module_id = str(module_data.get("id") or "").strip()
@@ -3378,12 +3393,8 @@ def install_validated_cpp_module(module_root: Path, module_data: dict, collect_d
     if not module_id:
         raise HTTPException(status_code=400, detail="module.json 缺少 id")
 
-    assert_new_module_id(module_id)
-
     target_dir = INSTALLED_MODULES_DIR / module_id
     if target_dir.exists():
-        # 理论上已有模块会被 assert_new_module_id 拦截。
-        # 这里保留兜底，防止历史残留目录阻止重新安装一个未登记的新模块。
         shutil.rmtree(target_dir)
     shutil.copytree(module_root, target_dir)
 
@@ -3565,6 +3576,9 @@ def validate_python_module_config_file(raw_path: str) -> dict:
         _dedupe_report_items(report)
         return report
 
+    if add_chinese_path_errors_to_report(report, {"Python 模块配置 JSON": raw}, "Python 模块配置 JSON"):
+        return report
+
     config_path = _resolve_validation_path(raw)
     report["config_path"] = str(config_path)
     report["config_dir"] = str(config_path.parent)
@@ -3607,6 +3621,17 @@ def validate_python_module_config_file(raw_path: str) -> dict:
     entry_file = str(_get_python_cfg_value(module_cfg, ["entry_file"], "main.py")).strip() or "main.py"
     python_executable_raw = str(_get_python_cfg_value(module_cfg, ["python_executable", "python", "python_path"], "")).strip()
     python_env_mode = str(_get_python_cfg_value(module_cfg, ["python_env_mode", "env_mode"], "create_venv")).strip().lower() or "create_venv"
+
+    add_chinese_path_errors_to_report(
+        report,
+        {
+            "source_dir": source_dir_raw,
+            "entry_file": entry_file,
+            "param_json_path": str(_get_python_cfg_value(module_cfg, ["param_json_path", "config_json"], "")).strip(),
+            "python_executable": python_executable_raw,
+        },
+        "Python 模块配置路径",
+    )
 
     if module_id_key == "id":
         _add_warning(report, "id", "检测到使用 id 字段，系统兼容该写法", "Python 配置 JSON 建议使用 module_id，便于和 C++ module.json 的 id 区分。")
@@ -3706,13 +3731,11 @@ def validate_python_module_config_file(raw_path: str) -> dict:
 
     inputs: list[dict] = []
     if isinstance(param_json, dict):
+        add_chinese_path_errors_to_report(report, param_json, "参数 JSON 路径")
         try:
             inputs = infer_inputs_from_param_json(param_json)
         except Exception as exc:
             _add_warning(report, "param_json_path", f"参数自动识别失败：{type(exc).__name__}: {exc}", "检查参数 JSON 中的值是否能被序列化；也可以先简化参数 JSON。")
-
-    if module_id:
-        add_duplicate_module_error_to_report(report, module_id)
 
     report["module"] = {
         "module_id": module_id,
@@ -3882,8 +3905,6 @@ def api_upload_python_module(
     if not safe_module_id:
         raise HTTPException(status_code=400, detail="模块 ID 不能为空")
 
-    assert_new_module_id(safe_module_id)
-
     if not file.filename or not file.filename.lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="请上传 Python 源码 zip 包")
 
@@ -3961,6 +3982,15 @@ def api_upload_python_folder_module(
     authorization: str | None = Header(default=None),
 ):
     require_admin(authorization)
+
+    raise_if_chinese_paths(
+        {
+            "folder_path": payload.folder_path,
+            "source_dir": payload.source_dir,
+            "param_json_path": payload.param_json_path,
+        },
+        "Python 模块安装路径",
+    )
 
     try:
         # 新模式：用户只选择 Python 模块文件夹
@@ -4219,6 +4249,17 @@ def api_admin_list_modules(authorization: str | None = Header(default=None)):
 def api_save_module(payload: ModuleSaveRequest, authorization: str | None = Header(default=None)):
     require_admin(authorization)
     module_data = payload.model_dump()
+
+    raise_if_chinese_paths(
+        {
+            "executable": module_data.get("executable"),
+            "working_dir": module_data.get("working_dir"),
+            "command_template": module_data.get("command_template"),
+            "inputs": module_data.get("inputs"),
+        },
+        "模块配置路径",
+    )
+
     upsert_module(module_data)
     return {"ok": True, "module": module_data}
 
@@ -4272,6 +4313,11 @@ def api_validate_python_module_folder(
     authorization: str | None = Header(default=None),
 ):
     require_admin(authorization)
+
+    if collect_chinese_path_items({"Python 模块文件夹": payload.folder_path}, "Python 模块文件夹"):
+        report = make_python_validation_report(str(payload.folder_path or ""))
+        add_chinese_path_errors_to_report(report, {"Python 模块文件夹": payload.folder_path}, "Python 模块文件夹")
+        return report
 
     try:
         config_path = resolve_python_module_config_from_folder(
@@ -4352,6 +4398,8 @@ def api_upload_python_config_module(
     authorization: str | None = Header(default=None),
 ):
     require_admin(authorization)
+
+    raise_if_chinese_paths({"Python 模块配置 JSON": payload.path}, "Python 模块配置 JSON")
 
     validation = validate_python_module_config_file(payload.path)
     if not validation.get("can_install"):
