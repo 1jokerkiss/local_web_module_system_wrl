@@ -168,11 +168,10 @@
     ],
     "tool_type": "aerosol",
     "parallel": {
-      "mode": "auto",
-      "input_key": "",
-      "output_key": "",
-      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
-      "output_suffix": ".tif"
+      "mode": "batch_group",
+      "file_patterns": "*.tif;*.tiff;*.img;*.hdf;*.HDF;*.h5;*.H5;*.nc;*.NC;*.dat;*.DAT",
+      "output_suffix": ".tif",
+      "output_naming": "source_stem"
     }
   },
   {
@@ -194,11 +193,12 @@
       "{config_xml}"
     ],
     "parallel": {
-      "mode": "auto",
-      "input_key": "",
-      "output_key": "",
-      "file_patterns": "*.*",
-      "output_suffix": ".tif"
+      "mode": "folder_chunks",
+      "input_key": "input_file",
+      "output_key": "output_dir",
+      "file_patterns": "*JD*;*JD_*;*JD-*;*.hdf;*.HDF;*.dat;*.DAT;*.nc;*.NC",
+      "output_suffix": ".tif",
+      "files_per_job": 1
     },
     "tags": [
       "parasol",
@@ -255,69 +255,131 @@
     "tool_type": "aerosol"
   },
   {
-    "id": "H8_CLOUD_TYPE",
+    "id": "H8_CLOUD_TYPE_EXE",
     "name": "葵花8号云类型反演",
-    "description": "葵花8号卫星云类型反演 Python 源码模块",
-    "enabled": true,
     "tool_type": "cloud",
-    "runtime_type": "python_venv",
-    "python_env_mode": "create_venv",
-    "base_python_executable": "D:\\Python\\Python38\\python.exe",
-    "install_release": "20260524_153639",
-    "config_mode": "config_json",
+    "description": "葵花8号云类型反演可执行模块，运行时读取 config.json，输入 NC 文件目录，输出云检测中间结果和最终 CARE_24CP 结果。",
+    "runtime": "executable",
+    "executable": "backend/installed_modules/H8_CLOUD_TYPE_EXE/CM_CTH.exe",
+    "working_dir": "backend/installed_modules/H8_CLOUD_TYPE_EXE",
+    "config_mode": "json_file",
     "command_template": [
       "{executable}",
-      "{entry_script}",
-      "{config_json}"
+      "{config_path}"
     ],
     "inputs": [
       {
         "key": "file",
-        "label": "file",
+        "label": "Input Folder",
         "type": "dir_path",
         "required": true,
+        "placeholder": "Select NC input folder",
         "visible_to_user": true,
         "admin_fixed": false,
         "path_mode": "absolute",
-        "io_role": "input",
-        "default": "D:\\NEPU\\NC"
+        "io_role": "input"
       },
       {
         "key": "cm_files",
-        "label": "cm_files",
+        "label": "Cloud Mask Folder",
         "type": "dir_path",
         "required": true,
+        "placeholder": "Select cloud mask output folder",
         "visible_to_user": true,
         "admin_fixed": false,
         "path_mode": "absolute",
-        "io_role": "input",
-        "default": "D:\\NEPU\\CM_24"
+        "io_role": "output"
       },
       {
         "key": "outpath",
-        "label": "outpath",
+        "label": "Output Folder",
         "type": "dir_path",
         "required": true,
+        "placeholder": "Select final output folder",
         "visible_to_user": true,
         "admin_fixed": false,
         "path_mode": "absolute",
-        "io_role": "output",
-        "default": "D:\\NEPU\\NC_1"
+        "io_role": "output"
       }
     ],
-    "param_template": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260524_153639/param_template.json",
-    "source_dir": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260524_153639/source",
-    "entry_file": "CM_CTH.py",
-    "entry_script": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260524_153639/source/CM_CTH.py",
-    "python_env_dir": "backend/module_envs/H8_CLOUD_TYPE_20260524_153639",
-    "executable": "backend/module_envs/H8_CLOUD_TYPE_20260524_153639/Scripts/python.exe",
-    "working_dir": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260524_153639/source",
     "parallel": {
-      "mode": "auto",
-      "input_key": "",
-      "output_key": "",
-      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
-      "output_suffix": ".tif"
-    }
+      "mode": "folder_chunks",
+      "input_key": "file",
+      "output_key": "outpath",
+      "file_patterns": "*.nc;*.NC",
+      "output_suffix": ".tif",
+      "files_per_job": 2
+    },
+    "dependency_dirs": [
+      "_internal",
+      "deps"
+    ],
+    "auto_collect_deps": false,
+    "tags": [
+      "h8",
+      "cloud",
+      "cth",
+      "executable"
+    ],
+    "enabled": true
+  },
+  {
+    "id": "CTH_FY",
+    "name": "FY CTH 反演",
+    "tool_type": "cloud",
+    "category": "cloud",
+    "description": "FY4 cloud top height retrieval executable module. It reads HDF files from the input folder and writes CTH GeoTIFF results to the output folder.",
+    "runtime": "executable",
+    "executable": "backend/installed_modules/CTH_FY/CTH_FY.exe",
+    "working_dir": "backend/installed_modules/CTH_FY",
+    "config_mode": "json_file",
+    "command_template": [
+      "{executable}",
+      "{config_path}"
+    ],
+    "inputs": [
+      {
+        "key": "fy4_path",
+        "label": "FY4 HDF Input Folder",
+        "type": "dir_path",
+        "required": true,
+        "placeholder": "Select FY4 HDF input folder",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input"
+      },
+      {
+        "key": "out_path",
+        "label": "Output Folder",
+        "type": "dir_path",
+        "required": true,
+        "placeholder": "Select output folder",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output"
+      }
+    ],
+    "parallel": {
+      "mode": "folder_chunks",
+      "input_key": "fy4_path",
+      "output_key": "out_path",
+      "file_patterns": "*.hdf;*.HDF",
+      "output_suffix": ".tif",
+      "files_per_job": 2
+    },
+    "dependency_dirs": [
+      "_internal",
+      "deps"
+    ],
+    "auto_collect_deps": false,
+    "tags": [
+      "FY4",
+      "CTH",
+      "cloud",
+      "executable"
+    ],
+    "enabled": true
   }
 ]

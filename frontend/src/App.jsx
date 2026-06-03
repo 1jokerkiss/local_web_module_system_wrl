@@ -613,6 +613,224 @@ function RunningDots({ active }) {
   return <span>{dots}</span>;
 }
 
+
+function formatElapsedSeconds(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds || 0)));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}小时${m}分${s}秒`;
+  if (m > 0) return `${m}分${s}秒`;
+  return `${s}秒`;
+}
+
+function parseTaskTimestamp(value) {
+  if (!value) return null;
+  const t = new Date(String(value).replace(' ', 'T')).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
+function countLogMatches(logs, pattern) {
+  return logs.reduce((n, line) => n + (pattern.test(String(line || '')) ? 1 : 0), 0);
+}
+
+function findLastNumberInLogs(logs, patterns) {
+  for (let i = logs.length - 1; i >= 0; i -= 1) {
+    const line = String(logs[i] || '');
+    for (const pattern of patterns) {
+      const m = line.match(pattern);
+      if (m && m[1]) {
+        const value = Number.parseInt(m[1], 10);
+        if (Number.isFinite(value) && value > 0) return value;
+      }
+    }
+  }
+  return 0;
+}
+
+function getTaskProgressInfo(task, taskLogs) {
+  const status = String(task?.status || '').toLowerCase();
+  const logs = Array.isArray(taskLogs) ? taskLogs : [];
+  const now = Date.now();
+  const startMs = parseTaskTimestamp(task?.started_at || task?.scheduled_at || task?.created_at);
+  const elapsedText = startMs ? formatElapsedSeconds((now - startMs) / 1000) : '';
+
+  if (!task) {
+    return {
+      percent: 0,
+      label: '正在加载任务信息',
+      detail: '',
+      mode: 'unknown',
+      color: '#2d7cf6',
+    };
+  }
+
+  if (status === 'queued') {
+    const queueText = task.queue_position ? `当前排队第 ${task.queue_position} 位` : '等待调度';
+    return {
+      percent: 0,
+      label: queueText,
+      detail: task.queue_reason || '系统正在等待可用进程槽',
+      mode: 'queued',
+      color: '#7c5cd6',
+    };
+  }
+
+  if (status === 'success') {
+    return {
+      percent: 100,
+      label: '任务已完成',
+      detail: elapsedText ? `总耗时：${elapsedText}` : '输出结果已进入登记流程',
+      mode: 'done',
+      color: '#1f9d55',
+    };
+  }
+
+  if (status === 'failed') {
+    return {
+      percent: 100,
+      label: '任务运行失败',
+      detail: '请查看下方运行日志中的 STDERR、ERROR 或 Traceback 信息',
+      mode: 'failed',
+      color: '#d64545',
+    };
+  }
+
+  if (status === 'cancelled') {
+    return {
+      percent: 100,
+      label: '任务已取消',
+      detail: elapsedText ? `已运行：${elapsedText}` : '',
+      mode: 'cancelled',
+      color: '#6b7280',
+    };
+  }
+
+  const parallelTotal = Number.parseInt(String(task?.parallel_total || 0), 10) || 0;
+  if (parallelTotal > 0) {
+    const done = Number.parseInt(String(task?.parallel_done || 0), 10) || 0;
+    const failed = Number.parseInt(String(task?.parallel_failed || 0), 10) || 0;
+    const finished = Math.min(parallelTotal, done + failed);
+    const percent = Math.max(0, Math.min(99, Math.round((finished / parallelTotal) * 100)));
+    return {
+      percent,
+      label: `子任务进度：${finished}/${parallelTotal}`,
+      detail: `成功 ${done} 个，失败 ${failed} 个${elapsedText ? `，已运行 ${elapsedText}` : ''}`,
+      mode: 'parallel',
+      color: '#2d7cf6',
+    };
+  }
+
+  const totalFiles = findLastNumberInLogs(logs, [
+    /共找到\s*(\d+)\s*个/i,
+    /找到\s*(\d+)\s*个/i,
+    /total\s*[:=]\s*(\d+)/i,
+    /files?\s*[:=]\s*(\d+)/i,
+  ]);
+
+  const savedCount = countLogMatches(
+    logs,
+    /(文件已保存|保存完成|输出完成|处理完成|write complete|saved|finished)/i
+  );
+  const processingCount = countLogMatches(
+    logs,
+    /(正在处理|开始处理|processing|running file)/i
+  );
+
+  if (totalFiles > 0) {
+    const current = Math.min(totalFiles, Math.max(savedCount, processingCount));
+    const percent = Math.max(1, Math.min(99, Math.round((current / totalFiles) * 100)));
+    const label = savedCount > 0
+      ? `文件进度：已完成 ${Math.min(savedCount, totalFiles)}/${totalFiles}`
+      : `文件进度：正在处理 ${current}/${totalFiles}`;
+
+    return {
+      percent,
+      label,
+      detail: `${elapsedText ? `已运行 ${elapsedText}；` : ''}进度根据运行日志自动识别`,
+      mode: 'log_files',
+      color: '#2d7cf6',
+    };
+  }
+
+  const started = logs.some((line) => /\[INFO\]\s*进程已启动|pid\s*=/i.test(String(line || '')));
+  if (started || status === 'running') {
+    return {
+      percent: null,
+      label: '任务正在运行',
+      detail: `${elapsedText ? `已运行 ${elapsedText}；` : ''}当前模块未输出可识别的百分比，系统正在持续记录日志`,
+      mode: 'indeterminate',
+      color: '#2d7cf6',
+    };
+  }
+
+  return {
+    percent: 5,
+    label: '任务准备中',
+    detail: elapsedText ? `已等待 ${elapsedText}` : '',
+    mode: 'preparing',
+    color: '#2d7cf6',
+  };
+}
+
+function TaskProgressPanel({ task, taskLogs }) {
+  const progress = getTaskProgressInfo(task, taskLogs);
+  const isIndeterminate = progress.percent == null;
+  const percent = isIndeterminate ? 45 : Math.max(0, Math.min(100, progress.percent));
+
+  return (
+    <div
+      style={{
+        marginTop: 12,
+        padding: 12,
+        borderRadius: 12,
+        background: '#f7fbff',
+        border: '1px solid #d7e6f7',
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+        <div style={{ fontWeight: 800, color: '#12385f' }}>运行进度</div>
+        <div style={{ fontWeight: 900, color: progress.color }}>
+          {isIndeterminate ? '运行中' : `${percent}%`}
+        </div>
+      </div>
+
+      <div
+        style={{
+          marginTop: 9,
+          height: 12,
+          borderRadius: 999,
+          overflow: 'hidden',
+          background: '#e7eef7',
+          border: '1px solid rgba(20,80,140,0.08)',
+        }}
+      >
+        <div
+          style={{
+            width: `${percent}%`,
+            height: '100%',
+            borderRadius: 999,
+            background: isIndeterminate
+              ? 'linear-gradient(90deg, rgba(45,124,246,0.25), rgba(45,124,246,0.95), rgba(45,124,246,0.25))'
+              : `linear-gradient(90deg, ${progress.color}, ${progress.color})`,
+            transition: 'width 0.45s ease',
+          }}
+        />
+      </div>
+
+      <div style={{ marginTop: 8, fontWeight: 800, color: '#163f68', fontSize: 13 }}>
+        {progress.label}
+        {progress.mode === 'indeterminate' && <RunningDots active={true} />}
+      </div>
+      {progress.detail && (
+        <div style={{ marginTop: 4, color: '#63758c', fontSize: 12, lineHeight: 1.5 }}>
+          {progress.detail}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SimpleOverlay({ title, onClose, children, width = 'min(960px, 96vw)' }) {
   return (
     <div
@@ -768,6 +986,8 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
             </div>
           )}
         </div>
+
+        <TaskProgressPanel task={task} taskLogs={taskLogs} />
 
         <div style={{ marginTop: 12 }}>
           <div style={{ fontWeight: 700, marginBottom: 8 }}>运行日志</div>

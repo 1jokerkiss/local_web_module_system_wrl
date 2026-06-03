@@ -617,6 +617,14 @@ def normalize_parallel_config(module: dict) -> dict:
         "output_key": raw.get("output_key") or module.get("parallel_output_key") or "",
         "file_patterns": raw.get("file_patterns") or module.get("parallel_file_patterns") or "*.tif;*.tiff;*.nc;*.hdf;*.h5",
         "output_suffix": raw.get("output_suffix") or module.get("parallel_output_suffix") or ".tif",
+
+        # 性能优化参数：
+        # files_per_job 控制 folder_chunks 模式下一个子进程处理几个文件。
+        # 值越大，EXE 启动/模型加载次数越少；值越小，负载均衡越好。
+        "files_per_job": raw.get("files_per_job") or module.get("parallel_files_per_job") or 1,
+
+        # 预留字段：后续如果需要按 workers * chunk_multiplier 生成更多小块，可以直接使用。
+        "chunk_multiplier": raw.get("chunk_multiplier") or module.get("parallel_chunk_multiplier") or 1,
     }
     mode = str(cfg.get("mode") or "auto").strip() or "auto"
     cfg["mode"] = mode if mode in VALID_PARALLEL_MODES else "auto"
@@ -624,6 +632,17 @@ def normalize_parallel_config(module: dict) -> dict:
     cfg["output_key"] = str(cfg.get("output_key") or "")
     cfg["file_patterns"] = str(cfg.get("file_patterns") or "*.tif;*.tiff;*.nc;*.hdf;*.h5")
     cfg["output_suffix"] = str(cfg.get("output_suffix") or ".tif")
+
+    try:
+        cfg["files_per_job"] = max(1, int(cfg.get("files_per_job") or 1))
+    except Exception:
+        cfg["files_per_job"] = 1
+
+    try:
+        cfg["chunk_multiplier"] = max(1, int(cfg.get("chunk_multiplier") or 1))
+    except Exception:
+        cfg["chunk_multiplier"] = 1
+
     return cfg
 
 
@@ -1814,10 +1833,86 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
     runtime_env["PATH"] = ";".join(ordered_dirs + [runtime_env.get("PATH", "")])
     runtime_env["MODULE_DLL_DIRS"] = ";".join(ordered_dirs)
 
-    # 避免 OpenBLAS 线程过多导致崩溃
-    runtime_env["OPENBLAS_NUM_THREADS"] = "1"
-    runtime_env["OMP_NUM_THREADS"] = "1"
-    runtime_env["GOTO_NUM_THREADS"] = "1"
+    def _as_int(value: Any, default: int = 1) -> int:
+        try:
+            return int(value or default)
+        except Exception:
+            return default
+
+    def _runtime_thread_count_for_child() -> int:
+        """根据“平台并行进程数”和“总计算线程预算”分配子进程内部线程数。
+
+        以前这里固定为 1，稳定但性能偏保守；现在改成：
+        - 平台拆分/batch 子任务：总线程预算 / 并行池大小；
+        - 普通单进程/module_internal：按用户设置或默认上限；
+        - 可通过环境变量 LOCAL_WEB_TOTAL_COMPUTE_THREADS、LOCAL_WEB_MAX_THREADS_PER_CHILD 调整。
+        """
+        cpu_count = max(1, int(os.cpu_count() or 1))
+
+        explicit = os.environ.get("LOCAL_WEB_CHILD_NUM_THREADS", "").strip()
+        if explicit:
+            return max(1, min(cpu_count, _as_int(explicit, 1)))
+
+        mode = str(
+            values.get("_parallel_mode")
+            or normalize_parallel_config(module).get("mode")
+            or "auto"
+        ).strip()
+
+        requested = _as_int(
+            values.get("_requested_parallel_workers")
+            or values.get("_effective_parallel_workers")
+            or values.get("_parallel_workers")
+            or values.get("parallel_workers"),
+            1,
+        )
+
+        pool_size = _as_int(
+            values.get("_parallel_pool_size")
+            or values.get("_parallel_total")
+            or values.get("_batch_total")
+            or requested,
+            1,
+        )
+
+        # 总计算线程预算：默认只用一部分 CPU，避免多进程 + 多线程把电脑打满。
+        total_budget = _as_int(
+            os.environ.get("LOCAL_WEB_TOTAL_COMPUTE_THREADS"),
+            max(1, min(cpu_count, max(2, cpu_count // 2))),
+        )
+
+        # 单个子进程最多线程数。
+        max_threads_per_child = _as_int(
+            os.environ.get("LOCAL_WEB_MAX_THREADS_PER_CHILD"),
+            4,
+        )
+
+        is_platform_child = bool(
+            values.get("_parallel_index")
+            or values.get("_parallel_total")
+            or values.get("_parallel_pool_size")
+            or values.get("_batch_index")
+            or values.get("_batch_total")
+        )
+
+        if mode in {"single_file", "folder_chunks", "batch_group"} or is_platform_child:
+            per_child = max(1, total_budget // max(1, pool_size))
+            return max(1, min(cpu_count, max_threads_per_child, per_child))
+
+        if mode in {"none", "module_internal"}:
+            return max(1, min(cpu_count, max_threads_per_child, requested))
+
+        return 1
+
+    runtime_threads = _runtime_thread_count_for_child()
+
+    # 控制数值计算库线程数。注意：这是“单个子进程内部线程数”，不是平台子进程数量。
+    runtime_env["OPENBLAS_NUM_THREADS"] = str(runtime_threads)
+    runtime_env["OMP_NUM_THREADS"] = str(runtime_threads)
+    runtime_env["GOTO_NUM_THREADS"] = str(runtime_threads)
+    runtime_env["MKL_NUM_THREADS"] = str(runtime_threads)
+    runtime_env["NUMEXPR_NUM_THREADS"] = str(runtime_threads)
+    runtime_env["LOCAL_WEB_RUNTIME_THREADS"] = str(runtime_threads)
     # 统一 Python 子进程输出编码，避免中文路径、tqdm 进度条在日志窗口乱码
     runtime_env["PYTHONIOENCODING"] = "utf-8"
     runtime_env["PYTHONUTF8"] = "1"
@@ -5086,9 +5181,15 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
         for idx, file_path in enumerate(files, start=1):
             job_inputs = apply_single_file_output_mapping(module, inputs, file_path)
             job_inputs[input_key] = str(file_path)
+
+            # 平台已经负责并发，单个子任务内部默认只处理当前文件。
+            # 线程数由 build_runtime_for_module 根据 _parallel_pool_size 动态分配。
+            job_inputs["parallel_workers"] = 1
+            job_inputs["parallel_workers"] = 1
             job_inputs["_parallel_workers"] = 1
             job_inputs["_parallel_index"] = idx
             job_inputs["_parallel_total"] = len(files)
+            job_inputs["_parallel_pool_size"] = workers
             if is_parasol_jd_pair_module(module) and files_before_parasol_filter != len(files):
                 job_inputs["_parasol_jd_filter"] = (
                     f"目录中共 {files_before_parasol_filter} 个文件，仅 JD 主输入生成 {len(files)} 个任务；"
@@ -5650,6 +5751,13 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
         job_inputs["_batch_index"] = idx
         job_inputs["_batch_total"] = total
         job_inputs["_batch_slot"] = slot
+
+        # batch_group 也是平台进程池并行，需要把并行池大小传给 build_runtime_for_module，
+        # 用于动态分配单个 EXE 内部的 MKL/OpenBLAS 线程数。
+        job_inputs["_parallel_pool_size"] = max(1, int(parallel_workers or 1))
+        job_inputs["_parallel_workers"] = 1
+        job_inputs["parallel_workers"] = 1
+
         if is_parasol_jd_pair_module(module) and primary_files_before_parasol_filter != len(primary_files):
             job_inputs["_parasol_jd_filter"] = (
                 f"目录中共 {primary_files_before_parasol_filter} 个文件，仅 JD 主输入生成 {len(primary_files)} 个任务；"
