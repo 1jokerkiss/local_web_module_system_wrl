@@ -175,48 +175,23 @@
     }
   },
   {
-    "id": "H8_CLOUD_TYPE_EXE",
-    "name": "葵花8号云类型反演",
-    "category": "云反演",
-    "description": "葵花8号云类型反演可执行模块，运行时读取 config.json，输入 NC 文件目录，输出云检测中间结果和最终 CARE_24CP 结果。",
-    "executable": "backend/installed_modules/H8_CLOUD_TYPE_EXE/CM_CTH.exe",
-    "working_dir": "backend/installed_modules/H8_CLOUD_TYPE_EXE",
-    "config_mode": "json",
+    "id": "parasol_aod",
+    "name": "PARASOL AOD 反演",
+    "description": "PARASOL AOD 本地原生模块。用户选择 PARASOL 输入文件目录和输出目录，管理员固定配置 XML、LUT 和 IGBP 资源。",
+    "runtime": "native",
+    "entry": "ParasolAOD.exe",
+    "executable": "backend/installed_modules/parasol_aod/ParasolAOD.exe",
+    "working_dir": "backend/installed_modules/parasol_aod",
+    "config_mode": "none",
+    "dependency_dirs": [
+      "deps"
+    ],
     "command_template": [
       "{executable}",
-      "{config_json}"
+      "{input_file}",
+      "{output_dir}",
+      "{config_xml}"
     ],
-    "inputs": [
-      {
-        "key": "file",
-        "label": "输入文件目录",
-        "type": "dir_path",
-        "required": true
-      },
-      {
-        "key": "cm_files",
-        "label": "云检测中间结果目录",
-        "type": "dir_path",
-        "required": true
-      },
-      {
-        "key": "outpath",
-        "label": "最终输出目录",
-        "type": "dir_path",
-        "required": true
-      }
-    ],
-    "tags": [
-      "h8",
-      "cloud",
-      "cth",
-      "云类型",
-      "云反演"
-    ],
-    "enabled": true,
-    "entry": "CM_CTH.exe",
-    "runtime": "cpp_native",
-    "tool_type": "cloud",
     "parallel": {
       "mode": "folder_chunks",
       "input_key": "input_file",
@@ -225,109 +200,54 @@
       "output_suffix": ".tif",
       "files_per_job": 1
     },
-      "mode": "auto",
-      "input_key": "",
-      "output_key": "",
-      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
-      "output_suffix": ".tif"
-    }
-  },
-  {
-    "id": "CTH_FY",
-    "name": "FY气溶胶反演",
-    "category": "云反演",
-    "description": "基于风云的气溶胶反演模块",
-    "executable": "backend/installed_modules/CTH_FY/CTH_FY.exe",
-    "working_dir": "backend/installed_modules/CTH_FY",
-    "config_mode": "json",
-    "command_template": [
-      "{executable}",
-      "{config_json}"
-    ],
-    "inputs": [
-      {
-        "key": "file",
-        "label": "输入文件目录",
-        "type": "dir_path",
-        "required": true
-      },
-      {
-        "key": "cm_files",
-        "label": "输出文件目录",
-        "type": "dir_path",
-        "required": true
-      }
-    ],
     "tags": [
-      "cthfy",
-      "aerosol",
-      "气溶胶类型",
-      "fy4"
+      "parasol",
+      "aod",
+      "remote-sensing",
+      "native"
     ],
     "enabled": true,
-    "entry": "CTH_FY.exe",
-    "runtime": "cpp_native",
-    "tool_type": "cloud",
-    "parallel": {
-      "mode": "auto",
-      "input_key": "",
-      "output_key": "",
-      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
-      "output_suffix": ".tif"
-    }
-  },
-  {
-    "id": "parasol_aod",
-    "name": "PARASOL AOD 反演",
-    "description": "PARASOL AOD 本地可执行模块。用户选择 PARASOL 输入目录和输出目录，管理员固定配置 XML、LUT 和 IGBP 资源。JD/JL 文件为配套文件，系统只按 JD 文件生成任务，JL 文件由模块自动匹配。",
-    "executable": "backend/installed_modules/parasol_aod/ParasolAOD.exe",
-    "working_dir": "backend/installed_modules/parasol_aod",
-    "config_mode": "json_file",
-    "command_template": [
-      "{executable}",
-      "{config_json}"
-    ],
     "inputs": [
       {
         "key": "input_file",
-        "label": "input_file",
+        "label": "PARASOL 输入文件目录",
         "type": "dir_path",
         "required": true,
+        "placeholder": "请选择 PARASOL Level-1 输入文件所在目录",
+        "default": "",
+        "help_text": "选择一个目录，平台会把目录中的输入文件拆成多个 job 并行运行。",
         "visible_to_user": true,
         "admin_fixed": false,
         "path_mode": "absolute",
-        "io_role": "input",
-        "default": "D:/yan1study/AOD_test/AOD_model/ParasolAOD/test_data",
-        "batch_role": "input",
-        "match_mode": "each_file",
-        "file_patterns": "*jd*;*JD*",
-        "batch_allow_all_files": true,
-        "batch_allow_no_extension": true,
-        "batch_include_regex": "(?i)jd(?=[_.-])"
+        "batch_role": "parasol",
+        "match_mode": "each_file"
       },
       {
         "key": "output_dir",
-        "label": "output_dir",
+        "label": "输出目录",
         "type": "dir_path",
         "required": true,
+        "placeholder": "请选择输出目录",
+        "default": "",
+        "help_text": "程序会在该目录下生成输出文件。",
         "visible_to_user": true,
         "admin_fixed": false,
         "path_mode": "absolute",
-        "io_role": "output",
-        "default": "D:/yan1study/AOD_test/AOD_model/ParasolAOD/web_test_out",
-        "batch_role": "output"
+        "batch_role": "",
+        "match_mode": "none",
+        "output_ext": ".tif"
       },
       {
         "key": "config_xml",
-        "label": "config_xml",
+        "label": "PARASOL 配置 XML",
         "type": "file_path",
         "required": true,
+        "placeholder": "",
+        "default": "resources/ConfigXMLFile.xml",
+        "help_text": "管理员固定输入，用户界面隐藏。XML 中配置 LUT 和 IGBP 文件路径。",
         "visible_to_user": false,
         "admin_fixed": true,
         "path_mode": "relative_to_module",
-        "io_role": "input",
-        "default": "resources/ConfigXMLFile.xml",
-        "batch_role": ""
         "batch_role": "",
         "match_mode": "none"
       }
@@ -441,30 +361,7 @@
         "io_role": "output"
       }
     ],
-    "tags": [
-      "executable",
-      "native"
-    ],
-    "tool_type": "aerosol",
     "parallel": {
-      "mode": "auto",
-      "input_key": "",
-      "output_key": "",
-      "file_patterns": "*jd*;*JD*",
-      "output_suffix": ".tif"
-    },
-    "enabled": true,
-    "runtime": "cpp_native",
-    "entry": "ParasolAOD.exe",
-    "dependency_dirs": [
-      "deps"
-    ],
-    "dependency_search_dirs": [],
-    "resource_dirs": [
-      "resources"
-    ],
-    "_manifest_format": "executable_module_json",
-    "_param_json_path": "D:\\local_module_web_system\\local_module_web_system\\parasol\\config.json"
       "mode": "folder_chunks",
       "input_key": "fy4_path",
       "output_key": "out_path",
