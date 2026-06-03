@@ -67,6 +67,18 @@ class TaskManager:
         self.child_launch_min_disk_free_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_DISK_FREE_GB", "0.5"))
         self.child_launch_wait_seconds = float(os.environ.get("LOCAL_WEB_CHILD_START_WAIT_SECONDS", "2"))
         self.child_start_stagger_seconds = float(os.environ.get("LOCAL_WEB_CHILD_START_STAGGER_SECONDS", "0.5"))
+        self.adaptive_child_start_enabled = str(os.environ.get("LOCAL_WEB_ADAPTIVE_CHILD_START", "1")).strip().lower() not in {"0", "false", "no", "off"}
+        self.adaptive_child_start_min_interval = float(os.environ.get("LOCAL_WEB_ADAPTIVE_CHILD_START_MIN_SECONDS", "5"))
+        self.adaptive_child_start_max_interval = float(os.environ.get("LOCAL_WEB_ADAPTIVE_CHILD_START_MAX_SECONDS", "60"))
+        self.adaptive_child_start_sample_seconds = float(os.environ.get("LOCAL_WEB_ADAPTIVE_CHILD_START_SAMPLE_SECONDS", "1.5"))
+        self.adaptive_child_start_decline_threshold = float(os.environ.get("LOCAL_WEB_ADAPTIVE_CHILD_START_CPU_DECLINE", "10"))
+        self.adaptive_child_start_stable_samples = max(1, int(os.environ.get("LOCAL_WEB_ADAPTIVE_CHILD_START_STABLE_SAMPLES", "3")))
+        self.adaptive_child_start_max_probe_seconds = float(os.environ.get("LOCAL_WEB_ADAPTIVE_CHILD_START_MAX_PROBE_SECONDS", "90"))
+        self.adaptive_child_start_min_peak_cpu = float(os.environ.get("LOCAL_WEB_ADAPTIVE_CHILD_START_MIN_PEAK_CPU", "60"))
+        self.adaptive_child_start_memory_threshold = float(os.environ.get("LOCAL_WEB_ADAPTIVE_CHILD_START_MEMORY_THRESHOLD", "90"))
+        self.adaptive_child_start_min_memory_gb = float(os.environ.get("LOCAL_WEB_ADAPTIVE_CHILD_START_MIN_MEMORY_GB", "1.0"))
+        self.learned_child_start_intervals: Dict[str, float] = {}
+        self.child_start_gate_locks: Dict[str, threading.Lock] = {}
         self._last_pressure_log_at: Dict[str, float] = {}
 
         self._load_tasks()
@@ -383,9 +395,10 @@ class TaskManager:
         if active_processes >= self.max_process_slots:
             return f"平台已启动 {active_processes}/{self.max_process_slots} 个模块进程，等待已有进程完成"
 
-        cpu = self._system_cpu_percent()
-        if cpu is not None and cpu >= self.child_launch_cpu_threshold:
-            return f"CPU 使用率 {cpu:.1f}% 已超过暂停启动阈值 {self.child_launch_cpu_threshold:.0f}%"
+        if not self.adaptive_child_start_enabled:
+            cpu = self._system_cpu_percent()
+            if cpu is not None and cpu >= self.child_launch_cpu_threshold:
+                return f"CPU 使用率 {cpu:.1f}% 已超过暂停启动阈值 {self.child_launch_cpu_threshold:.0f}%"
 
         mem = self._virtual_memory_snapshot()
         mem_percent = mem.get("percent")
@@ -432,6 +445,93 @@ class TaskManager:
                 )
             time.sleep(max(1.0, self.child_launch_wait_seconds))
 
+    def _adaptive_start_memory_safe(self) -> tuple[bool, str]:
+        mem = self._virtual_memory_snapshot()
+        mem_percent = mem.get("percent")
+        mem_available = mem.get("available_gb")
+        if mem_percent is not None and mem_percent >= self.adaptive_child_start_memory_threshold:
+            return False, f"内存使用率 {mem_percent:.1f}% 已超过自适应启动阈值 {self.adaptive_child_start_memory_threshold:.0f}%"
+        if mem_available is not None and mem_available <= self.adaptive_child_start_min_memory_gb:
+            return False, f"可用内存 {mem_available:.1f}GB 低于自适应启动阈值 {self.adaptive_child_start_min_memory_gb:.1f}GB"
+        return True, ""
+
+    def _learn_child_start_interval_after_first_launch(self, parent_id: str, label: str) -> float:
+        min_interval = max(0.0, self.adaptive_child_start_min_interval)
+        max_interval = max(min_interval, self.adaptive_child_start_max_interval)
+        sample_seconds = max(0.2, self.adaptive_child_start_sample_seconds)
+        decline_threshold = max(0.0, self.adaptive_child_start_decline_threshold)
+        required_samples = max(1, self.adaptive_child_start_stable_samples)
+        max_probe_seconds = max(min_interval, self.adaptive_child_start_max_probe_seconds)
+
+        start_time = time.time()
+        peak_cpu = 0.0
+        decline_count = 0
+        last_cpu: float | None = None
+        self.append_log(
+            parent_id,
+            f"[ADAPTIVE] 已启动首个子任务 {label}，开始监测 CPU 峰值回落，用于学习后续子任务启动间隔。",
+        )
+
+        while parent_id not in self.cancel_flags:
+            elapsed = time.time() - start_time
+            cpu = self._system_cpu_percent()
+            memory_safe, memory_reason = self._adaptive_start_memory_safe()
+
+            if cpu is not None:
+                peak_cpu = max(peak_cpu, cpu)
+                has_peak = peak_cpu >= self.adaptive_child_start_min_peak_cpu
+                dropped_from_peak = has_peak and cpu <= peak_cpu - decline_threshold
+                moving_down = last_cpu is not None and cpu <= last_cpu
+                if dropped_from_peak and moving_down:
+                    decline_count += 1
+                else:
+                    decline_count = 0
+                last_cpu = cpu
+
+                if decline_count >= required_samples and memory_safe:
+                    learned = max(min_interval, min(elapsed, max_interval))
+                    self.append_log(
+                        parent_id,
+                        f"[ADAPTIVE] 学到子任务启动间隔 {learned:.1f}s：CPU峰值 {peak_cpu:.1f}%，当前 {cpu:.1f}%，连续回落 {decline_count} 次。",
+                    )
+                    return learned
+
+                if not has_peak and elapsed >= min_interval and memory_safe:
+                    self.append_log(
+                        parent_id,
+                        f"[ADAPTIVE] 首个子任务未形成明显 CPU 峰值，使用最小启动间隔 {min_interval:.1f}s。",
+                    )
+                    return min_interval
+
+            if elapsed >= max_probe_seconds:
+                learned = max(min_interval, min(elapsed, max_interval))
+                reason = f"，内存暂不安全：{memory_reason}" if memory_reason else ""
+                self.append_log(
+                    parent_id,
+                    f"[ADAPTIVE] CPU 回落探测达到上限，使用保守启动间隔 {learned:.1f}s{reason}。",
+                )
+                return learned
+
+            time.sleep(sample_seconds)
+
+        return max_interval
+
+    def _sleep_before_adaptive_child_launch(self, parent_id: str, label: str, interval: float, last_launch_at: float) -> bool:
+        if interval <= 0 or last_launch_at <= 0:
+            return True
+        remaining = interval - (time.time() - last_launch_at)
+        if remaining <= 0:
+            return True
+
+        self.append_log(parent_id, f"[ADAPTIVE] 启动 {label} 前等待 {remaining:.1f}s，按首个子任务学习到的间隔错峰启动。")
+        end_at = time.time() + remaining
+        while parent_id not in self.cancel_flags:
+            left = end_at - time.time()
+            if left <= 0:
+                return True
+            time.sleep(min(0.5, max(0.05, left)))
+        return False
+
     def get_system_resource_info(self) -> Dict[str, Any]:
         with self.lock:
             running_workers = self._used_slots_locked()
@@ -460,6 +560,8 @@ class TaskManager:
             "cpu_count": self.cpu_count,
             "suggested_workers": self.suggested_process_slots,
             "max_workers": self.max_process_slots,
+            "adaptive_child_start": self.adaptive_child_start_enabled,
+            "learned_child_start_intervals": dict(self.learned_child_start_intervals),
             "running_workers": active_processes,
             "available_workers": max(0, self.max_process_slots - active_processes),
             "active_task_count": active_task_count,
@@ -931,6 +1033,10 @@ class TaskManager:
         next_index = 0
         failures = 0
         done = 0
+        with self.lock:
+            start_gate = self.child_start_gate_locks.setdefault(parent_id, threading.Lock())
+        learned_interval = self.learned_child_start_intervals.get(parent_id)
+        last_child_launch_at = 0.0
 
         def _worker(child_id: str, job: Dict[str, Any]):
             child_snapshot = self.get_task(child_id) or {}
@@ -972,12 +1078,29 @@ class TaskManager:
                             )
                         break
 
-                    self.append_log(parent_id, f"[INFO] 启动子任务 {next_index + 1}/{total}: {label}；当前运行 {len(running) + 1}/{max_parallel}")
-                    future = executor.submit(_worker, child_id, job)
-                    running[future] = child_id
-                    next_index += 1
-                    launched_any = True
-                    time.sleep(max(0.0, self.child_start_stagger_seconds))
+                    with start_gate:
+                        self._wait_until_safe_to_start_child(parent_id, str(label))
+                        if parent_id in self.cancel_flags:
+                            break
+                        if self.adaptive_child_start_enabled and learned_interval is not None:
+                            if not self._sleep_before_adaptive_child_launch(parent_id, str(label), learned_interval, last_child_launch_at):
+                                break
+                            self._wait_until_safe_to_start_child(parent_id, str(label))
+                            if parent_id in self.cancel_flags:
+                                break
+
+                        self.append_log(parent_id, f"[INFO] 启动子任务 {next_index + 1}/{total}: {label}；当前运行 {len(running) + 1}/{max_parallel}")
+                        future = executor.submit(_worker, child_id, job)
+                        running[future] = child_id
+                        next_index += 1
+                        launched_any = True
+                        last_child_launch_at = time.time()
+
+                    if self.adaptive_child_start_enabled and learned_interval is None and next_index < total:
+                        learned_interval = self._learn_child_start_interval_after_first_launch(parent_id, str(label))
+                        self.learned_child_start_intervals[parent_id] = learned_interval
+                    elif self.child_start_stagger_seconds > 0:
+                        time.sleep(self.child_start_stagger_seconds)
 
                 if not running:
                     # 没有运行中的子任务时，即使压力高也需要周期性重试。
@@ -1038,6 +1161,9 @@ class TaskManager:
             parallel_failed=failures,
         )
         self.append_log(parent_id, f"[INFO] 批处理结束，完成={done}/{total}，失败数={failures}")
+        with self.lock:
+            self.learned_child_start_intervals.pop(parent_id, None)
+            self.child_start_gate_locks.pop(parent_id, None)
         self.cancel_flags.discard(parent_id)
 
     def _stream_reader(self, pipe, task_id: str, prefix: str):
@@ -1278,6 +1404,10 @@ class TaskManager:
         self.append_log(parent_id, "[SAFE] 不再按模型文件大小直接降为 1；启动新子进程前检查 CPU/内存/磁盘，真正接近危险阈值时才暂停补位。")
 
         progress = {"done": 0, "failed": 0}
+        with self.lock:
+            start_gate = self.child_start_gate_locks.setdefault(parent_id, threading.Lock())
+        learned_interval = self.learned_child_start_intervals.get(parent_id)
+        last_child_launch_at = 0.0
 
         def run_one(index: int, spec: Dict[str, Any]):
             if parent_id in self.cancel_flags:
@@ -1349,12 +1479,29 @@ class TaskManager:
                             )
                         break
 
-                    future = executor.submit(run_one, next_index, spec)
-                    running[future] = next_index
-                    self.append_log(parent_id, f"[PARALLEL] 已提交 {next_index + 1}/{total}；当前运行 {len(running)}/{max_workers}")
-                    next_index += 1
-                    launched_any = True
-                    time.sleep(max(0.0, self.child_start_stagger_seconds))
+                    with start_gate:
+                        self._wait_until_safe_to_start_child(parent_id, str(label))
+                        if parent_id in self.cancel_flags:
+                            break
+                        if self.adaptive_child_start_enabled and learned_interval is not None:
+                            if not self._sleep_before_adaptive_child_launch(parent_id, str(label), learned_interval, last_child_launch_at):
+                                break
+                            self._wait_until_safe_to_start_child(parent_id, str(label))
+                            if parent_id in self.cancel_flags:
+                                break
+
+                        future = executor.submit(run_one, next_index, spec)
+                        running[future] = next_index
+                        self.append_log(parent_id, f"[PARALLEL] 已提交 {next_index + 1}/{total}；当前运行 {len(running)}/{max_workers}")
+                        next_index += 1
+                        launched_any = True
+                        last_child_launch_at = time.time()
+
+                    if self.adaptive_child_start_enabled and learned_interval is None and next_index < total:
+                        learned_interval = self._learn_child_start_interval_after_first_launch(parent_id, str(label))
+                        self.learned_child_start_intervals[parent_id] = learned_interval
+                    elif self.child_start_stagger_seconds > 0:
+                        time.sleep(self.child_start_stagger_seconds)
 
                 if not running:
                     paused_by_pressure = False
@@ -1415,6 +1562,9 @@ class TaskManager:
         )
 
         self.append_log(parent_id, f"[PARALLEL] 并行任务结束，状态={final_status}")
+        with self.lock:
+            self.learned_child_start_intervals.pop(parent_id, None)
+            self.child_start_gate_locks.pop(parent_id, None)
         self.cancel_flags.discard(parent_id)
 
     def cancel_task(self, task_id: str) -> bool:

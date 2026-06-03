@@ -648,6 +648,67 @@ def normalize_module_record(module: dict) -> dict:
 def ensure_modules_file():
     if not MODULES_FILE.exists():
         MODULES_FILE.write_text("[]", encoding="utf-8")
+
+
+def recover_modules_from_installed_modules() -> List[dict]:
+    recovered: List[dict] = []
+    seen: set[str] = set()
+    manifest_names = ["module.json", "executable_module.json", "python_module.json"]
+
+    for module_dir in sorted(INSTALLED_MODULES_DIR.iterdir(), key=lambda p: p.name.lower()):
+        if not module_dir.is_dir():
+            continue
+
+        manifest_path = next((module_dir / name for name in manifest_names if (module_dir / name).exists()), None)
+        if manifest_path is None:
+            continue
+
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(raw, dict):
+            continue
+
+        module_id = str(raw.get("id") or raw.get("module_id") or module_dir.name).strip()
+        if not module_id or module_id in seen:
+            continue
+
+        module = dict(raw)
+        module["id"] = module_id
+        module["name"] = module.get("name") or module.get("module_name") or module_id
+        module["description"] = module.get("description") or ""
+        module["enabled"] = module.get("enabled", True)
+
+        entry = str(module.get("entry") or module.get("entry_file") or "").strip()
+        executable = str(module.get("executable") or "").strip()
+        if not entry and executable:
+            entry = Path(executable).name
+        if entry:
+            module["entry"] = entry
+            module["executable"] = to_project_relative_path(module_dir / entry)
+        elif executable:
+            exe_path = Path(executable)
+            module["executable"] = (
+                to_project_relative_path(module_dir / exe_path.name)
+                if not exe_path.is_absolute()
+                else executable
+            )
+
+        module["working_dir"] = to_project_relative_path(module_dir)
+        module["config_mode"] = module.get("config_mode") or "json"
+        module["command_template"] = module.get("command_template") or ["{executable}", "{config_json}"]
+        module["inputs"] = module.get("inputs") if isinstance(module.get("inputs"), list) else []
+        module["tags"] = module.get("tags") if isinstance(module.get("tags"), list) else []
+        module["tool_type"] = normalize_tool_key(str(module.get("tool_type") or module.get("category") or "")) or guess_module_tool_type(module)
+        module["parallel"] = normalize_parallel_config(module)
+
+        seen.add(module_id)
+        recovered.append(normalize_module_record(module))
+
+    return recovered
+
+
 def load_modules() -> List[dict]:
     ensure_modules_file()
     try:
@@ -656,7 +717,13 @@ def load_modules() -> List[dict]:
             return [normalize_module_record(item) for item in data if isinstance(item, dict)]
         return []
     except Exception:
-        return []
+        recovered = recover_modules_from_installed_modules()
+        if recovered:
+            try:
+                save_modules(recovered)
+            except Exception:
+                pass
+        return recovered
 
 def sanitize_filename(name: str) -> str:
     name = Path(name).name
