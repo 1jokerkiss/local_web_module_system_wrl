@@ -85,6 +85,13 @@ class TaskManager:
         self.child_start_gate_locks: Dict[str, threading.Lock] = {}
         self._last_pressure_log_at: Dict[str, float] = {}
 
+        # 性能优化：日志高频输出时，不再每一行都把完整 tasks.json 写回磁盘。
+        # 前端读取任务时仍然直接读内存中的 logs；这里只是把持久化写盘做成短时间合并。
+        self.task_save_debounce_seconds = float(os.environ.get("LOCAL_WEB_TASK_SAVE_DEBOUNCE_SECONDS", "0.8"))
+        self.max_logs_per_task = max(200, int(os.environ.get("LOCAL_WEB_MAX_LOG_LINES_PER_TASK", "2000")))
+        self._save_dirty = False
+        self._save_timer: threading.Timer | None = None
+
         self._load_tasks()
         self._mark_interrupted_tasks()
         self._scheduler_heartbeat_thread = threading.Thread(
@@ -760,12 +767,57 @@ class TaskManager:
             self.drain_lock.release()
 
     def _save_tasks(self):
+        """立即把任务快照写入 tasks.json。
+
+        只在状态变化、任务结束等关键位置直接调用。
+        高频日志写入改由 _schedule_save_tasks() 合并，避免每输出一行日志就重写完整 JSON。
+        """
         with self.lock:
             data = list(self.tasks.values())
             self.tasks_file.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+
+    def _flush_scheduled_save(self):
+        with self.lock:
+            if not self._save_dirty:
+                self._save_timer = None
+                return
+            self._save_dirty = False
+            self._save_timer = None
+        self._save_tasks()
+
+    def _schedule_save_tasks(self):
+        """把多次日志写盘合并到一次，降低 runtime 期间磁盘 I/O。"""
+        if self.task_save_debounce_seconds <= 0:
+            self._save_tasks()
+            return
+
+        with self.lock:
+            self._save_dirty = True
+            timer = self._save_timer
+            if timer is not None and timer.is_alive():
+                return
+            self._save_timer = threading.Timer(
+                self.task_save_debounce_seconds,
+                self._flush_scheduled_save,
+            )
+            self._save_timer.daemon = True
+            self._save_timer.start()
+
+    def _trim_task_logs_locked(self, task: Dict[str, Any]):
+        logs = task.get("logs")
+        if not isinstance(logs, list):
+            return
+        if len(logs) <= self.max_logs_per_task:
+            return
+
+        keep_tail = max(100, self.max_logs_per_task - 1)
+        removed = len(logs) - keep_tail
+        task["logs"] = [
+            f"[LOG-TRIM] 日志过长，已省略前 {removed} 行；可通过调大 LOCAL_WEB_MAX_LOG_LINES_PER_TASK 保留更多日志。"
+        ] + logs[-keep_tail:]
 
     def list_tasks(self, owner_username: str | None = None) -> List[Dict[str, Any]]:
         with self.lock:
@@ -832,7 +884,8 @@ class TaskManager:
             if not task:
                 return
             task.setdefault("logs", []).append(str(text))
-        self._save_tasks()
+            self._trim_task_logs_locked(task)
+        self._schedule_save_tasks()
 
     def _extract_error_lines_for_parent(self, child_task: Dict[str, Any], max_lines: int = 35) -> List[str]:
         """把子任务失败原因摘出来写回父任务日志。
