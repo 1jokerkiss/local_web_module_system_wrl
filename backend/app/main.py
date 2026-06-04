@@ -625,6 +625,11 @@ def normalize_parallel_config(module: dict) -> dict:
 
         # 预留字段：后续如果需要按 workers * chunk_multiplier 生成更多小块，可以直接使用。
         "chunk_multiplier": raw.get("chunk_multiplier") or module.get("parallel_chunk_multiplier") or 1,
+
+        # 性能优化：重型 I/O / 大模型模块可以转为模块内部批处理，避免平台拆成多个 EXE 后反复加载模型。
+        "prefer_module_internal": raw.get("prefer_module_internal") if "prefer_module_internal" in raw else module.get("parallel_prefer_module_internal", False),
+        "force_platform_split": raw.get("force_platform_split") if "force_platform_split" in raw else module.get("parallel_force_platform_split", False),
+        "module_internal_keywords": raw.get("module_internal_keywords") or module.get("parallel_module_internal_keywords") or "",
     }
     mode = str(cfg.get("mode") or "auto").strip() or "auto"
     cfg["mode"] = mode if mode in VALID_PARALLEL_MODES else "auto"
@@ -642,6 +647,15 @@ def normalize_parallel_config(module: dict) -> dict:
         cfg["chunk_multiplier"] = max(1, int(cfg.get("chunk_multiplier") or 1))
     except Exception:
         cfg["chunk_multiplier"] = 1
+
+    def _bool_value(v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        return str(v or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+    cfg["prefer_module_internal"] = _bool_value(cfg.get("prefer_module_internal"))
+    cfg["force_platform_split"] = _bool_value(cfg.get("force_platform_split"))
+    cfg["module_internal_keywords"] = str(cfg.get("module_internal_keywords") or "")
 
     return cfg
 
@@ -1424,6 +1438,13 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
 
     # 6. 统一决定运行方式
     run_mode = resolve_run_parallel_mode(module, inputs, workers)
+    inputs["_resolved_run_mode"] = run_mode
+    if run_mode == "module_internal":
+        # 模块内部批处理：平台不再拆成多个 EXE，只把并行数写进 config.json。
+        # 这样可避免重复加载模型/依赖，适合 FY CTH、H8 云类型等重 I/O 模块。
+        inputs["parallel_workers"] = workers
+        inputs["_parallel_workers"] = workers
+        inputs["_parallel_mode"] = "module_internal"
     output_paths = collect_output_paths_from_inputs(module, inputs)
 
     # 6.1 C++/多输入目录批处理模式
@@ -5067,6 +5088,110 @@ def get_runtime_pressure_snapshot(path_for_disk: str | Path | None = None) -> di
 
     return snapshot
 
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", "n"}
+
+
+def _split_env_list(value: str) -> list[str]:
+    items: list[str] = []
+    for part in str(value or "").replace("；", ";").replace("，", ",").replace(",", ";").split(";"):
+        part = part.strip()
+        if part:
+            items.append(part)
+    return items
+
+
+def _module_search_text(module: dict) -> str:
+    return " ".join([
+        str(module.get("id") or ""),
+        str(module.get("module_id") or ""),
+        str(module.get("name") or ""),
+        str(module.get("module_name") or ""),
+        str(module.get("description") or ""),
+        str(module.get("executable") or module.get("entry") or module.get("entry_file") or ""),
+        " ".join(str(x) for x in (module.get("tags") or [])),
+    ]).lower()
+
+
+def should_use_module_internal_for_heavy_module(module: dict, inputs: dict, workers: int) -> tuple[bool, str]:
+    """判断是否把平台拆分改为模块内部批处理。\n\n    目的：对 FY CTH、H8 云类型等“大模型 + 高 I/O”模块，避免平台拆成多个 EXE。\n    平台拆分会导致每个子任务重复启动 EXE、重复加载模型、重复初始化 GDAL/HDF5，\n    CPU 周期性闲置通常无法靠继续加进程解决。\n\n    触发条件：\n    1. parallel.prefer_module_internal=true；或\n    2. 模块 ID 在 LOCAL_WEB_MODULE_INTERNAL_IDS 中；或\n    3. auto 开启，且模块名称/ID 命中 CTH/云类型关键词或固定资源较大。\n\n    关闭方式：\n    - 启动脚本设置 LOCAL_WEB_AUTO_INTERNAL_FOR_HEAVY_MODULES=0；或\n    - module.json 的 parallel 里写 force_platform_split=true。\n    """
+    if workers <= 1:
+        return False, ""
+
+    cfg = normalize_parallel_config(module)
+    if bool(cfg.get("force_platform_split")):
+        return False, "模块配置 force_platform_split=true，保持平台拆分"
+
+    mode = str(cfg.get("mode") or "auto").strip() or "auto"
+    if mode not in {"auto", "folder_chunks"}:
+        return False, ""
+
+    # 多输入时次匹配类任务，例如 H8 AOD，继续走 batch_group，不自动转内部并行。
+    try:
+        if _is_batch_request(module, inputs):
+            return False, "批处理匹配任务保持 batch_group"
+    except Exception:
+        pass
+
+    input_key = choose_parallel_input_key(module, inputs)
+    input_value = inputs.get(input_key) if input_key else None
+    if not input_value:
+        return False, ""
+
+    try:
+        input_path = Path(str(input_value))
+        if input_path.is_file():
+            return False, "单文件输入保持平台 single_file 语义"
+        if not input_path.exists() or not input_path.is_dir():
+            return False, ""
+    except Exception:
+        return False, ""
+
+    module_id = str(module.get("id") or module.get("module_id") or "").strip()
+    explicit_ids = set(_split_env_list(os.environ.get(
+        "LOCAL_WEB_MODULE_INTERNAL_IDS",
+        "CTH_FY;FY_CTH;H8_CLOUD_TYPE;H8_CLOUD_TYPE_EXE;CM_CTH"
+    )))
+    if module_id and module_id in explicit_ids:
+        return True, f"模块 {module_id} 在 LOCAL_WEB_MODULE_INTERNAL_IDS 中，采用模块内部批处理"
+
+    if bool(cfg.get("prefer_module_internal")):
+        return True, "模块配置 prefer_module_internal=true，采用模块内部批处理"
+
+    if not _env_bool("LOCAL_WEB_AUTO_INTERNAL_FOR_HEAVY_MODULES", True):
+        return False, ""
+
+    text = _module_search_text(module)
+    keyword_text = str(cfg.get("module_internal_keywords") or "").strip()
+    keywords = _split_env_list(keyword_text) if keyword_text else _split_env_list(os.environ.get(
+        "LOCAL_WEB_MODULE_INTERNAL_KEYWORDS",
+        "cth;cloud_type;cm_cth;fy_cth;cloud top;height retrieval;云类型;云顶高度;云高"
+    ))
+    keyword_hit = any(k.lower() in text for k in keywords if k)
+
+    try:
+        resource_bytes, _ = estimate_fixed_resource_bytes(module)
+        resource_gb = _gb(resource_bytes)
+    except Exception:
+        resource_gb = 0.0
+
+    try:
+        threshold_gb = float(os.environ.get("LOCAL_WEB_INTERNAL_RESOURCE_THRESHOLD_GB", "0.25"))
+    except Exception:
+        threshold_gb = 0.25
+
+    if keyword_hit:
+        return True, "模块命中 CTH/云类型等重型遥感反演关键词，采用模块内部批处理，避免重复加载模型"
+
+    if resource_gb >= threshold_gb:
+        return True, f"模块固定资源约 {resource_gb:.2f}GB，超过阈值 {threshold_gb:.2f}GB，采用模块内部批处理"
+
+    return False, ""
+
 def resolve_run_parallel_mode(module: dict, inputs: dict, workers: int) -> str:
     """
     统一决定任务运行方式，避免 batch_group / 平台拆分 / 模块内部并行混在一起。
@@ -5085,31 +5210,51 @@ def resolve_run_parallel_mode(module: dict, inputs: dict, workers: int) -> str:
 
     # 显式 none：永远不拆。
     if mode == "none":
+        inputs["_resolved_run_mode"] = "none"
         return "none"
 
     # 显式模块内部并行：永远不拆。
     if mode == "module_internal":
+        inputs["_resolved_run_mode"] = "module_internal"
+        inputs["_parallel_mode"] = "module_internal"
+        inputs["_parallel_internal_reason"] = "模块配置 parallel.mode=module_internal"
         return "module_internal"
 
     # 显式批处理：按多输入目录匹配。
     if mode == "batch_group":
+        inputs["_resolved_run_mode"] = "batch_group"
         return "batch_group"
+
+    # 对重型云类型/CTH 模块：即使原来配置为 folder_chunks，也优先转为 module_internal。
+    use_internal, internal_reason = should_use_module_internal_for_heavy_module(module, inputs, workers)
+    if use_internal:
+        inputs["_resolved_run_mode"] = "module_internal"
+        inputs["_parallel_mode"] = "module_internal"
+        inputs["_parallel_execution_strategy"] = "single_process_internal_batch"
+        inputs["_parallel_internal_reason"] = internal_reason
+        return "module_internal"
 
     # 显式平台拆分。
     if mode in {"single_file", "folder_chunks"}:
-        return "platform_split" if workers > 1 else "none"
+        run_mode = "platform_split" if workers > 1 else "none"
+        inputs["_resolved_run_mode"] = run_mode
+        return run_mode
 
     # auto 模式：
     # 1. 如果配置了 batch_role，例如 B01/B03/B06/SOLAR，走批处理；
-    # 2. 否则 workers > 1 才走平台拆分；
+    # 2. 否则 workers > 1 且不是重型 I/O 模块时才走平台拆分；
     # 3. workers == 1 就普通运行。
     if _is_batch_request(module, inputs):
+        inputs["_resolved_run_mode"] = "batch_group"
         return "batch_group"
 
     if workers > 1:
+        inputs["_resolved_run_mode"] = "platform_split"
         return "platform_split"
 
+    inputs["_resolved_run_mode"] = "none"
     return "none"
+
 def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: int) -> tuple[int, dict]:
     """轻量化并行调整。
 
