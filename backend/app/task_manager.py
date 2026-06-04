@@ -22,6 +22,10 @@ class TaskManager:
     def __init__(self, tasks_file: str | Path):
         self.tasks_file = Path(tasks_file)
         self.tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        self.base_dir = self.tasks_file.parent.parent
+        self.runtime_dir = self.base_dir / "runtime"
+        self.parallel_chunks_dir = self.runtime_dir / "parallel_chunks"
+        self.parallel_chunks_dir.mkdir(parents=True, exist_ok=True)
 
         self.lock = threading.RLock()
         self.tasks: Dict[str, Dict[str, Any]] = {}
@@ -129,6 +133,77 @@ class TaskManager:
                 self._save_tasks()
             except Exception:
                 pass
+    def _normalize_cleanup_roots(self, roots: Any) -> list[Path]:
+        """规范化需要清理的 runtime 子目录。
+
+        安全限制：只允许删除 backend/runtime/parallel_chunks 内部目录，
+        防止误删用户输入数据、输出目录或模块安装目录。
+        """
+        if not roots:
+            return []
+
+        if isinstance(roots, (str, Path)):
+            items = [roots]
+        elif isinstance(roots, (list, tuple, set)):
+            items = list(roots)
+        else:
+            return []
+
+        try:
+            allowed_root = self.parallel_chunks_dir.resolve()
+        except Exception:
+            return []
+
+        result: list[Path] = []
+        seen: set[str] = set()
+
+        for item in items:
+            try:
+                p = Path(str(item)).resolve()
+            except Exception:
+                continue
+
+            try:
+                p.relative_to(allowed_root)
+            except ValueError:
+                continue
+
+            key = str(p).lower()
+            if key not in seen:
+                seen.add(key)
+                result.append(p)
+
+        return result
+
+    def _cleanup_runtime_roots(self, task_id: str, roots: Any, reason: str = "任务结束"):
+        """清理平台拆分产生的 runtime/parallel_chunks 临时输入目录。"""
+        paths = self._normalize_cleanup_roots(roots)
+        if not paths:
+            return
+
+        removed = 0
+        for path in paths:
+            try:
+                if path.exists() and path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                    removed += 1
+            except Exception as exc:
+                try:
+                    self.append_log(task_id, f"[CLEANUP] 清理临时输入目录失败: {path}，原因: {type(exc).__name__}: {exc}")
+                except Exception:
+                    pass
+
+        if removed:
+            try:
+                self.append_log(task_id, f"[CLEANUP] {reason}，已清理 {removed} 个平台拆分临时输入目录，避免占用磁盘空间。")
+            except Exception:
+                pass
+
+    def _cleanup_runtime_roots_for_task(self, task_id: str, reason: str = "任务结束"):
+        task = self.get_task(task_id) or {}
+        roots = task.get("cleanup_roots") or (task.get("inputs") or {}).get("_parallel_cleanup_roots")
+        self._cleanup_runtime_roots(task_id, roots, reason=reason)
+
     def _scheduler_heartbeat(self):
         """
         调度器心跳。
@@ -168,17 +243,23 @@ class TaskManager:
             self.tasks = {}
 
     def _mark_interrupted_tasks(self):
-        """服务重启后，内存里的进程和调度队列都不存在了。把旧的 running/queued 标记为 cancelled。"""
+        """服务重启后，内存里的进程和调度队列都不存在了。把旧的 running/queued 标记为 cancelled，并清理平台拆分临时目录。"""
         changed = False
+        cleanup_map: dict[str, Any] = {}
         with self.lock:
             for task in self.tasks.values():
                 if task.get("status") in {"queued", "running"}:
                     task["status"] = "cancelled"
                     task["ended_at"] = now_iso()
                     task.setdefault("logs", []).append("[SYSTEM] 服务已重启，历史未完成任务已自动取消")
+                    roots = task.get("cleanup_roots") or (task.get("inputs") or {}).get("_parallel_cleanup_roots")
+                    if roots:
+                        cleanup_map[str(task.get("id") or "")] = roots
                     changed = True
         if changed:
             self._save_tasks()
+            for task_id, roots in cleanup_map.items():
+                self._cleanup_runtime_roots(task_id, roots, reason="服务重启后清理历史临时输入目录")
 
     def _system_cpu_percent(self) -> float | None:
         """读取本机 CPU 使用率。
@@ -880,7 +961,23 @@ class TaskManager:
         job_count = len(jobs)
         effective_workers = max(1, min(requested_workers, max(1, job_count)))
 
+        cleanup_roots = sorted({
+            str(job.get("cleanup_root") or "")
+            for job in jobs
+            if str(job.get("cleanup_root") or "").strip()
+        })
+        input_link_modes = sorted({
+            str(mode)
+            for job in jobs
+            for mode in (job.get("link_modes") or [])
+            if str(mode).strip()
+        })
+
         parent_inputs = dict(inputs or {})
+        if cleanup_roots:
+            parent_inputs["_parallel_cleanup_roots"] = cleanup_roots
+        if input_link_modes:
+            parent_inputs["_parallel_chunk_link_modes"] = input_link_modes
         parent_inputs["parallel_workers"] = effective_workers
         parent_inputs["_parallel_workers"] = effective_workers
         parent_inputs["_requested_parallel_workers"] = requested_workers
@@ -901,6 +998,7 @@ class TaskManager:
                 "max_workers": effective_workers,
                 "requested_workers": requested_workers,
                 "owner_username": str(owner_username or ""),
+                "cleanup_roots": cleanup_roots,
             },
         )
 
@@ -1400,6 +1498,14 @@ class TaskManager:
         )
 
         self.append_log(parent_id, f"[PARALLEL] 并行任务启动：总任务数={total}，实际并行数={max_workers}")
+        parent_task = self.get_task(parent_id) or {}
+        parent_inputs = parent_task.get("inputs") or {}
+        link_modes = parent_inputs.get("_parallel_chunk_link_modes") or []
+        if link_modes:
+            self.append_log(
+                parent_id,
+                f"[LINK] 子任务输入文件引用方式：{', '.join(str(x) for x in link_modes)}；系统未复制原始输入大文件到 runtime。"
+            )
         self.append_log(parent_id, "[POOL] 稳定进程池：最多同时运行 max_workers 个子任务；一个完成后补一个；检测到高负载时先等已有子任务完成，再决定是否补位。")
         self.append_log(parent_id, "[SAFE] 不再按模型文件大小直接降为 1；启动新子进程前检查 CPU/内存/磁盘，真正接近危险阈值时才暂停补位。")
 
@@ -1562,6 +1668,7 @@ class TaskManager:
         )
 
         self.append_log(parent_id, f"[PARALLEL] 并行任务结束，状态={final_status}")
+        self._cleanup_runtime_roots_for_task(parent_id, reason=f"并行任务结束，状态={final_status}")
         with self.lock:
             self.learned_child_start_intervals.pop(parent_id, None)
             self.child_start_gate_locks.pop(parent_id, None)
@@ -1591,6 +1698,7 @@ class TaskManager:
                             child["ended_at"] = now_iso()
                             child.setdefault("logs", []).append("[SYSTEM] 父任务排队取消，子任务取消")
             self._save_tasks()
+            self._cleanup_runtime_roots_for_task(task_id, reason="排队任务取消")
             self._drain_scheduler_queue()
             return True
 
@@ -1631,6 +1739,7 @@ class TaskManager:
                     parent["ended_at"] = now_iso()
                     parent.setdefault("logs", []).append("[SYSTEM] 并行任务已被手动终止")
             self._save_tasks()
+            self._cleanup_runtime_roots_for_task(task_id, reason="并行任务取消")
             return True or any_stopped
 
         process = self.processes.get(task_id)
@@ -1677,6 +1786,15 @@ class TaskManager:
                 except Exception:
                     pass
                 self.processes.pop(tid, None)
+
+        cleanup_roots = []
+        for tid in ids_to_delete:
+            t = self.get_task(tid) or {}
+            cleanup_roots.extend(t.get("cleanup_roots") or [])
+            cleanup_roots.extend((t.get("inputs") or {}).get("_parallel_cleanup_roots") or [])
+
+        if cleanup_roots:
+            self._cleanup_runtime_roots(task_id, cleanup_roots, reason="任务记录删除")
 
         with self.lock:
             for tid in ids_to_delete:

@@ -5272,21 +5272,113 @@ def split_evenly(items: list[Path], parts: int) -> list[list[Path]]:
     return [bucket for bucket in buckets if bucket]
 
 
-def link_or_copy_file(src: Path, dst: Path):
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists():
-        return
-    try:
-        os.link(src, dst)
-    except Exception:
-        try:
-            if hasattr(os, "symlink"):
-                os.symlink(src, dst)
-            else:
-                shutil.copy2(src, dst)
-        except Exception:
-            shutil.copy2(src, dst)
+def link_or_copy_file(src: Path, dst: Path) -> str:
+    """为并行子任务创建输入文件引用，默认只创建符号链接，不复制输入大文件。
 
+    说明：
+    - symlink：目录中显示为链接，最能直观看出不是复制文件；
+    - hardlink：不是物理复制，但资源管理器里看起来像普通文件，容易被误认为复制；
+    - copy/copy2：本函数已彻底禁用，不会再把 NC/HDF/TIF 大文件复制到 runtime。
+
+    默认策略：
+    - 只尝试 symlink；
+    - 如果需要兼容不支持 symlink 的环境，可显式设置 LOCAL_WEB_ALLOW_INPUT_HARDLINKS=1，
+      此时 symlink 失败后才允许 hardlink。
+    """
+    src = Path(src).resolve()
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    if not src.exists() or not src.is_file():
+        raise HTTPException(
+            status_code=400,
+            detail=f"并行输入文件不存在或不是文件: {src}",
+        )
+
+    if dst.exists() or dst.is_symlink():
+        try:
+            dst.unlink()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"无法清理旧的子任务输入文件: {dst}，原因: {type(exc).__name__}: {exc}",
+            )
+
+    errors: list[str] = []
+
+    # 默认只用 symlink，避免 hardlink 在资源管理器里显示成“普通大文件”而被误判为复制。
+    raw_order = str(os.environ.get("LOCAL_WEB_INPUT_LINK_ORDER", "symlink") or "symlink")
+    order = [
+        item.strip().lower()
+        for item in raw_order.replace("；", ",").replace(";", ",").split(",")
+        if item.strip()
+    ] or ["symlink"]
+
+    allow_symlink = str(os.environ.get("LOCAL_WEB_ALLOW_INPUT_SYMLINKS", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    allow_hardlink = str(os.environ.get("LOCAL_WEB_ALLOW_INPUT_HARDLINKS", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+    def try_symlink() -> str | None:
+        if not allow_symlink:
+            errors.append("symlink跳过: LOCAL_WEB_ALLOW_INPUT_SYMLINKS=0")
+            return None
+        if not hasattr(os, "symlink"):
+            errors.append("symlink失败: 当前 Python/系统不支持 os.symlink")
+            return None
+        try:
+            os.symlink(str(src), str(dst), target_is_directory=False)
+            return "symlink"
+        except Exception as exc:
+            errors.append(f"symlink失败: {type(exc).__name__}: {exc}")
+            return None
+
+    def try_hardlink() -> str | None:
+        if not allow_hardlink:
+            errors.append("hardlink跳过: LOCAL_WEB_ALLOW_INPUT_HARDLINKS 未启用")
+            return None
+        try:
+            os.link(str(src), str(dst))
+            return "hardlink"
+        except Exception as exc:
+            errors.append(f"hardlink失败: {type(exc).__name__}: {exc}")
+            return None
+
+    tried: set[str] = set()
+    for mode in order + ["symlink"]:
+        if mode in tried:
+            continue
+        tried.add(mode)
+
+        if mode in {"symlink", "symbolic", "symboliclink"}:
+            result = try_symlink()
+            if result:
+                return result
+        elif mode in {"hardlink", "link"}:
+            result = try_hardlink()
+            if result:
+                return result
+        elif mode in {"copy", "copy2"}:
+            errors.append("copy/copy2 已禁用：系统不再复制输入大文件到 runtime")
+
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "message": "无法为并行子任务创建输入文件符号链接。为避免复制输入大文件，系统已中止任务。",
+            "errors": [
+                {
+                    "field": "parallel.input_symlink",
+                    "message": f"源文件: {src}；目标位置: {dst}",
+                    "suggestion": "请用管理员身份运行 start_backend.bat，或开启 Windows 开发者模式，以允许创建符号链接。",
+                }
+            ],
+            "suggestions": [
+                "Windows 推荐：设置 → 系统 → 开发者选项 → 开启开发人员模式，然后重启系统。",
+                "或者右键 start_backend.bat，选择“以管理员身份运行”。",
+                "如果你接受 hardlink 形式，可在启动脚本中设置 LOCAL_WEB_ALLOW_INPUT_HARDLINKS=1；hardlink 不是复制，但资源管理器里看起来像普通文件。",
+                "本版本已禁用 copy/copy2，不会再把 NC/HDF/TIF 大文件复制到 runtime。",
+            ],
+            "debug": "; ".join(errors),
+        },
+    )
 
 def unique_chunk_filename(src: Path, used: set[str]) -> str:
     name = src.name
@@ -5511,11 +5603,13 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
             chunk_dir = chunk_root / f"job_{idx:04d}"
             chunk_dir.mkdir(parents=True, exist_ok=True)
             used_names: set[str] = set()
+            link_modes: list[str] = []
             for src in chunk:
                 dst = chunk_dir / unique_chunk_filename(src, used_names)
-                link_or_copy_file(src, dst)
+                link_modes.append(link_or_copy_file(src, dst))
 
             job_inputs = dict(inputs)
+            job_inputs["_parallel_chunk_link_modes"] = sorted(set(link_modes))
             job_inputs[input_key] = str(chunk_dir.resolve())
             if is_parasol_jd_pair_module(module) and files_before_parasol_filter != len(files):
                 job_inputs["_parasol_jd_filter"] = (
@@ -5540,6 +5634,8 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
                 "working_dir": working_dir,
                 "env": runtime_env,
                 "inputs": job_inputs,
+                "cleanup_root": str(chunk_root.resolve()),
+                "link_modes": sorted(set(link_modes)),
             })
         return jobs
 
