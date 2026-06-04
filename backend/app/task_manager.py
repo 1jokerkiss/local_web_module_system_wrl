@@ -79,26 +79,6 @@ class TaskManager:
         self.adaptive_child_start_min_memory_gb = float(os.environ.get("LOCAL_WEB_ADAPTIVE_CHILD_START_MIN_MEMORY_GB", "1.0"))
         self.learned_child_start_intervals: Dict[str, float] = {}
         self.child_start_gate_locks: Dict[str, threading.Lock] = {}
-
-        # 利用率感知调度器：AIMD（加性增大/乘性减小）动态调节并发目标。
-        # 目标：CPU 空闲且 I/O/内存安全时逐步补位；I/O/内存/CPU 压力升高时降低补位速度，避免多个子任务同时进入写盘阶段。
-        self.util_scheduler_enabled = str(os.environ.get("LOCAL_WEB_UTIL_SCHEDULER", "1")).strip().lower() not in {"0", "false", "no", "off"}
-        self.util_cpu_low = float(os.environ.get("LOCAL_WEB_UTIL_CPU_LOW", "60"))
-        self.util_cpu_high = float(os.environ.get("LOCAL_WEB_UTIL_CPU_HIGH", "92"))
-        self.util_memory_soft = float(os.environ.get("LOCAL_WEB_UTIL_MEMORY_SOFT", "78"))
-        self.util_memory_hard = float(os.environ.get("LOCAL_WEB_UTIL_MEMORY_HARD", "88"))
-        self.util_min_memory_soft_gb = float(os.environ.get("LOCAL_WEB_UTIL_MIN_MEMORY_SOFT_GB", "3"))
-        self.util_min_memory_hard_gb = float(os.environ.get("LOCAL_WEB_UTIL_MIN_MEMORY_HARD_GB", "1.5"))
-        self.util_io_read_soft_mb_s = float(os.environ.get("LOCAL_WEB_UTIL_IO_READ_SOFT_MB_S", os.environ.get("LOCAL_WEB_IO_READ_MB_S_THRESHOLD", "120")))
-        self.util_io_write_soft_mb_s = float(os.environ.get("LOCAL_WEB_UTIL_IO_WRITE_SOFT_MB_S", os.environ.get("LOCAL_WEB_IO_WRITE_MB_S_THRESHOLD", "60")))
-        self.util_io_read_hard_mb_s = float(os.environ.get("LOCAL_WEB_UTIL_IO_READ_HARD_MB_S", os.environ.get("LOCAL_WEB_IO_HARD_READ_MB_S_THRESHOLD", "360")))
-        self.util_io_write_hard_mb_s = float(os.environ.get("LOCAL_WEB_UTIL_IO_WRITE_HARD_MB_S", os.environ.get("LOCAL_WEB_IO_HARD_WRITE_MB_S_THRESHOLD", "300")))
-        self.util_disk_busy_soft = float(os.environ.get("LOCAL_WEB_UTIL_DISK_BUSY_SOFT", os.environ.get("LOCAL_WEB_IO_DISK_BUSY_THRESHOLD", "70")))
-        self.util_disk_busy_hard = float(os.environ.get("LOCAL_WEB_UTIL_DISK_BUSY_HARD", os.environ.get("LOCAL_WEB_IO_HARD_DISK_BUSY_THRESHOLD", "90")))
-        self.util_scale_up_samples = max(1, int(os.environ.get("LOCAL_WEB_UTIL_SCALE_UP_SAMPLES", "2")))
-        self.util_scale_up_cooldown = float(os.environ.get("LOCAL_WEB_UTIL_SCALE_UP_COOLDOWN_SECONDS", "8"))
-        self.util_scale_down_cooldown = float(os.environ.get("LOCAL_WEB_UTIL_SCALE_DOWN_COOLDOWN_SECONDS", "5"))
-        self.util_scheduler_states: Dict[str, Dict[str, Any]] = {}
         self._last_pressure_log_at: Dict[str, float] = {}
 
         self._load_tasks()
@@ -108,6 +88,27 @@ class TaskManager:
             daemon=True,
         )
         self._scheduler_heartbeat_thread.start()
+    def kick_scheduler(self):
+        """
+        外部主动唤醒调度器。
+        前端轮询 /api/tasks 或 /api/system/resources 时调用，
+        防止任务已经 queued 但调度器没有继续 drain。
+        """
+        try:
+            self._drain_scheduler_queue()
+        except Exception as exc:
+            try:
+                with self.lock:
+                    for item in self.scheduler_queue:
+                        task_id = str(item.get("task_id") or "")
+                        task = self.tasks.get(task_id)
+                        if task and task.get("status") == "queued":
+                            task["queue_reason"] = (
+                                f"调度器唤醒失败: {type(exc).__name__}: {exc}"
+                            )
+                self._save_tasks()
+            except Exception:
+                pass
     def kick_scheduler(self):
         """
         外部主动唤醒调度器。
@@ -128,279 +129,6 @@ class TaskManager:
                 self._save_tasks()
             except Exception:
                 pass
-
-    def _disk_io_rate_snapshot(self) -> Dict[str, Any]:
-        """
-        读取磁盘实时 I/O 速率。
-        返回 read_mb_s、write_mb_s、busy_percent。
-        需要 psutil。
-        """
-        try:
-            import psutil  # type: ignore
-        except Exception:
-            return {
-                "read_mb_s": None,
-                "write_mb_s": None,
-                "busy_percent": None,
-            }
-
-        try:
-            now = time.time()
-            counters = psutil.disk_io_counters()
-            if not counters:
-                return {
-                    "read_mb_s": None,
-                    "write_mb_s": None,
-                    "busy_percent": None,
-                }
-
-            current = {
-                "time": now,
-                "read_bytes": float(getattr(counters, "read_bytes", 0) or 0),
-                "write_bytes": float(getattr(counters, "write_bytes", 0) or 0),
-                "busy_time": float(getattr(counters, "busy_time", 0) or 0),
-            }
-
-            last = getattr(self, "_last_disk_io_sample", None)
-            self._last_disk_io_sample = current
-
-            if not last:
-                return {
-                    "read_mb_s": 0.0,
-                    "write_mb_s": 0.0,
-                    "busy_percent": 0.0,
-                }
-
-            dt = max(0.1, current["time"] - last["time"])
-            read_mb_s = (current["read_bytes"] - last["read_bytes"]) / dt / (1024 ** 2)
-            write_mb_s = (current["write_bytes"] - last["write_bytes"]) / dt / (1024 ** 2)
-
-            busy_delta = current["busy_time"] - last.get("busy_time", 0)
-            busy_percent = max(0.0, min(100.0, busy_delta / (dt * 10.0))) if busy_delta >= 0 else 0.0
-
-            return {
-                "read_mb_s": max(0.0, read_mb_s),
-                "write_mb_s": max(0.0, write_mb_s),
-                "busy_percent": busy_percent,
-            }
-
-        except Exception:
-            return {
-                "read_mb_s": None,
-                "write_mb_s": None,
-                "busy_percent": None,
-            }
-
-    def _io_pressure_reason(self, cpu: float | None = None, mem: Dict[str, Any] | None = None) -> str:
-        """
-        判断当前是否处于 I/O 压力阶段。
-
-        典型特征：
-        1. CPU 下降；
-        2. 内存使用率升高或可用内存降低；
-        3. 磁盘读写速率升高。
-        """
-        cpu = self._system_cpu_percent() if cpu is None else cpu
-        mem = self._virtual_memory_snapshot() if mem is None else mem
-        disk_io = self._disk_io_rate_snapshot()
-
-        try:
-            cpu_low_threshold = float(os.environ.get("LOCAL_WEB_IO_CPU_LOW_THRESHOLD", "55"))
-            mem_high_threshold = float(os.environ.get("LOCAL_WEB_IO_MEMORY_THRESHOLD", "80"))
-            min_available_gb = float(os.environ.get("LOCAL_WEB_IO_MIN_AVAILABLE_MEMORY_GB", "3"))
-            read_mb_s_threshold = float(os.environ.get("LOCAL_WEB_IO_READ_MB_S_THRESHOLD", "120"))
-            write_mb_s_threshold = float(os.environ.get("LOCAL_WEB_IO_WRITE_MB_S_THRESHOLD", "60"))
-            disk_busy_threshold = float(os.environ.get("LOCAL_WEB_IO_DISK_BUSY_THRESHOLD", "70"))
-            hard_read_mb_s_threshold = float(os.environ.get("LOCAL_WEB_IO_HARD_READ_MB_S_THRESHOLD", str(read_mb_s_threshold * 3)))
-            hard_write_mb_s_threshold = float(os.environ.get("LOCAL_WEB_IO_HARD_WRITE_MB_S_THRESHOLD", str(write_mb_s_threshold * 5)))
-            hard_disk_busy_threshold = float(os.environ.get("LOCAL_WEB_IO_HARD_DISK_BUSY_THRESHOLD", "90"))
-        except Exception:
-            cpu_low_threshold = 55
-            mem_high_threshold = 80
-            min_available_gb = 3
-            read_mb_s_threshold = 120
-            write_mb_s_threshold = 60
-            disk_busy_threshold = 70
-            hard_read_mb_s_threshold = 360
-            hard_write_mb_s_threshold = 300
-            hard_disk_busy_threshold = 90
-
-        mem_percent = mem.get("percent")
-        mem_available = mem.get("available_gb")
-        read_mb_s = disk_io.get("read_mb_s")
-        write_mb_s = disk_io.get("write_mb_s")
-        busy_percent = disk_io.get("busy_percent")
-
-        cpu_is_low = cpu is not None and cpu <= cpu_low_threshold
-
-        memory_pressure = (
-                (mem_percent is not None and mem_percent >= mem_high_threshold)
-                or (mem_available is not None and mem_available <= min_available_gb)
-        )
-
-        disk_pressure = (
-                (read_mb_s is not None and read_mb_s >= read_mb_s_threshold)
-                or (write_mb_s is not None and write_mb_s >= write_mb_s_threshold)
-                or (busy_percent is not None and busy_percent >= disk_busy_threshold)
-        )
-
-        disk_hard_pressure = (
-                (read_mb_s is not None and read_mb_s >= hard_read_mb_s_threshold)
-                or (write_mb_s is not None and write_mb_s >= hard_write_mb_s_threshold)
-                or (busy_percent is not None and busy_percent >= hard_disk_busy_threshold)
-        )
-
-        # 普通 I/O 偏高交给利用率调度器降低目标并发；只有硬 I/O 压力，
-        # 或 CPU 已明显下降且内存/I/O 同时有压力时，才真正暂停启动。
-        if disk_hard_pressure or (cpu_is_low and (memory_pressure or disk_pressure)):
-            parts = []
-            if cpu is not None:
-                parts.append(f"CPU 已降至 {cpu:.1f}%")
-            if mem_percent is not None:
-                parts.append(f"内存使用率 {mem_percent:.1f}%")
-            if mem_available is not None:
-                parts.append(f"可用内存 {mem_available:.1f}GB")
-            if read_mb_s is not None:
-                parts.append(f"磁盘读取 {read_mb_s:.1f}MB/s")
-            if write_mb_s is not None:
-                parts.append(f"磁盘写入 {write_mb_s:.1f}MB/s")
-            if busy_percent is not None:
-                parts.append(f"磁盘忙碌度 {busy_percent:.1f}%")
-
-            return "检测到 I/O/内存压力阶段：" + "，".join(parts)
-
-        return ""
-
-    def _adaptive_parallel_target(
-        self,
-        parent_id: str,
-        max_workers: int,
-        running_count: int,
-        done_count: int,
-        total_count: int,
-    ) -> int:
-        """AIMD 利用率调度器。
-
-        返回本轮允许的目标并发数 target。
-        - 资源安全且 CPU 利用率偏低：逐步 +1，提高利用率；
-        - 磁盘/内存/CPU 出现软压力：保持或降低到当前运行数，避免继续补位；
-        - 磁盘/内存/CPU 出现硬压力：目标并发减半，但不强杀已运行进程。
-        """
-        max_workers = max(1, int(max_workers or 1))
-        if not self.util_scheduler_enabled:
-            return max_workers
-
-        now = time.time()
-        with self.lock:
-            state = self.util_scheduler_states.setdefault(parent_id, {
-                "target": 1,
-                "low_samples": 0,
-                "last_change_at": 0.0,
-                "last_log_at": 0.0,
-            })
-            target = max(1, min(max_workers, int(state.get("target") or 1)))
-
-        cpu = self._system_cpu_percent()
-        mem = self._virtual_memory_snapshot()
-        disk_io = self._disk_io_rate_snapshot()
-
-        mem_percent = mem.get("percent")
-        mem_available = mem.get("available_gb")
-        read_mb_s = disk_io.get("read_mb_s")
-        write_mb_s = disk_io.get("write_mb_s")
-        busy_percent = disk_io.get("busy_percent")
-
-        cpu_hard = cpu is not None and cpu >= self.child_launch_cpu_threshold
-        cpu_soft = cpu is not None and cpu >= self.util_cpu_high
-        cpu_low = cpu is not None and cpu <= self.util_cpu_low
-
-        mem_hard = (
-            (mem_percent is not None and mem_percent >= self.util_memory_hard)
-            or (mem_available is not None and mem_available <= self.util_min_memory_hard_gb)
-        )
-        mem_soft = (
-            (mem_percent is not None and mem_percent >= self.util_memory_soft)
-            or (mem_available is not None and mem_available <= self.util_min_memory_soft_gb)
-        )
-        io_hard = (
-            (read_mb_s is not None and read_mb_s >= self.util_io_read_hard_mb_s)
-            or (write_mb_s is not None and write_mb_s >= self.util_io_write_hard_mb_s)
-            or (busy_percent is not None and busy_percent >= self.util_disk_busy_hard)
-        )
-        io_soft = (
-            (read_mb_s is not None and read_mb_s >= self.util_io_read_soft_mb_s)
-            or (write_mb_s is not None and write_mb_s >= self.util_io_write_soft_mb_s)
-            or (busy_percent is not None and busy_percent >= self.util_disk_busy_soft)
-        )
-
-        hard_pressure = cpu_hard or mem_hard or io_hard
-        soft_pressure = cpu_soft or mem_soft or io_soft
-
-        changed = False
-        action = "保持"
-        reason_parts = []
-        if cpu is not None:
-            reason_parts.append(f"CPU={cpu:.1f}%")
-        if mem_percent is not None:
-            reason_parts.append(f"MEM={mem_percent:.1f}%")
-        if mem_available is not None:
-            reason_parts.append(f"可用内存={mem_available:.1f}GB")
-        if read_mb_s is not None:
-            reason_parts.append(f"读={read_mb_s:.1f}MB/s")
-        if write_mb_s is not None:
-            reason_parts.append(f"写={write_mb_s:.1f}MB/s")
-        if busy_percent is not None:
-            reason_parts.append(f"磁盘忙={busy_percent:.1f}%")
-
-        if hard_pressure and now - float(state.get("last_change_at") or 0) >= self.util_scale_down_cooldown:
-            new_target = max(1, min(max(1, running_count), max(1, (target + 1) // 2)))
-            if new_target < target:
-                target = new_target
-                changed = True
-                action = "硬压力降并发"
-            state["low_samples"] = 0
-            state["last_change_at"] = now
-        elif soft_pressure:
-            # 软压力：不继续向上补位；如果目标高于当前运行数，则回落到当前运行数。
-            new_target = max(1, min(target, max(1, running_count)))
-            if new_target < target and now - float(state.get("last_change_at") or 0) >= self.util_scale_down_cooldown:
-                target = new_target
-                changed = True
-                action = "软压力限并发"
-                state["last_change_at"] = now
-            state["low_samples"] = 0
-        elif cpu_low and not mem_soft and not io_soft:
-            state["low_samples"] = int(state.get("low_samples") or 0) + 1
-            if (
-                state["low_samples"] >= self.util_scale_up_samples
-                and target < max_workers
-                and now - float(state.get("last_change_at") or 0) >= self.util_scale_up_cooldown
-            ):
-                target += 1
-                changed = True
-                action = "资源空闲升并发"
-                state["low_samples"] = 0
-                state["last_change_at"] = now
-        else:
-            state["low_samples"] = 0
-
-        with self.lock:
-            state["target"] = max(1, min(max_workers, int(target)))
-            target = int(state["target"])
-            last_log = float(state.get("last_log_at") or 0)
-            should_log = changed or (now - last_log >= 20 and done_count < total_count)
-            if should_log:
-                state["last_log_at"] = now
-
-        if should_log:
-            self.append_log(
-                parent_id,
-                f"[SCHED] {action}：目标并发={target}/{max_workers}，当前运行={running_count}，完成={done_count}/{total_count}；"
-                + "，".join(reason_parts)
-            )
-
-        return max(1, min(max_workers, target))
-
     def _scheduler_heartbeat(self):
         """
         调度器心跳。
@@ -656,22 +384,23 @@ class TaskManager:
                 return {"percent": None, "free_gb": None}
 
     def _runtime_pressure_reason(self) -> str:
+        """返回是否应该暂停启动新的子进程。
+
+        轻量化策略：
+        - 顶层任务不因为内存 80% 多就长期 queued；
+        - 真正启动每一个子进程前，才检查 CPU/内存/磁盘和当前平台进程数；
+        - 已启动的进程不强杀，只暂停后续启动，等负载下降再继续。
+        """
         active_processes = self._active_process_count()
         if active_processes >= self.max_process_slots:
             return f"平台已启动 {active_processes}/{self.max_process_slots} 个模块进程，等待已有进程完成"
 
-        cpu = self._system_cpu_percent()
+        if not self.adaptive_child_start_enabled:
+            cpu = self._system_cpu_percent()
+            if cpu is not None and cpu >= self.child_launch_cpu_threshold:
+                return f"CPU 使用率 {cpu:.1f}% 已超过暂停启动阈值 {self.child_launch_cpu_threshold:.0f}%"
+
         mem = self._virtual_memory_snapshot()
-
-        # 新增：I/O 阶段错峰控制
-        if active_processes > 0:
-            io_reason = self._io_pressure_reason(cpu=cpu, mem=mem)
-            if io_reason:
-                return io_reason
-
-        if cpu is not None and cpu >= self.child_launch_cpu_threshold:
-            return f"CPU 使用率 {cpu:.1f}% 已超过暂停启动阈值 {self.child_launch_cpu_threshold:.0f}%"
-
         mem_percent = mem.get("percent")
         mem_available = mem.get("available_gb")
         if mem_percent is not None and mem_percent >= self.child_launch_memory_threshold:
@@ -1129,17 +858,6 @@ class TaskManager:
         )
 
         self._append_parallel_adjustment_log(task["id"], inputs)
-        if str((inputs or {}).get("_parallel_mode") or "").lower() == "module_internal":
-            workers = (inputs or {}).get("_parallel_workers") or (inputs or {}).get("parallel_workers") or 1
-            reason = (inputs or {}).get("_parallel_internal_reason") or "重型模块采用内部批处理"
-            self.append_log(
-                task["id"],
-                f"[PERF] 模块内部批处理模式：平台只启动 1 个常驻进程，parallel_workers={workers} 写入 config.json；原因：{reason}。"
-            )
-            self.append_log(
-                task["id"],
-                "[PERF] 该模式用于减少重复启动 EXE、重复加载模型和重复初始化 GDAL/HDF5；真正的并行需由算法模块读取 parallel_workers 后在内部实现。"
-            )
         # 单个模块进程只占 1 个真实启动槽；parallel_workers 只写入配置，不作为父任务排队条件。
         self._enqueue_task_runner(
             task["id"],
@@ -1342,10 +1060,6 @@ class TaskManager:
                     child_id, job = job_items[next_index]
                     label = job.get("label") or child_id
 
-                    adaptive_target = self._adaptive_parallel_target(parent_id, max_parallel, len(running), done, total)
-                    if len(running) >= adaptive_target:
-                        break
-
                     # 一旦检测到 CPU/内存/磁盘压力，就不要在没有子任务完成的情况下继续补位。
                     # 这样不会出现“刚提示暂停，马上又把下一个任务提交上去”的情况。
                     if paused_by_pressure and running:
@@ -1450,7 +1164,6 @@ class TaskManager:
         with self.lock:
             self.learned_child_start_intervals.pop(parent_id, None)
             self.child_start_gate_locks.pop(parent_id, None)
-            self.util_scheduler_states.pop(parent_id, None)
         self.cancel_flags.discard(parent_id)
 
     def _stream_reader(self, pipe, task_id: str, prefix: str):
@@ -1748,10 +1461,6 @@ class TaskManager:
                     spec = jobs[next_index]
                     label = spec.get("label") or f"子任务 {next_index + 1}"
 
-                    adaptive_target = self._adaptive_parallel_target(parent_id, max_workers, len(running), progress["done"], total)
-                    if len(running) >= adaptive_target:
-                        break
-
                     # 一旦检测到 CPU/内存/磁盘压力，就等待至少一个正在运行的子任务结束后再判断是否补位。
                     # 旧版会在压力短暂波动时继续提交，导致日志里出现“暂停后仍提交第 6 个任务”。
                     if paused_by_pressure and running:
@@ -1856,7 +1565,6 @@ class TaskManager:
         with self.lock:
             self.learned_child_start_intervals.pop(parent_id, None)
             self.child_start_gate_locks.pop(parent_id, None)
-            self.util_scheduler_states.pop(parent_id, None)
         self.cancel_flags.discard(parent_id)
 
     def cancel_task(self, task_id: str) -> bool:

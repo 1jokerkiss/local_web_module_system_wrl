@@ -630,28 +630,6 @@ function parseTaskTimestamp(value) {
   return Number.isFinite(t) ? t : null;
 }
 
-function getTaskElapsedText(task) {
-  if (!task) return '';
-
-  const status = String(task?.status || '').toLowerCase();
-  const startMs = parseTaskTimestamp(
-    task?.started_at || task?.scheduled_at || task?.created_at
-  );
-
-  if (!startMs) return '';
-
-  const terminal = isTerminalTaskStatus(status);
-  const endMs = terminal
-    ? parseTaskTimestamp(
-        task?.ended_at || task?.finished_at || task?.completed_at || task?.updated_at
-      )
-    : Date.now();
-
-  if (!endMs || endMs < startMs) return '';
-
-  return formatElapsedSeconds((endMs - startMs) / 1000);
-}
-
 function countLogMatches(logs, pattern) {
   return logs.reduce((n, line) => n + (pattern.test(String(line || '')) ? 1 : 0), 0);
 }
@@ -673,7 +651,9 @@ function findLastNumberInLogs(logs, patterns) {
 function getTaskProgressInfo(task, taskLogs) {
   const status = String(task?.status || '').toLowerCase();
   const logs = Array.isArray(taskLogs) ? taskLogs : [];
-  const elapsedText = getTaskElapsedText(task);
+  const now = Date.now();
+  const startMs = parseTaskTimestamp(task?.started_at || task?.scheduled_at || task?.created_at);
+  const elapsedText = startMs ? formatElapsedSeconds((now - startMs) / 1000) : '';
 
   if (!task) {
     return {
@@ -710,9 +690,7 @@ function getTaskProgressInfo(task, taskLogs) {
     return {
       percent: 100,
       label: '任务运行失败',
-      detail: elapsedText
-        ? `总耗时：${elapsedText}；请查看下方运行日志中的 STDERR、ERROR 或 Traceback 信息`
-        : '请查看下方运行日志中的 STDERR、ERROR 或 Traceback 信息',
+      detail: '请查看下方运行日志中的 STDERR、ERROR 或 Traceback 信息',
       mode: 'failed',
       color: '#d64545',
     };
