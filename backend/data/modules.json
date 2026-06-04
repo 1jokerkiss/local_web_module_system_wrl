@@ -308,7 +308,7 @@
       "output_key": "outpath",
       "file_patterns": "*.nc;*.NC",
       "output_suffix": ".tif",
-      "files_per_job": 2
+      "files_per_job": 1
     },
     "dependency_dirs": [
       "_internal",
@@ -367,7 +367,7 @@
       "output_key": "out_path",
       "file_patterns": "*.hdf;*.HDF",
       "output_suffix": ".tif",
-      "files_per_job": 2
+      "files_per_job": 1
     },
     "dependency_dirs": [
       "_internal",

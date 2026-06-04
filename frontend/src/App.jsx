@@ -593,12 +593,26 @@ function statusBadge(status) {
   );
 }
 
+const TASK_TERMINAL_STATUSES = new Set([
+  'success',
+  'failed',
+  'cancelled',
+  'canceled',
+  'error',
+  'stopped',
+  'timeout',
+]);
+
+function normalizeTaskStatus(status) {
+  return String(status || '').trim().toLowerCase();
+}
+
 function isTerminalTaskStatus(status) {
-  return ['success', 'failed', 'cancelled'].includes(status);
+  return TASK_TERMINAL_STATUSES.has(normalizeTaskStatus(status));
 }
 
 function isActiveTaskStatus(status) {
-  return ['queued', 'running'].includes(status);
+  return ['queued', 'running'].includes(normalizeTaskStatus(status));
 }
 
 function RunningDots({ active }) {
@@ -630,6 +644,118 @@ function parseTaskTimestamp(value) {
   return Number.isFinite(t) ? t : null;
 }
 
+function getTaskCacheKey(task) {
+  return String(task?.id || task?.task_id || `${task?.module_id || 'task'}_${task?.created_at || ''}`);
+}
+
+function getTaskBackendStartMs(task) {
+  return parseTaskTimestamp(task?.started_at || task?.scheduled_at || task?.created_at);
+}
+
+function getTaskBackendEndMs(task) {
+  return parseTaskTimestamp(
+    task?.ended_at ||
+      task?.finished_at ||
+      task?.completed_at ||
+      task?.cancelled_at ||
+      task?.canceled_at ||
+      task?.stopped_at
+  );
+}
+
+function normalizeFrontendMs(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function getTaskStartMs(task) {
+  return normalizeFrontendMs(task?._frontend_start_ms) || getTaskBackendStartMs(task);
+}
+
+function getTaskEndMs(task) {
+  return normalizeFrontendMs(task?._frontend_end_ms) || getTaskBackendEndMs(task);
+}
+
+function shouldTaskTimerRun(status) {
+  return normalizeTaskStatus(status) === 'running';
+}
+
+function stampTaskTiming(previousTask, nextTask) {
+  if (!nextTask) return nextTask;
+
+  const now = Date.now();
+  const previousStatus = normalizeTaskStatus(previousTask?.status);
+  const nextStatus = normalizeTaskStatus(nextTask?.status);
+
+  const previousStartMs = normalizeFrontendMs(previousTask?._frontend_start_ms);
+  const nextStartMs = normalizeFrontendMs(nextTask?._frontend_start_ms);
+  const backendStartMs = getTaskBackendStartMs(nextTask);
+
+  let startMs = previousStartMs || nextStartMs || backendStartMs || null;
+  let endMs =
+    normalizeFrontendMs(previousTask?._frontend_end_ms) ||
+    normalizeFrontendMs(nextTask?._frontend_end_ms) ||
+    getTaskBackendEndMs(nextTask) ||
+    null;
+
+  // 进入 running 的那一刻记录前端开始时间；各个任务独立保存到自己的 task 对象上。
+  if (shouldTaskTimerRun(nextStatus) && !startMs) {
+    startMs = backendStartMs || now;
+  }
+
+  // 如果后端有 started_at，以后端时间为准，但不会破坏已经独立保存的前端开始时间。
+  if (!startMs && backendStartMs) {
+    startMs = backendStartMs;
+  }
+
+  const statusChanged = previousStatus && nextStatus && previousStatus !== nextStatus;
+  const wasRunning = shouldTaskTimerRun(previousStatus);
+  const stillRunning = shouldTaskTimerRun(nextStatus);
+
+  // 只要任务曾经处于 running，之后状态发生变化并离开 running，就冻结结束时间。
+  // success / failed / cancelled / stopped / timeout / 其他非 running 状态都会停止计时。
+  if (startMs && !endMs && statusChanged && wasRunning && !stillRunning) {
+    endMs = getTaskBackendEndMs(nextTask) || now;
+  }
+
+  // 如果第一次拿到任务时已经是终止状态，也必须补一个结束时间，避免拖动弹窗时继续用 Date.now()。
+  if (startMs && !endMs && isTerminalTaskStatus(nextStatus)) {
+    endMs = getTaskBackendEndMs(nextTask) || now;
+  }
+
+  const timedTask = { ...nextTask };
+
+  if (startMs) {
+    timedTask._frontend_start_ms = startMs;
+  }
+
+  if (endMs) {
+    timedTask._frontend_end_ms = Math.max(endMs, startMs || endMs);
+  }
+
+  return timedTask;
+}
+
+function getTaskElapsedSeconds(task, nowMs = Date.now()) {
+  if (!task) return null;
+
+  const startMs = getTaskStartMs(task);
+  if (!startMs) return null;
+
+  const endMs = getTaskEndMs(task);
+  const finalMs = endMs || nowMs;
+
+  if (!finalMs || finalMs < startMs) return 0;
+
+  return Math.max(0, (finalMs - startMs) / 1000);
+}
+
+function getTaskElapsedText(task, nowMs = Date.now()) {
+  const elapsedSeconds = getTaskElapsedSeconds(task, nowMs);
+  if (elapsedSeconds == null) return '';
+  return formatElapsedSeconds(elapsedSeconds);
+}
+
 function countLogMatches(logs, pattern) {
   return logs.reduce((n, line) => n + (pattern.test(String(line || '')) ? 1 : 0), 0);
 }
@@ -648,12 +774,10 @@ function findLastNumberInLogs(logs, patterns) {
   return 0;
 }
 
-function getTaskProgressInfo(task, taskLogs) {
-  const status = String(task?.status || '').toLowerCase();
+function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
+  const status = normalizeTaskStatus(task?.status);
   const logs = Array.isArray(taskLogs) ? taskLogs : [];
-  const now = Date.now();
-  const startMs = parseTaskTimestamp(task?.started_at || task?.scheduled_at || task?.created_at);
-  const elapsedText = startMs ? formatElapsedSeconds((now - startMs) / 1000) : '';
+  const elapsedText = elapsedTextOverride || '';
 
   if (!task) {
     return {
@@ -686,17 +810,19 @@ function getTaskProgressInfo(task, taskLogs) {
     };
   }
 
-  if (status === 'failed') {
+  if (status === 'failed' || status === 'error' || status === 'timeout') {
     return {
       percent: 100,
       label: '任务运行失败',
-      detail: '请查看下方运行日志中的 STDERR、ERROR 或 Traceback 信息',
+      detail: elapsedText
+        ? `总耗时：${elapsedText}；请查看下方运行日志中的 STDERR、ERROR 或 Traceback 信息`
+        : '请查看下方运行日志中的 STDERR、ERROR 或 Traceback 信息',
       mode: 'failed',
       color: '#d64545',
     };
   }
 
-  if (status === 'cancelled') {
+  if (status === 'cancelled' || status === 'canceled' || status === 'stopped') {
     return {
       percent: 100,
       label: '任务已取消',
@@ -772,9 +898,28 @@ function getTaskProgressInfo(task, taskLogs) {
     color: '#2d7cf6',
   };
 }
+function mergeTaskForWindow(previousTask, nextTask) {
+  return stampTaskTiming(previousTask, nextTask);
+}
+
 
 function TaskProgressPanel({ task, taskLogs }) {
-  const progress = getTaskProgressInfo(task, taskLogs);
+  const status = normalizeTaskStatus(task?.status);
+  const running = shouldTaskTimerRun(status);
+  const [nowMs, setNowMs] = useState(Date.now());
+
+  useEffect(() => {
+    if (!running) return undefined;
+
+    const timer = setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [running, getTaskCacheKey(task)]);
+
+  const elapsedText = getTaskElapsedText(task, nowMs);
+  const progress = getTaskProgressInfo(task, taskLogs, elapsedText);
   const isIndeterminate = progress.percent == null;
   const percent = isIndeterminate ? 45 : Math.max(0, Math.min(100, progress.percent));
 
@@ -2068,7 +2213,7 @@ useEffect(() => {
 
                     return {
                       ...x,
-                      task: detail,
+                      task: mergeTaskForWindow(x.task, detail),
                       minimized: false,
                       left,
                       top,
@@ -2080,14 +2225,14 @@ useEffect(() => {
                     zRef.current += 1;
                     return {
                       ...x,
-                      task: detail,
+                      task: mergeTaskForWindow(x.task, detail),
                       zIndex: zRef.current,
                     };
                   }
 
                   return {
                     ...x,
-                    task: detail,
+                    task: mergeTaskForWindow(x.task, detail),
                   };
                 })
               );
@@ -2554,6 +2699,7 @@ function getCenteredTaskWindowPosition(offset = 0) {
   };
 }
 function addTaskWindow(task, title) {
+  const timedTask = stampTaskTiming(null, task);
   zRef.current += 1;
   setWindows((prev) => {
     const offset = (prev.length % 4) * 24;
@@ -2568,7 +2714,7 @@ function addTaskWindow(task, title) {
       {
         id: `w_${task.id}`,
         taskId: task.id,
-        task,
+        task: timedTask,
         title,
         minimized: false,
         left,
@@ -2593,6 +2739,18 @@ function addTaskWindow(task, title) {
     if (!target) return;
     try {
       await cancelTask(target.taskId);
+
+      try {
+        const detail = await getTask(target.taskId);
+        setWindows((prev) =>
+          prev.map((x) =>
+            x.id === id
+              ? { ...x, task: mergeTaskForWindow(x.task, detail), zIndex: ++zRef.current }
+              : x
+          )
+        );
+      } catch {}
+
       await refreshTasks();
     } catch (e) {
       alert(e?.message || '停止任务失败');
