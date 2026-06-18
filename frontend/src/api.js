@@ -538,3 +538,72 @@ export async function uploadPythonModuleConfig(path) {
     body: JSON.stringify({ path }),
   });
 }
+
+// =========================
+// Dask 分布式集群
+// =========================
+export async function getDistributedStatus() {
+  return request('/api/distributed/status');
+}
+
+export async function installDaskRuntime(payload = {}) {
+  return request('/api/distributed/install', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function openDaskFirewall(payload = {}) {
+  return request('/api/distributed/firewall', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function startDaskHead(payload) {
+  return request('/api/distributed/start-head', {
+    method: 'POST',
+    body: JSON.stringify(payload || {}),
+  });
+}
+
+export async function joinDaskCluster(payload) {
+  return request('/api/distributed/join', {
+    method: 'POST',
+    body: JSON.stringify(payload || {}),
+  });
+}
+
+export async function leaveDaskCluster() {
+  return request('/api/distributed/leave', {
+    method: 'POST',
+  });
+}
+
+export async function stopDaskCluster() {
+  return request('/api/distributed/stop', {
+    method: 'POST',
+  });
+}
+
+export async function setDistributedExecutionMode(mode, sharedRuntimeRoot = '') {
+  return request('/api/distributed/execution-mode', {
+    method: 'POST',
+    body: JSON.stringify({
+      mode,
+      shared_runtime_root: sharedRuntimeRoot || '',
+    }),
+  });
+}
+
+export async function testDaskSharedPath(path) {
+  return request('/api/distributed/test-shared-path', {
+    method: 'POST',
+    body: JSON.stringify({ path: path || '' }),
+  });
+}
+
+export async function getDaskLogs() {
+  return request('/api/distributed/logs');
+}
+

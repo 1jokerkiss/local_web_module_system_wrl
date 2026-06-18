@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .dask_job_runner import execute_subprocess_job
+
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -85,6 +87,11 @@ class TaskManager:
         self.child_start_gate_locks: Dict[str, threading.Lock] = {}
         self._last_pressure_log_at: Dict[str, float] = {}
 
+        # 可选 Dask 分布式执行后端。未启用时完全保持原本机 subprocess 行为。
+        self.cluster_manager = None
+        self.dask_futures: Dict[str, Any] = {}
+        self.dask_cancel_files: Dict[str, str] = {}
+
         # 性能优化：日志高频输出时，不再每一行都把完整 tasks.json 写回磁盘。
         # 前端读取任务时仍然直接读内存中的 logs；这里只是把持久化写盘做成短时间合并。
         self.task_save_debounce_seconds = float(os.environ.get("LOCAL_WEB_TASK_SAVE_DEBOUNCE_SECONDS", "0.8"))
@@ -99,6 +106,456 @@ class TaskManager:
             daemon=True,
         )
         self._scheduler_heartbeat_thread.start()
+    def set_cluster_manager(self, cluster_manager):
+        """注入 DaskClusterManager，避免 TaskManager 直接依赖 FastAPI 层。"""
+        self.cluster_manager = cluster_manager
+
+    def _distributed_execution_enabled(self) -> bool:
+        manager = self.cluster_manager
+        if manager is None:
+            return False
+        try:
+            return bool(manager.distributed_execution_enabled())
+        except Exception:
+            return False
+
+    def _distributed_parent_slots(self, local_slots: int) -> int:
+        # Dask 任务本机只运行一个协调线程，不应占用 local_slots 个本机进程槽。
+        return 1 if self._distributed_execution_enabled() else max(1, int(local_slots or 1))
+
+    def _prepare_dask_payload(self, spec: Dict[str, Any], job_id: str) -> Dict[str, Any]:
+        command = [str(x) for x in (spec.get("command") or [])]
+        config_text = None
+        config_arg_index = None
+
+        # 平台生成的 config.json 很小，可随 Dask 任务发送并在 Worker 本地重建。
+        # 大型 NC/HDF/TIF 不在这里传输，仍通过共享路径读取。
+        for index in range(len(command) - 1, -1, -1):
+            arg = command[index]
+            if not str(arg).lower().endswith(".json"):
+                continue
+            try:
+                path = Path(arg)
+                if path.is_file() and path.stat().st_size <= 10 * 1024 * 1024:
+                    config_text = path.read_text(encoding="utf-8")
+                    config_arg_index = index
+                    break
+            except Exception:
+                continue
+
+        cancel_file = ""
+        manager = self.cluster_manager
+        if manager is not None:
+            try:
+                shared_root = str(manager.get_shared_runtime_root() or "").strip()
+                if shared_root:
+                    cancel_dir = Path(shared_root) / "cancel"
+                    cancel_dir.mkdir(parents=True, exist_ok=True)
+                    cancel_path = cancel_dir / f"{job_id}.cancel"
+                    if cancel_path.exists():
+                        cancel_path.unlink()
+                    cancel_file = str(cancel_path)
+                    with self.lock:
+                        self.dask_cancel_files[job_id] = cancel_file
+            except Exception:
+                cancel_file = ""
+
+        return {
+            "job_id": job_id,
+            "command": command,
+            "working_dir": spec.get("working_dir"),
+            "env": spec.get("env") or {},
+            "config_text": config_text,
+            "config_arg_index": config_arg_index,
+            "cancel_file": cancel_file,
+            "max_output_chars": 2_000_000,
+        }
+
+    def _append_dask_output(self, task_id: str, prefix: str, text: str, max_lines: int = 500):
+        if not text:
+            return
+        lines = str(text).splitlines()
+        if len(lines) > max_lines:
+            lines = lines[-max_lines:]
+            self.append_log(task_id, f"[{prefix}] 输出过长，仅保留最后 {max_lines} 行")
+        for line in lines:
+            self.append_log(task_id, f"[{prefix}] {line}")
+
+    def _apply_dask_result(self, task_id: str, result: Dict[str, Any]) -> str:
+        result = result or {}
+        self._append_dask_output(task_id, "STDOUT", str(result.get("stdout") or ""))
+        self._append_dask_output(task_id, "STDERR", str(result.get("stderr") or ""))
+
+        return_code = int(result.get("return_code", -1))
+        if bool(result.get("cancelled")) or return_code == -2:
+            status = "cancelled"
+        else:
+            status = "success" if return_code == 0 else "failed"
+        remote_name = str(result.get("hostname") or result.get("ip") or "unknown")
+        self.append_log(
+            task_id,
+            f"[DASK] 远程节点={remote_name}，PID={result.get('pid') or '-'}，"
+            f"return_code={return_code}，耗时={result.get('duration_seconds') or '-'}s",
+        )
+        self.update_task(
+            task_id,
+            status=status,
+            return_code=return_code,
+            pid=result.get("pid"),
+            started_at=result.get("started_at") or now_iso(),
+            ended_at=result.get("ended_at") or now_iso(),
+            remote_node=remote_name,
+            remote_ip=result.get("ip") or "",
+            execution_backend="dask",
+        )
+        cancel_file = self.dask_cancel_files.pop(task_id, "")
+        if cancel_file:
+            try:
+                Path(cancel_file).unlink(missing_ok=True)
+            except Exception:
+                pass
+        return status
+
+    def _signal_dask_cancel(self, task_id: str):
+        cancel_file = str(self.dask_cancel_files.get(task_id) or "").strip()
+        if not cancel_file:
+            return
+        try:
+            path = Path(cancel_file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("cancel", encoding="utf-8")
+        except Exception:
+            pass
+
+    def _run_dask_single_task(
+        self,
+        task_id: str,
+        command: List[str],
+        working_dir: str | None,
+        env: Dict[str, str] | None,
+    ):
+        manager = self.cluster_manager
+        if manager is None:
+            self._run_process_task(task_id, command, working_dir, env)
+            return
+
+        self.update_task(
+            task_id,
+            status="running",
+            started_at=now_iso(),
+            execution_backend="dask",
+        )
+        self.append_log(task_id, "[DASK] 单任务已提交到 Dask 集群")
+        spec = {
+            "command": command,
+            "working_dir": working_dir,
+            "env": env or {},
+        }
+
+        try:
+            client = manager.get_client()
+            info = client.scheduler_info(n_workers=-1)
+            if not (info.get("workers") or {}):
+                raise RuntimeError("Dask 集群没有可用 Worker")
+
+            payload = self._prepare_dask_payload(spec, task_id)
+            future = client.submit(
+                execute_subprocess_job,
+                payload,
+                pure=False,
+                key=f"local-web-{task_id}-{uuid.uuid4().hex[:8]}",
+            )
+            with self.lock:
+                self.dask_futures[task_id] = future
+
+            while not future.done():
+                if task_id in self.cancel_flags:
+                    self._signal_dask_cancel(task_id)
+                    try:
+                        future.cancel()
+                    except Exception:
+                        pass
+                    self.update_task(task_id, status="cancelled", ended_at=now_iso(), return_code=-1)
+                    return
+                time.sleep(0.5)
+
+            result = future.result()
+            self._apply_dask_result(task_id, result)
+
+        except Exception as exc:
+            self.append_log(task_id, f"[DASK-ERROR] {type(exc).__name__}: {exc}")
+            self.append_log(task_id, traceback.format_exc())
+            self.update_task(
+                task_id,
+                status="failed",
+                return_code=-1,
+                ended_at=now_iso(),
+                execution_backend="dask",
+            )
+        finally:
+            with self.lock:
+                self.dask_futures.pop(task_id, None)
+            cancel_file = self.dask_cancel_files.pop(task_id, "")
+            if cancel_file:
+                try:
+                    Path(cancel_file).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            self.cancel_flags.discard(task_id)
+
+    def _run_dask_job_group(
+        self,
+        parent_id: str,
+        entries: List[Dict[str, Any]],
+        max_workers: int,
+        group_name: str,
+    ):
+        total = len(entries)
+        max_workers = max(1, min(int(max_workers or 1), max(1, total)))
+        manager = self.cluster_manager
+        if manager is None:
+            raise RuntimeError("DaskClusterManager 未初始化")
+
+        self.update_task(
+            parent_id,
+            status="running",
+            started_at=now_iso(),
+            parallel_total=total,
+            parallel_done=0,
+            parallel_failed=0,
+            max_workers=max_workers,
+            execution_backend="dask",
+        )
+        self.append_log(
+            parent_id,
+            f"[DASK] {group_name}启动：总任务数={total}，最多同时提交={max_workers}",
+        )
+        self.append_log(
+            parent_id,
+            "[DASK] 大型输入数据不会通过调度器传输；所有节点必须能访问 config.json 中的输入/输出路径。",
+        )
+
+        client = manager.get_client()
+        scheduler_info = client.scheduler_info(n_workers=-1)
+        worker_count = len(scheduler_info.get("workers") or {})
+        if worker_count <= 0:
+            raise RuntimeError("Dask 集群没有可用 Worker")
+        self.append_log(parent_id, f"[DASK] 当前可用 Worker={worker_count}")
+
+        next_index = 0
+        done_count = 0
+        failures = 0
+        running: Dict[Any, Dict[str, Any]] = {}
+
+        try:
+            while (next_index < total or running) and parent_id not in self.cancel_flags:
+                while (
+                    next_index < total
+                    and len(running) < max_workers
+                    and parent_id not in self.cancel_flags
+                ):
+                    entry = entries[next_index]
+                    spec = entry["spec"]
+                    child_id = entry.get("child_id")
+                    label = str(spec.get("label") or f"子任务 {next_index + 1}")
+
+                    if not child_id:
+                        parent_task = self.get_task(parent_id) or {}
+                        child = self.create_task(
+                            module_id=spec.get("module_id", ""),
+                            module_name=spec.get("module_name", label),
+                            command=spec.get("command") or [],
+                            inputs=spec.get("inputs") or {},
+                            kind="module",
+                            extra={
+                                "parent_id": parent_id,
+                                "job_index": next_index + 1,
+                                "owner_username": str(parent_task.get("owner_username") or ""),
+                                "execution_backend": "dask",
+                            },
+                        )
+                        child_id = child["id"]
+                        with self.lock:
+                            parent = self.tasks.get(parent_id)
+                            if parent:
+                                parent.setdefault("children", []).append(child_id)
+                    else:
+                        self.update_task(
+                            child_id,
+                            status="running",
+                            started_at=now_iso(),
+                            execution_backend="dask",
+                        )
+
+                    payload = self._prepare_dask_payload(spec, child_id)
+                    future = client.submit(
+                        execute_subprocess_job,
+                        payload,
+                        pure=False,
+                        key=f"local-web-{child_id}-{uuid.uuid4().hex[:8]}",
+                    )
+                    with self.lock:
+                        self.dask_futures[child_id] = future
+
+                    running[future] = {
+                        "child_id": child_id,
+                        "label": label,
+                        "index": next_index,
+                    }
+                    self.append_log(
+                        parent_id,
+                        f"[DASK] 已提交 {next_index + 1}/{total}: {label}；"
+                        f"当前在途 {len(running)}/{max_workers}",
+                    )
+                    next_index += 1
+
+                if not running:
+                    break
+
+                completed = [future for future in running if future.done()]
+                if not completed:
+                    time.sleep(0.5)
+                    continue
+
+                for future in completed:
+                    meta = running.pop(future)
+                    child_id = meta["child_id"]
+                    label = meta["label"]
+                    try:
+                        result = future.result()
+                        status = self._apply_dask_result(child_id, result)
+                    except Exception as exc:
+                        status = "failed"
+                        self.append_log(child_id, f"[DASK-ERROR] {type(exc).__name__}: {exc}")
+                        self.append_log(child_id, traceback.format_exc())
+                        self.update_task(
+                            child_id,
+                            status="failed",
+                            return_code=-1,
+                            ended_at=now_iso(),
+                            execution_backend="dask",
+                        )
+                    finally:
+                        with self.lock:
+                            self.dask_futures.pop(child_id, None)
+                        cancel_file = self.dask_cancel_files.pop(child_id, "")
+                        if cancel_file:
+                            try:
+                                Path(cancel_file).unlink(missing_ok=True)
+                            except Exception:
+                                pass
+
+                    if status != "success":
+                        failures += 1
+                        self._append_child_failure_to_parent(parent_id, child_id, label)
+
+                    done_count += 1
+                    self.update_task(
+                        parent_id,
+                        parallel_done=done_count,
+                        parallel_failed=failures,
+                    )
+                    self.append_log(
+                        parent_id,
+                        f"[DASK] 完成 {done_count}/{total}: {label}，状态={status}",
+                    )
+
+            if parent_id in self.cancel_flags:
+                for future, meta in list(running.items()):
+                    child_id = meta["child_id"]
+                    self._signal_dask_cancel(child_id)
+                    try:
+                        future.cancel()
+                    except Exception:
+                        pass
+                    self.update_task(child_id, status="cancelled", ended_at=now_iso(), return_code=-1)
+                    with self.lock:
+                        self.dask_futures.pop(child_id, None)
+
+            parent = self.get_task(parent_id) or {}
+            children = parent.get("children") or []
+            child_statuses = [(self.get_task(cid) or {}).get("status") for cid in children]
+
+            if parent_id in self.cancel_flags or any(s == "cancelled" for s in child_statuses):
+                final_status = "cancelled"
+                return_code = -1
+            elif failures > 0 or done_count < total or any(s != "success" for s in child_statuses):
+                final_status = "failed"
+                return_code = 1
+            else:
+                final_status = "success"
+                return_code = 0
+
+            self.update_task(
+                parent_id,
+                status=final_status,
+                return_code=return_code,
+                ended_at=now_iso(),
+                parallel_done=done_count,
+                parallel_failed=sum(1 for s in child_statuses if s != "success"),
+                execution_backend="dask",
+            )
+            self.append_log(parent_id, f"[DASK] {group_name}结束，状态={final_status}")
+            self._cleanup_runtime_roots_for_task(
+                parent_id,
+                reason=f"Dask {group_name}结束，状态={final_status}",
+            )
+
+        finally:
+            self.cancel_flags.discard(parent_id)
+
+    def _mark_dask_parent_failed(self, parent_id: str, exc: Exception, group_name: str):
+        self.append_log(parent_id, f"[DASK-ERROR] {type(exc).__name__}: {exc}")
+        self.append_log(parent_id, traceback.format_exc())
+        self.update_task(
+            parent_id,
+            status="failed",
+            return_code=-1,
+            ended_at=now_iso(),
+            execution_backend="dask",
+        )
+        self._cleanup_runtime_roots_for_task(
+            parent_id,
+            reason=f"Dask {group_name}异常结束",
+        )
+
+    def _run_parallel_task_dask(
+        self,
+        parent_id: str,
+        jobs: List[Dict[str, Any]],
+        max_workers: int,
+    ):
+        entries = [{"child_id": None, "spec": job} for job in jobs]
+        try:
+            return self._run_dask_job_group(
+                parent_id,
+                entries,
+                max_workers,
+                group_name="并行任务",
+            )
+        except Exception as exc:
+            self._mark_dask_parent_failed(parent_id, exc, "并行任务")
+
+    def _run_batch_group_dask(
+        self,
+        parent_id: str,
+        child_job_map: Dict[str, Dict[str, Any]],
+        max_parallel: int,
+    ):
+        entries = [
+            {"child_id": child_id, "spec": job}
+            for child_id, job in child_job_map.items()
+        ]
+        try:
+            return self._run_dask_job_group(
+                parent_id,
+                entries,
+                max_parallel,
+                group_name="批处理",
+            )
+        except Exception as exc:
+            self._mark_dask_parent_failed(parent_id, exc, "批处理")
+
     def kick_scheduler(self):
         """
         外部主动唤醒调度器。
@@ -141,11 +598,7 @@ class TaskManager:
             except Exception:
                 pass
     def _normalize_cleanup_roots(self, roots: Any) -> list[Path]:
-        """规范化需要清理的 runtime 子目录。
-
-        安全限制：只允许删除 backend/runtime/parallel_chunks 内部目录，
-        防止误删用户输入数据、输出目录或模块安装目录。
-        """
+        """规范化并限制可清理的临时任务目录。"""
         if not roots:
             return []
 
@@ -156,23 +609,41 @@ class TaskManager:
         else:
             return []
 
+        allowed_roots: list[Path] = []
         try:
-            allowed_root = self.parallel_chunks_dir.resolve()
+            allowed_roots.append(self.parallel_chunks_dir.resolve())
         except Exception:
+            pass
+
+        manager = self.cluster_manager
+        if manager is not None:
+            try:
+                shared = str(manager.get_shared_runtime_root() or "").strip()
+                if shared:
+                    allowed_roots.append((Path(shared) / "parallel_chunks").resolve())
+            except Exception:
+                pass
+
+        if not allowed_roots:
             return []
 
         result: list[Path] = []
         seen: set[str] = set()
-
         for item in items:
             try:
                 p = Path(str(item)).resolve()
             except Exception:
                 continue
 
-            try:
-                p.relative_to(allowed_root)
-            except ValueError:
+            allowed = False
+            for allowed_root in allowed_roots:
+                try:
+                    p.relative_to(allowed_root)
+                    allowed = True
+                    break
+                except ValueError:
+                    continue
+            if not allowed:
                 continue
 
             key = str(p).lower()
@@ -181,6 +652,7 @@ class TaskManager:
                 result.append(p)
 
         return result
+
 
     def _cleanup_runtime_roots(self, task_id: str, roots: Any, reason: str = "任务结束"):
         """清理平台拆分产生的 runtime/parallel_chunks 临时输入目录。"""
@@ -662,6 +1134,7 @@ class TaskManager:
             "disk_percent": disk_snapshot.get("percent"),
             "disk_free_gb": disk_snapshot.get("free_gb"),
             "active_tasks": active_tasks,
+            "execution_backend": "dask" if self._distributed_execution_enabled() else "local",
         }
 
     def _can_start_queued_item_locked(self, item: Dict[str, Any]) -> tuple[bool, str]:
@@ -993,9 +1466,10 @@ class TaskManager:
 
         self._append_parallel_adjustment_log(task["id"], inputs)
         # 单个模块进程只占 1 个真实启动槽；parallel_workers 只写入配置，不作为父任务排队条件。
+        runner = self._run_dask_single_task if self._distributed_execution_enabled() else self._run_process_task
         self._enqueue_task_runner(
             task["id"],
-            self._run_process_task,
+            runner,
             (task["id"], command, working_dir, env),
             requested_slots=1,
         )
@@ -1062,7 +1536,7 @@ class TaskManager:
             parent["id"],
             self._run_parallel_task,
             (parent["id"], jobs, effective_workers),
-            requested_slots=effective_workers,
+            requested_slots=self._distributed_parent_slots(effective_workers),
         )
         return self.get_task(parent["id"]) or parent
 
@@ -1150,7 +1624,7 @@ class TaskManager:
             parent["id"],
             self._run_batch_group,
             (parent["id"], child_job_map, effective_parallel),
-            requested_slots=effective_parallel,
+            requested_slots=self._distributed_parent_slots(effective_parallel),
         )
         return self.get_task(parent["id"]) or parent
 
@@ -1160,6 +1634,9 @@ class TaskManager:
         child_job_map: Dict[str, Dict[str, Any]],
         max_parallel: int,
     ):
+        if self._distributed_execution_enabled():
+            return self._run_batch_group_dask(parent_id, child_job_map, max_parallel)
+
         total = len(child_job_map)
         max_parallel = max(1, int(max_parallel or 1))
         self.update_task(
@@ -1537,6 +2014,9 @@ class TaskManager:
             self._save_tasks()
 
     def _run_parallel_task(self, parent_id: str, jobs: List[Dict[str, Any]], max_workers: int):
+        if self._distributed_execution_enabled():
+            return self._run_parallel_task_dask(parent_id, jobs, max_workers)
+
         total = len(jobs)
         max_workers = max(1, min(int(max_workers or 1), max(1, total)))
 
@@ -1771,6 +2251,14 @@ class TaskManager:
             self.cancel_flags.add(task_id)
             any_stopped = False
             for child_id in task.get("children") or []:
+                dask_future = self.dask_futures.get(child_id)
+                if dask_future is not None:
+                    self._signal_dask_cancel(child_id)
+                    try:
+                        dask_future.cancel()
+                        any_stopped = True
+                    except Exception:
+                        pass
                 process = self.processes.get(child_id)
                 if process is not None:
                     try:
@@ -1794,6 +2282,24 @@ class TaskManager:
             self._save_tasks()
             self._cleanup_runtime_roots_for_task(task_id, reason="并行任务取消")
             return True or any_stopped
+
+        dask_future = self.dask_futures.get(task_id)
+        if dask_future is not None:
+            self._signal_dask_cancel(task_id)
+            try:
+                dask_future.cancel()
+            except Exception:
+                pass
+            with self.lock:
+                task = self.tasks.get(task_id)
+                if task:
+                    task["status"] = "cancelled"
+                    task["ended_at"] = now_iso()
+                    task["return_code"] = -1
+                    task.setdefault("logs", []).append("[SYSTEM] Dask 任务已请求取消")
+                self.dask_futures.pop(task_id, None)
+            self._save_tasks()
+            return True
 
         process = self.processes.get(task_id)
         if process is None:

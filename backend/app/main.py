@@ -21,24 +21,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 import stat
 import time
-from .auth import (
-    admin_reset_password,
-    create_token,
-    create_user,
-    delete_user,
-    get_current_user,
-    get_security_question,
-    load_users,
-    register_user,
-    remove_token,
-    require_admin,
-    reset_password_by_security_answer,
-    sanitize_user,
-    update_user_enabled,
-    update_user_role,
-    verify_user,
-)
+from .auth import (admin_reset_password,create_token,create_user,delete_user,get_current_user,get_security_question,load_users,register_user,remove_token,require_admin,reset_password_by_security_answer,sanitize_user,update_user_enabled,update_user_role,verify_user,)
 from .task_manager import TaskManager
+from .dask_cluster_manager import DaskClusterError, DaskClusterManager
 
 
 def now_iso() -> str:
@@ -59,18 +44,9 @@ INSTALLED_MODULES_DIR.mkdir(parents=True, exist_ok=True)
 PYTHON_WHEELS_DIR = BASE_DIR / "python_wheels"
 PYTHON_WHEELS_DIR.mkdir(parents=True, exist_ok=True)
 
-STRICT_LOCAL_BINARY_PACKAGES = {
-    "gdal",
-    "rasterio",
-    "pyproj",
-    "cartopy",
-}
+STRICT_LOCAL_BINARY_PACKAGES = {"gdal","rasterio","pyproj","cartopy",}
 
-PREFER_LOCAL_BINARY_PACKAGES = {
-    "numpy",
-    "h5py",
-    "netcdf4",
-}
+PREFER_LOCAL_BINARY_PACKAGES = {"numpy","h5py","netcdf4",}
 # Python 源码模块的独立运行环境目录。
 # 方案二：不再把 Python 源码打包成 exe，而是为每个 Python 模块创建独立 venv，
 # 运行时使用该 venv 的 python.exe 执行入口脚本，并传入平台生成的 config.json。
@@ -96,7 +72,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+dask_cluster_manager = DaskClusterManager(BASE_DIR, project_root=PROJECT_ROOT)
 task_manager = TaskManager(TASKS_FILE)
+task_manager.set_cluster_manager(dask_cluster_manager)
 
 
 @app.get("/api/system/resources")
@@ -139,7 +117,6 @@ class AddUserRequest(BaseModel):
 
 class UpdateUserRoleRequest(BaseModel):
     role: str
-
 
 class UpdateUserEnabledRequest(BaseModel):
     enabled: bool
@@ -213,24 +190,198 @@ class PythonFolderModuleUploadRequest(BaseModel):
 
 class PythonModuleConfigRequest(BaseModel):
     path: str
+
+
+class DaskInstallRequest(BaseModel):
+    package_spec: str = ""
+    upgrade: bool = False
+
+
+class DaskStartHeadRequest(BaseModel):
+    bind_ip: str = ""
+    scheduler_port: int = 8786
+    dashboard_port: int = 8787
+    api_port: int = 8000
+    worker_name: str = ""
+    nworkers: int = 1
+    nthreads: int = 1
+    memory_limit: str = "auto"
+    shared_runtime_root: str = ""
+    auto_install: bool = True
+
+
+class DaskJoinRequest(BaseModel):
+    head_ip: str
+    api_port: int = 8000
+    join_token: str
+    worker_name: str = ""
+    nworkers: int = 1
+    nthreads: int = 1
+    memory_limit: str = "auto"
+    auto_install: bool = True
+
+
+class DaskExecutionModeRequest(BaseModel):
+    mode: str = "local"
+    shared_runtime_root: str = ""
+
+
+class DaskFirewallRequest(BaseModel):
+    api_port: int = 8000
+    scheduler_port: int = 8786
+    dashboard_port: int = 8787
+
+
+class DaskSharedPathRequest(BaseModel):
+    path: str = ""
+
+
+# =========================
+# Dask 分布式集群管理 API
+# =========================
+@app.get("/api/distributed/status")
+def api_distributed_status(authorization: str | None = Header(default=None)):
+    user = get_current_user(authorization)
+    status = dask_cluster_manager.status()
+    if user.role != "admin":
+        status["join_token"] = ""
+    return status
+
+
+@app.post("/api/distributed/install")
+def api_distributed_install(
+    payload: DaskInstallRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return dask_cluster_manager.install(
+            package_spec=payload.package_spec,
+            upgrade=payload.upgrade,
+        )
+    except DaskClusterError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/distributed/firewall")
+def api_distributed_firewall(
+    payload: DaskFirewallRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    return dask_cluster_manager.open_firewall(
+        api_port=payload.api_port,
+        scheduler_port=payload.scheduler_port,
+        dashboard_port=payload.dashboard_port,
+    )
+
+
+@app.post("/api/distributed/start-head")
+def api_distributed_start_head(
+    payload: DaskStartHeadRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return dask_cluster_manager.start_head(
+            bind_ip=payload.bind_ip,
+            scheduler_port=payload.scheduler_port,
+            dashboard_port=payload.dashboard_port,
+            api_port=payload.api_port,
+            worker_name=payload.worker_name,
+            nworkers=payload.nworkers,
+            nthreads=payload.nthreads,
+            memory_limit=payload.memory_limit,
+            shared_runtime_root=payload.shared_runtime_root,
+            auto_install=payload.auto_install,
+        )
+    except DaskClusterError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/distributed/join-info")
+def api_distributed_join_info(token: str):
+    # 此接口供子节点后端执行加入握手；使用独立高强度随机令牌验证，
+    # 不复用浏览器登录 token。
+    try:
+        return dask_cluster_manager.get_join_info(token)
+    except DaskClusterError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+
+@app.post("/api/distributed/join")
+def api_distributed_join(
+    payload: DaskJoinRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return dask_cluster_manager.join_cluster(
+            head_ip=payload.head_ip,
+            api_port=payload.api_port,
+            join_token=payload.join_token,
+            worker_name=payload.worker_name,
+            nworkers=payload.nworkers,
+            nthreads=payload.nthreads,
+            memory_limit=payload.memory_limit,
+            auto_install=payload.auto_install,
+        )
+    except DaskClusterError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/distributed/leave")
+def api_distributed_leave(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    return dask_cluster_manager.leave_cluster()
+
+
+@app.post("/api/distributed/stop")
+def api_distributed_stop(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    return dask_cluster_manager.stop_cluster()
+
+
+@app.post("/api/distributed/execution-mode")
+def api_distributed_execution_mode(
+    payload: DaskExecutionModeRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return dask_cluster_manager.set_execution_mode(
+            payload.mode,
+            payload.shared_runtime_root,
+        )
+    except DaskClusterError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/distributed/test-shared-path")
+def api_distributed_test_shared_path(
+    payload: DaskSharedPathRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return dask_cluster_manager.test_shared_path(payload.path)
+    except DaskClusterError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/distributed/logs")
+def api_distributed_logs(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    return dask_cluster_manager.tail_logs()
+
+
 # 通用辅助函数
-VALID_PARALLEL_MODES = {
-    "none",
-    "auto",
-    "single_file",
-    "folder_chunks",
-    "module_internal",
-    "batch_group",
-}
+VALID_PARALLEL_MODES = {"none","auto","single_file","folder_chunks","module_internal","batch_group",}
 DEFAULT_PARALLEL_PATTERNS = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
 
 # 初始默认工具栏。现在云反演 / 气溶胶反演也按普通动态工具栏处理，
 # 只在第一次创建 toolbars.json 时写入；之后不会强制重新合并回来。
-DEFAULT_TOOLBARS = [
-    {"key": "cloud", "label": "云反演", "system": False},
-    {"key": "aerosol", "label": "气溶胶反演", "system": False},
-]
-
+DEFAULT_TOOLBARS = [{"key": "cloud", "label": "云反演", "system": False},{"key": "aerosol", "label": "气溶胶反演", "system": False},]
 
 CHINESE_PATH_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 PATH_LIKE_KEY_PATTERN = re.compile(
@@ -5596,7 +5747,24 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
             for i in range(0, len(files), files_per_job):
                 job_units.append(files[i:i + files_per_job])
 
-        chunk_root = RUNTIME_DIR / "parallel_chunks" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        if dask_cluster_manager.distributed_execution_enabled():
+            shared_runtime_root = dask_cluster_manager.get_shared_runtime_root()
+            if not shared_runtime_root:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "分布式 folder_chunks 模式需要所有节点可访问的共享运行目录。"
+                        "请先在“分布式”页面填写 UNC 路径并检测，例如 "
+                        r"\\192.168.2.100\local_web_runtime"
+                    ),
+                )
+            chunk_root = (
+                Path(shared_runtime_root)
+                / "parallel_chunks"
+                / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            )
+        else:
+            chunk_root = RUNTIME_DIR / "parallel_chunks" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         chunk_root.mkdir(parents=True, exist_ok=True)
 
         for idx, chunk in enumerate(job_units, start=1):
