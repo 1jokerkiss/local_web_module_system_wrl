@@ -1,0 +1,22 @@
+{
+  "role": "head",
+  "execution_mode": "local",
+  "cluster_id": "9ecdf016d882",
+  "join_token": "yefYCEXiMO_mTAuOhppaUzBqCqrHtloz",
+  "scheduler_address": "tcp://192.168.2.138:8786",
+  "head_api_url": "http://192.168.2.138:8000",
+  "scheduler_port": 8786,
+  "dashboard_port": 8787,
+  "api_port": 8000,
+  "scheduler_pid": 20316,
+  "worker_pid": 27004,
+  "worker_name": "LAPTOP-40D4C67U-head",
+  "nworkers": 1,
+  "nthreads": 1,
+  "memory_limit": "auto",
+  "shared_runtime_root": "",
+  "package_spec": "dask[distributed]==2024.7.1",
+  "created_at": "2026-06-18T16:56:14",
+  "joined_at": "2026-06-18T16:56:14",
+  "last_error": ""
+}

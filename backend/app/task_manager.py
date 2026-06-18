@@ -12,7 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COM
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from .tif_tiles import merge_tif_tiles
+
+from .dask_job_runner import execute_subprocess_job
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -24,7 +25,7 @@ class TaskManager:
         self.tasks_file = Path(tasks_file)
         self.tasks_file.parent.mkdir(parents=True, exist_ok=True)
         self.base_dir = self.tasks_file.parent.parent
-        self.runtime_dir = Path(os.environ.get("LOCAL_WEB_RUNTIME_DIR") or (self.base_dir / "runtime")).resolve()
+        self.runtime_dir = self.base_dir / "runtime"
         self.parallel_chunks_dir = self.runtime_dir / "parallel_chunks"
         self.parallel_chunks_dir.mkdir(parents=True, exist_ok=True)
 
@@ -32,19 +33,6 @@ class TaskManager:
         self.tasks: Dict[str, Dict[str, Any]] = {}
         self.processes: Dict[str, subprocess.Popen] = {}
         self.cancel_flags: set[str] = set()
-
-        # CPU 亲和性：把每个 exe 绑定到固定 CPU 核组，避免多个 exe 自由抢占全部 CPU。
-        # 默认启用；如需关闭：set LOCAL_WEB_CPU_AFFINITY=0
-        self.affinity_lock = threading.RLock()
-        self.task_cpu_affinity: Dict[str, List[int]] = {}
-        self.cpu_affinity_enabled = self._env_bool("LOCAL_WEB_CPU_AFFINITY", True)
-        self.cpu_affinity_reserved_cores = max(0, int(os.environ.get("LOCAL_WEB_RESERVED_CORES", "2") or 2))
-        self.cpu_affinity_cores_per_process = max(1, int(os.environ.get("LOCAL_WEB_CORES_PER_PROCESS", "2") or 2))
-        self.cpu_affinity_max_groups = max(0, int(os.environ.get("LOCAL_WEB_AFFINITY_MAX_GROUPS", "0") or 0))
-        self.cpu_affinity_wait_seconds = max(0.05, float(os.environ.get("LOCAL_WEB_AFFINITY_WAIT_SECONDS", "0.2") or 0.2))
-        self.cpu_affinity_set_thread_env = self._env_bool("LOCAL_WEB_AFFINITY_SET_THREAD_ENV", True)
-        self.cpu_affinity_include_children = self._env_bool("LOCAL_WEB_AFFINITY_INCLUDE_CHILDREN", True)
-        self.cpu_affinity_core_groups: List[List[int]] = []
 
         # 运行调度器：根据本机 CPU 核数控制同时运行的模块进程数。
         # 遥感反演通常会加载大模型/大数组，CPU 核数不能直接等于安全并发。
@@ -70,14 +58,6 @@ class TaskManager:
             env_max_slots = default_max_slots
 
         self.max_process_slots = max(1, min(self.cpu_count, env_max_slots))
-
-        # 根据 CPU 亲和性配置生成核组。默认保留前 2 个逻辑核给系统/浏览器/后端，
-        # 每个 exe 分配 2 个逻辑核。核组数量会反向限制最大并行 exe 数，避免选择了
-        # 8 个进程但只剩 3 组 CPU 核可用。
-        self.cpu_affinity_core_groups = self._build_cpu_affinity_groups()
-        if self.cpu_affinity_enabled and self.cpu_affinity_core_groups:
-            self.max_process_slots = min(self.max_process_slots, len(self.cpu_affinity_core_groups))
-
         self.suggested_process_slots = max(1, min(self.max_process_slots, env_suggested_slots))
         # 顶层排队只做“临界保护”。一般负载不阻止父任务启动，避免一直 queued。
         self.cpu_busy_threshold = float(os.environ.get("LOCAL_WEB_CPU_QUEUE_THRESHOLD", "99"))
@@ -86,17 +66,13 @@ class TaskManager:
         self.drain_lock = threading.Lock()
         # 运行中保护：批处理/并行任务启动子进程前会检查 CPU、内存和磁盘压力，压力过高时暂停启动新子任务。
         # 子进程启动保护：逐个启动子任务；达到阈值时暂停启动新的子任务。
-        self.child_launch_cpu_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_CPU_THRESHOLD", "99"))
+        self.child_launch_cpu_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_CPU_THRESHOLD", "96"))
         self.child_launch_memory_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_MEMORY_THRESHOLD", "99"))
         self.child_launch_min_memory_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_MEMORY_GB", "0.3"))
         self.child_launch_disk_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_DISK_THRESHOLD", "99.5"))
         self.child_launch_min_disk_free_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_DISK_FREE_GB", "0.5"))
         self.child_launch_wait_seconds = float(os.environ.get("LOCAL_WEB_CHILD_START_WAIT_SECONDS", "2"))
         self.child_start_stagger_seconds = float(os.environ.get("LOCAL_WEB_CHILD_START_STAGGER_SECONDS", "0.5"))
-        self.fast_refill_cpu_threshold = float(os.environ.get("LOCAL_WEB_FAST_REFILL_CPU_THRESHOLD", "99.5"))
-        self.fast_refill_memory_threshold = float(os.environ.get("LOCAL_WEB_FAST_REFILL_MEMORY_THRESHOLD", "97"))
-        self.fast_refill_min_memory_gb = float(os.environ.get("LOCAL_WEB_FAST_REFILL_MIN_MEMORY_GB", "1.0"))
-        self.fast_refill_wait_seconds = float(os.environ.get("LOCAL_WEB_FAST_REFILL_WAIT_SECONDS", "0.4"))
         self.adaptive_child_start_enabled = str(os.environ.get("LOCAL_WEB_ADAPTIVE_CHILD_START", "1")).strip().lower() not in {"0", "false", "no", "off"}
         self.adaptive_child_start_min_interval = float(os.environ.get("LOCAL_WEB_ADAPTIVE_CHILD_START_MIN_SECONDS", "5"))
         self.adaptive_child_start_max_interval = float(os.environ.get("LOCAL_WEB_ADAPTIVE_CHILD_START_MAX_SECONDS", "60"))
@@ -110,18 +86,11 @@ class TaskManager:
         self.learned_child_start_intervals: Dict[str, float] = {}
         self.child_start_gate_locks: Dict[str, threading.Lock] = {}
         self._last_pressure_log_at: Dict[str, float] = {}
-        self.parallel_progress_scan_interval_seconds = float(os.environ.get("LOCAL_WEB_PARALLEL_PROGRESS_SCAN_SECONDS", "1.0"))
-        self.parallel_monitor_interval_seconds = float(os.environ.get("LOCAL_WEB_PARALLEL_MONITOR_LOG_SECONDS", "20"))
-        self.dynamic_worker_boost_enabled = str(os.environ.get("LOCAL_WEB_DYNAMIC_WORKER_BOOST", "1")).strip().lower() not in {"0", "false", "no", "off"}
-        # 启用 CPU 亲和性时，动态额外 worker 会破坏“一个 exe 一个固定核组”的稳定性，默认关闭。
-        if self.cpu_affinity_enabled:
-            self.dynamic_worker_boost_enabled = False
-        self.dynamic_worker_boost_extra = max(0, int(os.environ.get("LOCAL_WEB_DYNAMIC_WORKER_BOOST_EXTRA", "1") or 1))
-        self.dynamic_worker_boost_cpu_below = float(os.environ.get("LOCAL_WEB_DYNAMIC_WORKER_BOOST_CPU_BELOW", "55"))
-        self.dynamic_worker_boost_memory_below = float(os.environ.get("LOCAL_WEB_DYNAMIC_WORKER_BOOST_MEMORY_BELOW", "88"))
-        self.dynamic_worker_boost_min_memory_gb = float(os.environ.get("LOCAL_WEB_DYNAMIC_WORKER_BOOST_MIN_MEMORY_GB", "2.0"))
-        self._last_parallel_monitor_log_at: Dict[str, float] = {}
-        self._last_dynamic_boost_log_at: Dict[str, float] = {}
+
+        # 可选 Dask 分布式执行后端。未启用时完全保持原本机 subprocess 行为。
+        self.cluster_manager = None
+        self.dask_futures: Dict[str, Any] = {}
+        self.dask_cancel_files: Dict[str, str] = {}
 
         # 性能优化：日志高频输出时，不再每一行都把完整 tasks.json 写回磁盘。
         # 前端读取任务时仍然直接读内存中的 logs；这里只是把持久化写盘做成短时间合并。
@@ -137,6 +106,456 @@ class TaskManager:
             daemon=True,
         )
         self._scheduler_heartbeat_thread.start()
+    def set_cluster_manager(self, cluster_manager):
+        """注入 DaskClusterManager，避免 TaskManager 直接依赖 FastAPI 层。"""
+        self.cluster_manager = cluster_manager
+
+    def _distributed_execution_enabled(self) -> bool:
+        manager = self.cluster_manager
+        if manager is None:
+            return False
+        try:
+            return bool(manager.distributed_execution_enabled())
+        except Exception:
+            return False
+
+    def _distributed_parent_slots(self, local_slots: int) -> int:
+        # Dask 任务本机只运行一个协调线程，不应占用 local_slots 个本机进程槽。
+        return 1 if self._distributed_execution_enabled() else max(1, int(local_slots or 1))
+
+    def _prepare_dask_payload(self, spec: Dict[str, Any], job_id: str) -> Dict[str, Any]:
+        command = [str(x) for x in (spec.get("command") or [])]
+        config_text = None
+        config_arg_index = None
+
+        # 平台生成的 config.json 很小，可随 Dask 任务发送并在 Worker 本地重建。
+        # 大型 NC/HDF/TIF 不在这里传输，仍通过共享路径读取。
+        for index in range(len(command) - 1, -1, -1):
+            arg = command[index]
+            if not str(arg).lower().endswith(".json"):
+                continue
+            try:
+                path = Path(arg)
+                if path.is_file() and path.stat().st_size <= 10 * 1024 * 1024:
+                    config_text = path.read_text(encoding="utf-8")
+                    config_arg_index = index
+                    break
+            except Exception:
+                continue
+
+        cancel_file = ""
+        manager = self.cluster_manager
+        if manager is not None:
+            try:
+                shared_root = str(manager.get_shared_runtime_root() or "").strip()
+                if shared_root:
+                    cancel_dir = Path(shared_root) / "cancel"
+                    cancel_dir.mkdir(parents=True, exist_ok=True)
+                    cancel_path = cancel_dir / f"{job_id}.cancel"
+                    if cancel_path.exists():
+                        cancel_path.unlink()
+                    cancel_file = str(cancel_path)
+                    with self.lock:
+                        self.dask_cancel_files[job_id] = cancel_file
+            except Exception:
+                cancel_file = ""
+
+        return {
+            "job_id": job_id,
+            "command": command,
+            "working_dir": spec.get("working_dir"),
+            "env": spec.get("env") or {},
+            "config_text": config_text,
+            "config_arg_index": config_arg_index,
+            "cancel_file": cancel_file,
+            "max_output_chars": 2_000_000,
+        }
+
+    def _append_dask_output(self, task_id: str, prefix: str, text: str, max_lines: int = 500):
+        if not text:
+            return
+        lines = str(text).splitlines()
+        if len(lines) > max_lines:
+            lines = lines[-max_lines:]
+            self.append_log(task_id, f"[{prefix}] 输出过长，仅保留最后 {max_lines} 行")
+        for line in lines:
+            self.append_log(task_id, f"[{prefix}] {line}")
+
+    def _apply_dask_result(self, task_id: str, result: Dict[str, Any]) -> str:
+        result = result or {}
+        self._append_dask_output(task_id, "STDOUT", str(result.get("stdout") or ""))
+        self._append_dask_output(task_id, "STDERR", str(result.get("stderr") or ""))
+
+        return_code = int(result.get("return_code", -1))
+        if bool(result.get("cancelled")) or return_code == -2:
+            status = "cancelled"
+        else:
+            status = "success" if return_code == 0 else "failed"
+        remote_name = str(result.get("hostname") or result.get("ip") or "unknown")
+        self.append_log(
+            task_id,
+            f"[DASK] 远程节点={remote_name}，PID={result.get('pid') or '-'}，"
+            f"return_code={return_code}，耗时={result.get('duration_seconds') or '-'}s",
+        )
+        self.update_task(
+            task_id,
+            status=status,
+            return_code=return_code,
+            pid=result.get("pid"),
+            started_at=result.get("started_at") or now_iso(),
+            ended_at=result.get("ended_at") or now_iso(),
+            remote_node=remote_name,
+            remote_ip=result.get("ip") or "",
+            execution_backend="dask",
+        )
+        cancel_file = self.dask_cancel_files.pop(task_id, "")
+        if cancel_file:
+            try:
+                Path(cancel_file).unlink(missing_ok=True)
+            except Exception:
+                pass
+        return status
+
+    def _signal_dask_cancel(self, task_id: str):
+        cancel_file = str(self.dask_cancel_files.get(task_id) or "").strip()
+        if not cancel_file:
+            return
+        try:
+            path = Path(cancel_file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("cancel", encoding="utf-8")
+        except Exception:
+            pass
+
+    def _run_dask_single_task(
+        self,
+        task_id: str,
+        command: List[str],
+        working_dir: str | None,
+        env: Dict[str, str] | None,
+    ):
+        manager = self.cluster_manager
+        if manager is None:
+            self._run_process_task(task_id, command, working_dir, env)
+            return
+
+        self.update_task(
+            task_id,
+            status="running",
+            started_at=now_iso(),
+            execution_backend="dask",
+        )
+        self.append_log(task_id, "[DASK] 单任务已提交到 Dask 集群")
+        spec = {
+            "command": command,
+            "working_dir": working_dir,
+            "env": env or {},
+        }
+
+        try:
+            client = manager.get_client()
+            info = client.scheduler_info(n_workers=-1)
+            if not (info.get("workers") or {}):
+                raise RuntimeError("Dask 集群没有可用 Worker")
+
+            payload = self._prepare_dask_payload(spec, task_id)
+            future = client.submit(
+                execute_subprocess_job,
+                payload,
+                pure=False,
+                key=f"local-web-{task_id}-{uuid.uuid4().hex[:8]}",
+            )
+            with self.lock:
+                self.dask_futures[task_id] = future
+
+            while not future.done():
+                if task_id in self.cancel_flags:
+                    self._signal_dask_cancel(task_id)
+                    try:
+                        future.cancel()
+                    except Exception:
+                        pass
+                    self.update_task(task_id, status="cancelled", ended_at=now_iso(), return_code=-1)
+                    return
+                time.sleep(0.5)
+
+            result = future.result()
+            self._apply_dask_result(task_id, result)
+
+        except Exception as exc:
+            self.append_log(task_id, f"[DASK-ERROR] {type(exc).__name__}: {exc}")
+            self.append_log(task_id, traceback.format_exc())
+            self.update_task(
+                task_id,
+                status="failed",
+                return_code=-1,
+                ended_at=now_iso(),
+                execution_backend="dask",
+            )
+        finally:
+            with self.lock:
+                self.dask_futures.pop(task_id, None)
+            cancel_file = self.dask_cancel_files.pop(task_id, "")
+            if cancel_file:
+                try:
+                    Path(cancel_file).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            self.cancel_flags.discard(task_id)
+
+    def _run_dask_job_group(
+        self,
+        parent_id: str,
+        entries: List[Dict[str, Any]],
+        max_workers: int,
+        group_name: str,
+    ):
+        total = len(entries)
+        max_workers = max(1, min(int(max_workers or 1), max(1, total)))
+        manager = self.cluster_manager
+        if manager is None:
+            raise RuntimeError("DaskClusterManager 未初始化")
+
+        self.update_task(
+            parent_id,
+            status="running",
+            started_at=now_iso(),
+            parallel_total=total,
+            parallel_done=0,
+            parallel_failed=0,
+            max_workers=max_workers,
+            execution_backend="dask",
+        )
+        self.append_log(
+            parent_id,
+            f"[DASK] {group_name}启动：总任务数={total}，最多同时提交={max_workers}",
+        )
+        self.append_log(
+            parent_id,
+            "[DASK] 大型输入数据不会通过调度器传输；所有节点必须能访问 config.json 中的输入/输出路径。",
+        )
+
+        client = manager.get_client()
+        scheduler_info = client.scheduler_info(n_workers=-1)
+        worker_count = len(scheduler_info.get("workers") or {})
+        if worker_count <= 0:
+            raise RuntimeError("Dask 集群没有可用 Worker")
+        self.append_log(parent_id, f"[DASK] 当前可用 Worker={worker_count}")
+
+        next_index = 0
+        done_count = 0
+        failures = 0
+        running: Dict[Any, Dict[str, Any]] = {}
+
+        try:
+            while (next_index < total or running) and parent_id not in self.cancel_flags:
+                while (
+                    next_index < total
+                    and len(running) < max_workers
+                    and parent_id not in self.cancel_flags
+                ):
+                    entry = entries[next_index]
+                    spec = entry["spec"]
+                    child_id = entry.get("child_id")
+                    label = str(spec.get("label") or f"子任务 {next_index + 1}")
+
+                    if not child_id:
+                        parent_task = self.get_task(parent_id) or {}
+                        child = self.create_task(
+                            module_id=spec.get("module_id", ""),
+                            module_name=spec.get("module_name", label),
+                            command=spec.get("command") or [],
+                            inputs=spec.get("inputs") or {},
+                            kind="module",
+                            extra={
+                                "parent_id": parent_id,
+                                "job_index": next_index + 1,
+                                "owner_username": str(parent_task.get("owner_username") or ""),
+                                "execution_backend": "dask",
+                            },
+                        )
+                        child_id = child["id"]
+                        with self.lock:
+                            parent = self.tasks.get(parent_id)
+                            if parent:
+                                parent.setdefault("children", []).append(child_id)
+                    else:
+                        self.update_task(
+                            child_id,
+                            status="running",
+                            started_at=now_iso(),
+                            execution_backend="dask",
+                        )
+
+                    payload = self._prepare_dask_payload(spec, child_id)
+                    future = client.submit(
+                        execute_subprocess_job,
+                        payload,
+                        pure=False,
+                        key=f"local-web-{child_id}-{uuid.uuid4().hex[:8]}",
+                    )
+                    with self.lock:
+                        self.dask_futures[child_id] = future
+
+                    running[future] = {
+                        "child_id": child_id,
+                        "label": label,
+                        "index": next_index,
+                    }
+                    self.append_log(
+                        parent_id,
+                        f"[DASK] 已提交 {next_index + 1}/{total}: {label}；"
+                        f"当前在途 {len(running)}/{max_workers}",
+                    )
+                    next_index += 1
+
+                if not running:
+                    break
+
+                completed = [future for future in running if future.done()]
+                if not completed:
+                    time.sleep(0.5)
+                    continue
+
+                for future in completed:
+                    meta = running.pop(future)
+                    child_id = meta["child_id"]
+                    label = meta["label"]
+                    try:
+                        result = future.result()
+                        status = self._apply_dask_result(child_id, result)
+                    except Exception as exc:
+                        status = "failed"
+                        self.append_log(child_id, f"[DASK-ERROR] {type(exc).__name__}: {exc}")
+                        self.append_log(child_id, traceback.format_exc())
+                        self.update_task(
+                            child_id,
+                            status="failed",
+                            return_code=-1,
+                            ended_at=now_iso(),
+                            execution_backend="dask",
+                        )
+                    finally:
+                        with self.lock:
+                            self.dask_futures.pop(child_id, None)
+                        cancel_file = self.dask_cancel_files.pop(child_id, "")
+                        if cancel_file:
+                            try:
+                                Path(cancel_file).unlink(missing_ok=True)
+                            except Exception:
+                                pass
+
+                    if status != "success":
+                        failures += 1
+                        self._append_child_failure_to_parent(parent_id, child_id, label)
+
+                    done_count += 1
+                    self.update_task(
+                        parent_id,
+                        parallel_done=done_count,
+                        parallel_failed=failures,
+                    )
+                    self.append_log(
+                        parent_id,
+                        f"[DASK] 完成 {done_count}/{total}: {label}，状态={status}",
+                    )
+
+            if parent_id in self.cancel_flags:
+                for future, meta in list(running.items()):
+                    child_id = meta["child_id"]
+                    self._signal_dask_cancel(child_id)
+                    try:
+                        future.cancel()
+                    except Exception:
+                        pass
+                    self.update_task(child_id, status="cancelled", ended_at=now_iso(), return_code=-1)
+                    with self.lock:
+                        self.dask_futures.pop(child_id, None)
+
+            parent = self.get_task(parent_id) or {}
+            children = parent.get("children") or []
+            child_statuses = [(self.get_task(cid) or {}).get("status") for cid in children]
+
+            if parent_id in self.cancel_flags or any(s == "cancelled" for s in child_statuses):
+                final_status = "cancelled"
+                return_code = -1
+            elif failures > 0 or done_count < total or any(s != "success" for s in child_statuses):
+                final_status = "failed"
+                return_code = 1
+            else:
+                final_status = "success"
+                return_code = 0
+
+            self.update_task(
+                parent_id,
+                status=final_status,
+                return_code=return_code,
+                ended_at=now_iso(),
+                parallel_done=done_count,
+                parallel_failed=sum(1 for s in child_statuses if s != "success"),
+                execution_backend="dask",
+            )
+            self.append_log(parent_id, f"[DASK] {group_name}结束，状态={final_status}")
+            self._cleanup_runtime_roots_for_task(
+                parent_id,
+                reason=f"Dask {group_name}结束，状态={final_status}",
+            )
+
+        finally:
+            self.cancel_flags.discard(parent_id)
+
+    def _mark_dask_parent_failed(self, parent_id: str, exc: Exception, group_name: str):
+        self.append_log(parent_id, f"[DASK-ERROR] {type(exc).__name__}: {exc}")
+        self.append_log(parent_id, traceback.format_exc())
+        self.update_task(
+            parent_id,
+            status="failed",
+            return_code=-1,
+            ended_at=now_iso(),
+            execution_backend="dask",
+        )
+        self._cleanup_runtime_roots_for_task(
+            parent_id,
+            reason=f"Dask {group_name}异常结束",
+        )
+
+    def _run_parallel_task_dask(
+        self,
+        parent_id: str,
+        jobs: List[Dict[str, Any]],
+        max_workers: int,
+    ):
+        entries = [{"child_id": None, "spec": job} for job in jobs]
+        try:
+            return self._run_dask_job_group(
+                parent_id,
+                entries,
+                max_workers,
+                group_name="并行任务",
+            )
+        except Exception as exc:
+            self._mark_dask_parent_failed(parent_id, exc, "并行任务")
+
+    def _run_batch_group_dask(
+        self,
+        parent_id: str,
+        child_job_map: Dict[str, Dict[str, Any]],
+        max_parallel: int,
+    ):
+        entries = [
+            {"child_id": child_id, "spec": job}
+            for child_id, job in child_job_map.items()
+        ]
+        try:
+            return self._run_dask_job_group(
+                parent_id,
+                entries,
+                max_parallel,
+                group_name="批处理",
+            )
+        except Exception as exc:
+            self._mark_dask_parent_failed(parent_id, exc, "批处理")
+
     def kick_scheduler(self):
         """
         外部主动唤醒调度器。
@@ -179,11 +598,7 @@ class TaskManager:
             except Exception:
                 pass
     def _normalize_cleanup_roots(self, roots: Any) -> list[Path]:
-        """规范化需要清理的 runtime 子目录。
-
-        安全限制：只允许删除 backend/runtime/parallel_chunks 内部目录，
-        防止误删用户输入数据、输出目录或模块安装目录。
-        """
+        """规范化并限制可清理的临时任务目录。"""
         if not roots:
             return []
 
@@ -194,23 +609,41 @@ class TaskManager:
         else:
             return []
 
+        allowed_roots: list[Path] = []
         try:
-            allowed_root = self.parallel_chunks_dir.resolve()
+            allowed_roots.append(self.parallel_chunks_dir.resolve())
         except Exception:
+            pass
+
+        manager = self.cluster_manager
+        if manager is not None:
+            try:
+                shared = str(manager.get_shared_runtime_root() or "").strip()
+                if shared:
+                    allowed_roots.append((Path(shared) / "parallel_chunks").resolve())
+            except Exception:
+                pass
+
+        if not allowed_roots:
             return []
 
         result: list[Path] = []
         seen: set[str] = set()
-
         for item in items:
             try:
                 p = Path(str(item)).resolve()
             except Exception:
                 continue
 
-            try:
-                p.relative_to(allowed_root)
-            except ValueError:
+            allowed = False
+            for allowed_root in allowed_roots:
+                try:
+                    p.relative_to(allowed_root)
+                    allowed = True
+                    break
+                except ValueError:
+                    continue
+            if not allowed:
                 continue
 
             key = str(p).lower()
@@ -219,6 +652,7 @@ class TaskManager:
                 result.append(p)
 
         return result
+
 
     def _cleanup_runtime_roots(self, task_id: str, roots: Any, reason: str = "任务结束"):
         """清理平台拆分产生的 runtime/parallel_chunks 临时输入目录。"""
@@ -305,166 +739,6 @@ class TaskManager:
             self._save_tasks()
             for task_id, roots in cleanup_map.items():
                 self._cleanup_runtime_roots(task_id, roots, reason="服务重启后清理历史临时输入目录")
-
-    @staticmethod
-    def _env_bool(name: str, default: bool = False) -> bool:
-        value = os.environ.get(name)
-        if value is None or str(value).strip() == "":
-            return bool(default)
-        return str(value).strip().lower() not in {"0", "false", "no", "off", "disable", "disabled"}
-
-    @staticmethod
-    def _format_core_range(cores: List[int] | None) -> str:
-        cores = sorted(int(x) for x in (cores or []))
-        if not cores:
-            return ""
-        ranges: list[str] = []
-        start = prev = cores[0]
-        for core in cores[1:]:
-            if core == prev + 1:
-                prev = core
-                continue
-            ranges.append(str(start) if start == prev else f"{start}-{prev}")
-            start = prev = core
-        ranges.append(str(start) if start == prev else f"{start}-{prev}")
-        return ",".join(ranges)
-
-    def _build_cpu_affinity_groups(self) -> List[List[int]]:
-        """生成 CPU 核组，例如 24 核、保留 2 核、每进程 2 核 => [2,3], [4,5] ...。"""
-        if not self.cpu_affinity_enabled:
-            return []
-
-        cpu_count = max(1, int(self.cpu_count or os.cpu_count() or 1))
-        cores_per_process = max(1, min(cpu_count, int(self.cpu_affinity_cores_per_process or 1)))
-
-        # CPU 很少时不强行保留 2 个核，避免无核可分配。
-        reserve = max(0, int(self.cpu_affinity_reserved_cores or 0))
-        if cpu_count <= 2:
-            reserve = 0
-        elif reserve >= cpu_count:
-            reserve = max(0, cpu_count - cores_per_process)
-        reserve = max(0, min(reserve, max(0, cpu_count - 1)))
-
-        usable = list(range(reserve, cpu_count))
-        groups: List[List[int]] = []
-        for i in range(0, len(usable), cores_per_process):
-            group = usable[i:i + cores_per_process]
-            if len(group) == cores_per_process:
-                groups.append(group)
-
-        if not groups and usable:
-            groups = [usable]
-
-        if self.cpu_affinity_max_groups > 0:
-            groups = groups[:self.cpu_affinity_max_groups]
-
-        return groups
-
-    def _cpu_affinity_policy_snapshot(self) -> Dict[str, Any]:
-        with self.affinity_lock:
-            active = {
-                task_id: {
-                    "cores": list(cores),
-                    "label": self._format_core_range(cores),
-                }
-                for task_id, cores in self.task_cpu_affinity.items()
-            }
-            used = len(active)
-
-        return {
-            "enabled": bool(self.cpu_affinity_enabled),
-            "reserved_cores": int(self.cpu_affinity_reserved_cores),
-            "cores_per_process": int(self.cpu_affinity_cores_per_process),
-            "set_thread_env": bool(self.cpu_affinity_set_thread_env),
-            "include_children": bool(self.cpu_affinity_include_children),
-            "groups": [list(g) for g in self.cpu_affinity_core_groups],
-            "group_labels": [self._format_core_range(g) for g in self.cpu_affinity_core_groups],
-            "total_groups": len(self.cpu_affinity_core_groups),
-            "used_groups": used,
-            "free_groups": max(0, len(self.cpu_affinity_core_groups) - used),
-            "active_assignments": active,
-        }
-
-    def _acquire_cpu_affinity_group(self, task_id: str) -> List[int]:
-        """为一个即将启动的 exe 申请 CPU 核组。无可用组时短暂等待。"""
-        if not self.cpu_affinity_enabled or not self.cpu_affinity_core_groups:
-            return []
-
-        while task_id not in self.cancel_flags:
-            with self.affinity_lock:
-                existing = self.task_cpu_affinity.get(task_id)
-                if existing:
-                    return list(existing)
-
-                used = {tuple(v) for v in self.task_cpu_affinity.values()}
-                for group in self.cpu_affinity_core_groups:
-                    key = tuple(group)
-                    if key not in used:
-                        self.task_cpu_affinity[task_id] = list(group)
-                        return list(group)
-
-            time.sleep(self.cpu_affinity_wait_seconds)
-
-        return []
-
-    def _release_cpu_affinity_group(self, task_id: str) -> None:
-        if not self.cpu_affinity_enabled:
-            return
-        with self.affinity_lock:
-            self.task_cpu_affinity.pop(task_id, None)
-
-    def _inject_affinity_thread_env(self, env: Dict[str, str], cores: List[int]) -> Dict[str, str]:
-        """把单 exe 内部线程数限制到核组大小，减少 OpenMP/MKL/GDAL 等库的线程争抢。"""
-        if not cores or not self.cpu_affinity_set_thread_env:
-            return env
-
-        thread_count = max(1, len(cores))
-        for key in (
-            "OPENBLAS_NUM_THREADS",
-            "OMP_NUM_THREADS",
-            "OMP_THREAD_LIMIT",
-            "GOTO_NUM_THREADS",
-            "MKL_NUM_THREADS",
-            "NUMEXPR_NUM_THREADS",
-            "LOKY_MAX_CPU_COUNT",
-            "OPENCV_FOR_THREADS_NUM",
-            "GDAL_NUM_THREADS",
-            "LOCAL_WEB_RUNTIME_THREADS",
-        ):
-            env[key] = str(thread_count)
-        env["LOCAL_WEB_CPU_AFFINITY_CORES"] = ",".join(str(x) for x in cores)
-        env["LOCAL_WEB_CPU_AFFINITY_LABEL"] = self._format_core_range(cores)
-        return env
-
-    def _apply_cpu_affinity_to_process(self, pid: int, cores: List[int]) -> tuple[bool, str]:
-        """把进程绑定到指定 CPU 核组；Windows/Linux/macOS 能力取决于 psutil/系统支持。"""
-        if not self.cpu_affinity_enabled or not cores:
-            return False, "CPU 亲和性未启用或未分配核组"
-
-        # 首选 psutil：Windows / Linux 都支持 cpu_affinity。
-        try:
-            import psutil  # type: ignore
-            proc = psutil.Process(pid)
-            proc.cpu_affinity(list(cores))
-            if self.cpu_affinity_include_children:
-                for child in proc.children(recursive=True):
-                    try:
-                        child.cpu_affinity(list(cores))
-                    except Exception:
-                        continue
-            return True, ""
-        except Exception as exc:
-            psutil_error = repr(exc)
-
-        # Linux 兜底。
-        try:
-            if hasattr(os, "sched_setaffinity"):
-                os.sched_setaffinity(pid, set(cores))  # type: ignore[attr-defined]
-                return True, ""
-        except Exception as exc:
-            return False, f"设置 CPU 亲和性失败：psutil={psutil_error}；sched_setaffinity={repr(exc)}"
-
-        return False, f"设置 CPU 亲和性失败：{psutil_error}。请安装 psutil，或关闭 LOCAL_WEB_CPU_AFFINITY。"
 
     def _system_cpu_percent(self) -> float | None:
         """读取本机 CPU 使用率。
@@ -669,7 +943,7 @@ class TaskManager:
             except Exception:
                 return {"percent": None, "free_gb": None}
 
-    def _runtime_pressure_reason(self, fast_refill: bool = False) -> str:
+    def _runtime_pressure_reason(self) -> str:
         """返回是否应该暂停启动新的子进程。
 
         轻量化策略：
@@ -681,33 +955,18 @@ class TaskManager:
         if active_processes >= self.max_process_slots:
             return f"平台已启动 {active_processes}/{self.max_process_slots} 个模块进程，等待已有进程完成"
 
-        if self.cpu_affinity_enabled and self.cpu_affinity_core_groups:
-            with self.affinity_lock:
-                free_groups = len(self.cpu_affinity_core_groups) - len(self.task_cpu_affinity)
-            if free_groups <= 0:
-                return f"CPU 核组已全部占用：{len(self.task_cpu_affinity)}/{len(self.cpu_affinity_core_groups)}，等待已有 exe 完成后释放核组"
-
-        if fast_refill or not self.adaptive_child_start_enabled:
+        if not self.adaptive_child_start_enabled:
             cpu = self._system_cpu_percent()
-            cpu_threshold = self.fast_refill_cpu_threshold if fast_refill else self.child_launch_cpu_threshold
-            if cpu is not None and cpu >= cpu_threshold:
-                return f"CPU 使用率 {cpu:.1f}% 已超过暂停启动阈值 {cpu_threshold:.0f}%"
+            if cpu is not None and cpu >= self.child_launch_cpu_threshold:
+                return f"CPU 使用率 {cpu:.1f}% 已超过暂停启动阈值 {self.child_launch_cpu_threshold:.0f}%"
 
         mem = self._virtual_memory_snapshot()
         mem_percent = mem.get("percent")
         mem_available = mem.get("available_gb")
-        memory_threshold = (
-            max(self.child_launch_memory_threshold, self.fast_refill_memory_threshold)
-            if fast_refill else self.child_launch_memory_threshold
-        )
-        min_memory_gb = (
-            min(self.child_launch_min_memory_gb, self.fast_refill_min_memory_gb)
-            if fast_refill else self.child_launch_min_memory_gb
-        )
-        if mem_percent is not None and mem_percent >= memory_threshold:
-            return f"内存使用率 {mem_percent:.1f}% 已超过暂停启动阈值 {memory_threshold:.0f}%"
-        if mem_available is not None and mem_available <= min_memory_gb:
-            return f"可用内存仅 {mem_available:.1f}GB，低于最低阈值 {min_memory_gb:.1f}GB"
+        if mem_percent is not None and mem_percent >= self.child_launch_memory_threshold:
+            return f"内存使用率 {mem_percent:.1f}% 已超过暂停启动阈值 {self.child_launch_memory_threshold:.0f}%"
+        if mem_available is not None and mem_available <= self.child_launch_min_memory_gb:
+            return f"可用内存仅 {mem_available:.1f}GB，低于最低阈值 {self.child_launch_min_memory_gb:.1f}GB"
 
         disk = self._disk_usage_snapshot()
         disk_percent = disk.get("percent")
@@ -719,22 +978,20 @@ class TaskManager:
 
         return ""
 
-    def _wait_until_safe_to_start_child(self, parent_id: str, label: str, fast_refill: bool = False):
+    def _wait_until_safe_to_start_child(self, parent_id: str, label: str):
         """父并行任务运行期间，系统压力过高时不再启动新子进程，等压力下降再继续。
 
         需要连续两次采样都安全才放行，避免刚启动几个进程时 CPU 还没来得及升高，
         后续进程又被瞬间全部拉起导致电脑卡死。
         """
         safe_samples = 0
-        required_safe_samples = 1 if fast_refill else 2
-        wait_seconds = self.fast_refill_wait_seconds if fast_refill else self.child_launch_wait_seconds
         while parent_id not in self.cancel_flags:
-            reason = self._runtime_pressure_reason(fast_refill=fast_refill)
+            reason = self._runtime_pressure_reason()
             if not reason:
                 safe_samples += 1
-                if safe_samples >= required_safe_samples:
+                if safe_samples >= 2:
                     return
-                time.sleep(max(0.1, min(wait_seconds, 3.0)))
+                time.sleep(max(1.0, min(self.child_launch_wait_seconds, 3.0)))
                 continue
 
             safe_samples = 0
@@ -746,7 +1003,7 @@ class TaskManager:
                     parent_id,
                     f"[SAFE] 暂停启动新子任务 {label}：{reason}。已启动的任务继续运行，等负载下降后自动继续，防止电脑卡死。",
                 )
-            time.sleep(max(0.1, wait_seconds))
+            time.sleep(max(1.0, self.child_launch_wait_seconds))
 
     def _adaptive_start_memory_safe(self) -> tuple[bool, str]:
         mem = self._virtual_memory_snapshot()
@@ -836,7 +1093,6 @@ class TaskManager:
         return False
 
     def get_system_resource_info(self) -> Dict[str, Any]:
-        affinity_policy = self._cpu_affinity_policy_snapshot()
         with self.lock:
             running_workers = self._used_slots_locked()
             active_task_count = len(self.active_slots)
@@ -853,9 +1109,6 @@ class TaskManager:
                     "requested_workers": slots,
                     "pid": task.get("pid"),
                     "status": task.get("status") or "running",
-                    "cpu_affinity_cores": task.get("cpu_affinity_cores") or [],
-                    "cpu_affinity_label": task.get("cpu_affinity_label") or "",
-                    "runtime_threads": task.get("runtime_threads"),
                 })
 
         cpu_percent = self._system_cpu_percent()
@@ -881,14 +1134,7 @@ class TaskManager:
             "disk_percent": disk_snapshot.get("percent"),
             "disk_free_gb": disk_snapshot.get("free_gb"),
             "active_tasks": active_tasks,
-            "cpu_affinity": affinity_policy,
-            "cpu_affinity_enabled": affinity_policy.get("enabled"),
-            "cpu_affinity_reserved_cores": affinity_policy.get("reserved_cores"),
-            "cpu_affinity_cores_per_process": affinity_policy.get("cores_per_process"),
-            "cpu_affinity_group_labels": affinity_policy.get("group_labels"),
-            "cpu_affinity_total_groups": affinity_policy.get("total_groups"),
-            "cpu_affinity_used_groups": affinity_policy.get("used_groups"),
-            "cpu_affinity_free_groups": affinity_policy.get("free_groups"),
+            "execution_backend": "dask" if self._distributed_execution_enabled() else "local",
         }
 
     def _can_start_queued_item_locked(self, item: Dict[str, Any]) -> tuple[bool, str]:
@@ -1220,9 +1466,10 @@ class TaskManager:
 
         self._append_parallel_adjustment_log(task["id"], inputs)
         # 单个模块进程只占 1 个真实启动槽；parallel_workers 只写入配置，不作为父任务排队条件。
+        runner = self._run_dask_single_task if self._distributed_execution_enabled() else self._run_process_task
         self._enqueue_task_runner(
             task["id"],
-            self._run_process_task,
+            runner,
             (task["id"], command, working_dir, env),
             requested_slots=1,
         )
@@ -1289,7 +1536,7 @@ class TaskManager:
             parent["id"],
             self._run_parallel_task,
             (parent["id"], jobs, effective_workers),
-            requested_slots=effective_workers,
+            requested_slots=self._distributed_parent_slots(effective_workers),
         )
         return self.get_task(parent["id"]) or parent
 
@@ -1320,12 +1567,6 @@ class TaskManager:
             "_requested_parallel_workers": requested_parallel,
             "_effective_parallel_workers": effective_parallel,
         }
-        batch_fast_refill = str(os.environ.get("LOCAL_WEB_BATCH_FAST_REFILL", "1")).strip().lower() not in {"0", "false", "no", "off"}
-        if batch_fast_refill:
-            parent_inputs["_parallel_fast_refill"] = True
-        first_input_profiles = next((job.get("input_profiles") for job in jobs if job.get("input_profiles")), None)
-        if first_input_profiles:
-            parent_inputs["_batch_tif_profiles"] = list(first_input_profiles)
         if requested_parallel != effective_parallel:
             parent_inputs["_parallel_worker_note"] = (
                 f"用户选择 {requested_parallel} 个进程，但本次只有 {job_count} 个子任务，"
@@ -1383,7 +1624,7 @@ class TaskManager:
             parent["id"],
             self._run_batch_group,
             (parent["id"], child_job_map, effective_parallel),
-            requested_slots=effective_parallel,
+            requested_slots=self._distributed_parent_slots(effective_parallel),
         )
         return self.get_task(parent["id"]) or parent
 
@@ -1393,6 +1634,9 @@ class TaskManager:
         child_job_map: Dict[str, Dict[str, Any]],
         max_parallel: int,
     ):
+        if self._distributed_execution_enabled():
+            return self._run_batch_group_dask(parent_id, child_job_map, max_parallel)
+
         total = len(child_job_map)
         max_parallel = max(1, int(max_parallel or 1))
         self.update_task(
@@ -1404,18 +1648,8 @@ class TaskManager:
             parallel_failed=0,
             max_workers=max_parallel,
         )
-        parent_task = self.get_task(parent_id) or {}
-        parent_inputs = parent_task.get("inputs") or {}
-        fast_refill = bool(parent_inputs.get("_parallel_fast_refill"))
         self.append_log(parent_id, f"[INFO] 批处理开始，共 {total} 个子任务")
         self.append_log(parent_id, f"[INFO] 用户选择并发数 = {max_parallel}；系统会逐个启动子进程，负载高时暂停启动新进程")
-        if fast_refill:
-            self.append_log(parent_id, "[POOL] 批处理快速补位已启用：一个影像子任务完成后立即补下一个，不使用自适应错峰等待。")
-        input_profiles = parent_inputs.get("_batch_tif_profiles") or []
-        if input_profiles:
-            self.append_log(parent_id, "[DATA] 首个批处理子任务 TIF 输入结构如下：")
-            for item in input_profiles:
-                self.append_log(parent_id, f"[DATA]   {item}")
         self.append_log(parent_id, "[POOL] 稳定进程池：最多同时运行 max_parallel 个子任务；一个完成后补一个；检测到高负载时先等已有子任务完成，再决定是否补位。")
         self.append_log(parent_id, "[SAFE] 启动新子进程前检查 CPU/内存/磁盘，真正接近危险阈值时才暂停补位。")
 
@@ -1459,7 +1693,7 @@ class TaskManager:
                     if paused_by_pressure and running:
                         break
 
-                    reason = self._runtime_pressure_reason(fast_refill=fast_refill)
+                    reason = self._runtime_pressure_reason()
                     if reason:
                         paused_by_pressure = True
                         now = time.time()
@@ -1473,13 +1707,13 @@ class TaskManager:
                         break
 
                     with start_gate:
-                        self._wait_until_safe_to_start_child(parent_id, str(label), fast_refill=fast_refill)
+                        self._wait_until_safe_to_start_child(parent_id, str(label))
                         if parent_id in self.cancel_flags:
                             break
-                        if self.adaptive_child_start_enabled and not fast_refill and learned_interval is not None:
+                        if self.adaptive_child_start_enabled and learned_interval is not None:
                             if not self._sleep_before_adaptive_child_launch(parent_id, str(label), learned_interval, last_child_launch_at):
                                 break
-                            self._wait_until_safe_to_start_child(parent_id, str(label), fast_refill=fast_refill)
+                            self._wait_until_safe_to_start_child(parent_id, str(label))
                             if parent_id in self.cancel_flags:
                                 break
 
@@ -1490,10 +1724,10 @@ class TaskManager:
                         launched_any = True
                         last_child_launch_at = time.time()
 
-                    if self.adaptive_child_start_enabled and not fast_refill and learned_interval is None and next_index < total:
+                    if self.adaptive_child_start_enabled and learned_interval is None and next_index < total:
                         learned_interval = self._learn_child_start_interval_after_first_launch(parent_id, str(label))
                         self.learned_child_start_intervals[parent_id] = learned_interval
-                    elif self.child_start_stagger_seconds > 0 and not fast_refill:
+                    elif self.child_start_stagger_seconds > 0:
                         time.sleep(self.child_start_stagger_seconds)
 
                 if not running:
@@ -1558,8 +1792,6 @@ class TaskManager:
         with self.lock:
             self.learned_child_start_intervals.pop(parent_id, None)
             self.child_start_gate_locks.pop(parent_id, None)
-            self._last_parallel_monitor_log_at.pop(parent_id, None)
-            self._last_dynamic_boost_log_at.pop(parent_id, None)
         self.cancel_flags.discard(parent_id)
 
     def _stream_reader(self, pipe, task_id: str, prefix: str):
@@ -1631,18 +1863,6 @@ class TaskManager:
             task_id,
             f"[INFO] GOTO_NUM_THREADS = {merged_env.get('GOTO_NUM_THREADS', '')}",
         )
-        self.append_log(
-            task_id,
-            f"[INFO] MKL_NUM_THREADS = {merged_env.get('MKL_NUM_THREADS', '')}",
-        )
-        self.append_log(
-            task_id,
-            f"[INFO] LOKY_MAX_CPU_COUNT = {merged_env.get('LOKY_MAX_CPU_COUNT', '')}",
-        )
-        self.append_log(
-            task_id,
-            f"[INFO] LOCAL_WEB_RUNTIME_THREADS = {merged_env.get('LOCAL_WEB_RUNTIME_THREADS', '')}",
-        )
 
         config_arg = None
 
@@ -1683,28 +1903,6 @@ class TaskManager:
         return hints.get(return_code)
 
     @staticmethod
-    def _logs_contain_failure_signature(logs: Any) -> bool:
-        if not logs:
-            return False
-        if isinstance(logs, str):
-            text = logs
-        else:
-            try:
-                text = "\n".join(str(line) for line in logs)
-            except Exception:
-                text = str(logs)
-        lowered = text.lower()
-        signatures = (
-            "no such file",
-            "no such directory",
-            "file not found",
-            "path not found",
-            "找不到文件",
-            "系统找不到指定的文件",
-        )
-        return any(item in lowered for item in signatures)
-
-    @staticmethod
     def decode_process_output(raw: bytes) -> str:
         if raw is None:
             return ""
@@ -1727,18 +1925,9 @@ class TaskManager:
         if env:
             merged_env.update(env)
 
-        affinity_cores: List[int] = []
-        process: subprocess.Popen | None = None
+        self._log_runtime_context(task_id, command, working_dir, merged_env)
 
         try:
-            # 先申请 CPU 核组，再写入环境变量和启动进程。
-            # 这样每个 exe 从启动开始就能获得明确的线程预算。
-            affinity_cores = self._acquire_cpu_affinity_group(task_id)
-            if affinity_cores:
-                self._inject_affinity_thread_env(merged_env, affinity_cores)
-
-            self._log_runtime_context(task_id, command, working_dir, merged_env)
-
             creationflags = 0
             if os.name == "nt":
                 creationflags = subprocess.CREATE_NO_WINDOW
@@ -1755,11 +1944,6 @@ class TaskManager:
                 creationflags=creationflags,
             )
 
-            affinity_ok = False
-            affinity_error = ""
-            if affinity_cores:
-                affinity_ok, affinity_error = self._apply_cpu_affinity_to_process(process.pid, affinity_cores)
-
             with self.lock:
                 self.processes[task_id] = process
                 task = self.tasks.get(task_id)
@@ -1767,28 +1951,9 @@ class TaskManager:
                     task["status"] = "running"
                     task["pid"] = process.pid
                     task["started_at"] = now_iso()
-                    if affinity_cores:
-                        task["cpu_affinity_cores"] = list(affinity_cores)
-                        task["cpu_affinity_label"] = self._format_core_range(affinity_cores)
-                        task["runtime_threads"] = int(merged_env.get("LOCAL_WEB_RUNTIME_THREADS") or len(affinity_cores))
                     task.setdefault("logs", []).append(
                         f"[INFO] 进程已启动，PID = {process.pid}"
                     )
-                    if affinity_cores:
-                        label = self._format_core_range(affinity_cores)
-                        threads = merged_env.get("LOCAL_WEB_RUNTIME_THREADS") or str(len(affinity_cores))
-                        if affinity_ok:
-                            task.setdefault("logs", []).append(
-                                f"[AFFINITY] 已绑定 CPU 核组：{label}；每进程线程数限制为 {threads}。"
-                            )
-                        else:
-                            task.setdefault("logs", []).append(
-                                f"[AFFINITY-WARN] 已分配 CPU 核组 {label}，但设置进程亲和性失败：{affinity_error}"
-                            )
-                    elif self.cpu_affinity_enabled:
-                        task.setdefault("logs", []).append(
-                            "[AFFINITY-WARN] CPU 亲和性已启用，但没有可用核组，本进程不绑定 CPU。"
-                        )
             self._save_tasks()
 
             t_out = threading.Thread(
@@ -1812,18 +1977,13 @@ class TaskManager:
             with self.lock:
                 task = self.tasks.get(task_id)
                 if task:
-                    failure_signature = self._logs_contain_failure_signature(task.get("logs") or [])
                     if task.get("status") != "cancelled":
                         task["return_code"] = return_code
-                        task["status"] = "failed" if return_code != 0 or failure_signature else "success"
+                        task["status"] = "success" if return_code == 0 else "failed"
                         task["ended_at"] = now_iso()
                     task.setdefault("logs", []).append(
                         f"[INFO] 进程结束，return_code = {return_code}"
                     )
-                    if failure_signature and return_code == 0:
-                        task.setdefault("logs", []).append(
-                            "[OUTPUT-ERROR] 子程序返回 0，但日志包含找不到文件/路径的失败信息，平台已按失败处理。"
-                        )
 
                     hint = self._hint_from_return_code(return_code)
                     if hint:
@@ -1834,6 +1994,7 @@ class TaskManager:
                             "[WARN] 进程失败，但没有捕获到 stdout/stderr。"
                         )
 
+            self.processes.pop(task_id, None)
             self._save_tasks()
 
         except Exception as e:
@@ -1848,451 +2009,40 @@ class TaskManager:
                         f"[PYTHON-EXCEPTION] {repr(e)}"
                     )
                     task.setdefault("logs", []).append(traceback.format_exc())
+
+            self.processes.pop(task_id, None)
             self._save_tasks()
-
-        finally:
-            with self.lock:
-                self.processes.pop(task_id, None)
-            self._release_cpu_affinity_group(task_id)
-            self._save_tasks()
-
-    def _run_parallel_tile_merge(self, parent_id: str) -> bool:
-        parent = self.get_task(parent_id) or {}
-        inputs = parent.get("inputs") or {}
-        merge_plan = inputs.get("_parallel_tile_merge_plan")
-        if not merge_plan:
-            return True
-
-        plans = merge_plan.get("plans") if isinstance(merge_plan, dict) else None
-        if not isinstance(plans, list) or not plans:
-            plans = [merge_plan]
-
-        try:
-            for idx, plan in enumerate(plans, start=1):
-                if not isinstance(plan, dict):
-                    continue
-                tile_count = int(plan.get("tile_count") or len(plan.get("tiles") or []))
-                job_count = int(plan.get("job_count") or 0)
-                grouped = bool(plan.get("grouped_for_model_reuse"))
-                self.append_log(
-                    parent_id,
-                    f"[TILE] 开始拼接瓦片 {idx}/{len(plans)}：tiles={tile_count}，jobs={job_count}，模型复用分组={'是' if grouped else '否'}",
-                )
-                output_path = merge_tif_tiles(
-                    plan,
-                    log=lambda message: self.append_log(parent_id, message),
-                )
-                self.append_log(parent_id, f"[TILE] 瓦片拼接完成：{output_path}")
-            return True
-        except Exception as exc:
-            self.append_log(parent_id, f"[TILE-ERROR] 瓦片拼接失败：{type(exc).__name__}: {exc}")
-            self.append_log(parent_id, traceback.format_exc())
-            return False
-
-    def _prepare_parallel_output_progress(self, jobs: List[Dict[str, Any]]) -> Dict[str, Any]:
-        dirs: list[Path] = []
-        extensions: set[str] = set()
-        inputs: list[dict] = []
-        seen_dirs: set[str] = set()
-        seen_input_ids: set[str] = set()
-        require_outputs = False
-
-        for job in jobs:
-            if job.get("require_outputs") or (job.get("inputs") or {}).get("_parallel_require_outputs"):
-                require_outputs = True
-            watch = job.get("progress_watch") or {}
-            for raw_dir in watch.get("output_dirs") or []:
-                try:
-                    path = Path(str(raw_dir)).resolve()
-                except Exception:
-                    continue
-                key = str(path).lower()
-                if key not in seen_dirs:
-                    seen_dirs.add(key)
-                    dirs.append(path)
-
-            for ext in watch.get("output_extensions") or []:
-                ext_text = str(ext or "").strip().lower()
-                if not ext_text:
-                    continue
-                if not ext_text.startswith("."):
-                    ext_text = "." + ext_text
-                extensions.add(ext_text)
-
-            for item in watch.get("inputs") or []:
-                input_id = str(item.get("id") or "").strip()
-                if not input_id or input_id in seen_input_ids:
-                    continue
-                tokens = [
-                    str(token or "").strip().lower()
-                    for token in (item.get("tokens") or [])
-                    if str(token or "").strip()
-                ]
-                if not tokens:
-                    continue
-                seen_input_ids.add(input_id)
-                inputs.append({"id": input_id, "tokens": sorted(set(tokens))})
-
-        if not dirs or not inputs:
-            return {"enabled": False, "require_outputs": require_outputs}
-
-        if not extensions:
-            extensions = {".tif", ".tiff"}
-
-        baseline: dict[str, tuple[int, int]] = {}
-        for directory in dirs:
-            if not directory.exists() or not directory.is_dir():
-                continue
-            try:
-                iterator = directory.rglob("*") if len(inputs) <= 200 else directory.glob("*")
-                for path in iterator:
-                    if not path.is_file() or path.suffix.lower() not in extensions:
-                        continue
-                    try:
-                        stat = path.stat()
-                        baseline[str(path.resolve()).lower()] = (int(stat.st_mtime_ns), int(stat.st_size))
-                    except Exception:
-                        continue
-            except Exception:
-                continue
-
-        return {
-            "enabled": True,
-            "dirs": dirs,
-            "extensions": extensions,
-            "inputs": inputs,
-            "baseline": baseline,
-            "seen_ids": set(),
-            "seen_output_keys": set(),
-            "require_outputs": require_outputs,
-            "last_scan_at": 0.0,
-            "last_report_count": 0,
-        }
-
-    def _scan_parallel_output_progress(self, state: Dict[str, Any], force: bool = False) -> list[str]:
-        if not state.get("enabled"):
-            return []
-
-        now = time.time()
-        if not force and now - float(state.get("last_scan_at") or 0.0) < max(0.2, self.parallel_progress_scan_interval_seconds):
-            return []
-        state["last_scan_at"] = now
-
-        extensions = state.get("extensions") or {".tif", ".tiff"}
-        baseline = state.get("baseline") or {}
-        seen_ids: set[str] = state.setdefault("seen_ids", set())
-        seen_output_keys: set[str] = state.setdefault("seen_output_keys", set())
-        matched: list[str] = []
-        unmatched_outputs: list[tuple[str, str]] = []
-
-        candidates: list[Path] = []
-        for directory in state.get("dirs") or []:
-            try:
-                path = Path(directory)
-                if not path.exists() or not path.is_dir():
-                    continue
-                iterator = path.rglob("*") if len(state.get("inputs") or []) <= 200 else path.glob("*")
-                for item in iterator:
-                    if item.is_file() and item.suffix.lower() in extensions:
-                        candidates.append(item)
-            except Exception:
-                continue
-
-        for path in candidates:
-            try:
-                stat = path.stat()
-                key = str(path.resolve()).lower()
-                snapshot = (int(stat.st_mtime_ns), int(stat.st_size))
-            except Exception:
-                continue
-            if baseline.get(key) == snapshot:
-                continue
-            if key in seen_output_keys:
-                continue
-            name = path.name.lower()
-            stem = path.stem.lower()
-            matched_by_token = False
-            for item in state.get("inputs") or []:
-                input_id = str(item.get("id") or "")
-                if not input_id or input_id in seen_ids:
-                    continue
-                tokens = item.get("tokens") or []
-                if any(token and (token in name or token in stem) for token in tokens):
-                    seen_ids.add(input_id)
-                    seen_output_keys.add(key)
-                    matched.append(input_id)
-                    matched_by_token = True
-                    break
-            if not matched_by_token:
-                unmatched_outputs.append((key, path.name))
-
-        if unmatched_outputs:
-            inputs = state.get("inputs") or []
-            for key, output_name in unmatched_outputs:
-                if key in seen_output_keys:
-                    continue
-                target = next(
-                    (
-                        str(item.get("id") or "")
-                        for item in inputs
-                        if str(item.get("id") or "") and str(item.get("id") or "") not in seen_ids
-                    ),
-                    "",
-                )
-                if not target:
-                    break
-                seen_ids.add(target)
-                seen_output_keys.add(key)
-                matched.append(target or output_name)
-
-        return matched
-
-    def _apply_parallel_output_progress(
-        self,
-        parent_id: str,
-        progress: Dict[str, int],
-        progress_total: int,
-        progress_label: str,
-        state: Dict[str, Any],
-        force_log: bool = False,
-    ) -> None:
-        if not state.get("enabled"):
-            return
-
-        matched = self._scan_parallel_output_progress(state, force=force_log)
-        seen_count = min(progress_total, len(state.get("seen_ids") or set()))
-        if seen_count <= int(progress.get("done") or 0):
-            return
-
-        progress["done"] = seen_count
-        self.update_task(parent_id, parallel_done=progress["done"], parallel_failed=progress["failed"])
-
-        last_report = int(state.get("last_report_count") or 0)
-        if force_log or matched or seen_count > last_report:
-            state["last_report_count"] = seen_count
-            if matched:
-                names = ", ".join(matched[-3:])
-                extra = f"；最新：{names}"
-            else:
-                extra = ""
-            self.append_log(parent_id, f"[PROGRESS] 已输出 {seen_count}/{progress_total} 个{progress_label}{extra}")
-
-    def _parallel_monitor_snapshot(self) -> Dict[str, Any]:
-        mem = self._virtual_memory_snapshot()
-        return {
-            "cpu": self._system_cpu_percent(),
-            "memory_percent": mem.get("percent"),
-            "memory_available_gb": mem.get("available_gb"),
-        }
-
-    def _dynamic_parallel_worker_limit(
-        self,
-        parent_id: str,
-        base_workers: int,
-        pool_capacity: int,
-        running_count: int,
-        pending_count: int,
-    ) -> int:
-        if (
-            not self.dynamic_worker_boost_enabled
-            or pending_count <= 0
-            or pool_capacity <= base_workers
-            or running_count < base_workers
-        ):
-            return base_workers
-
-        snapshot = self._parallel_monitor_snapshot()
-        cpu = snapshot.get("cpu")
-        mem_percent = snapshot.get("memory_percent")
-        mem_available = snapshot.get("memory_available_gb")
-        safe = True
-        reasons: list[str] = []
-
-        if cpu is not None and cpu > self.dynamic_worker_boost_cpu_below:
-            safe = False
-            reasons.append(f"CPU {cpu:.1f}%")
-        if mem_percent is not None and mem_percent >= self.dynamic_worker_boost_memory_below:
-            safe = False
-            reasons.append(f"内存 {mem_percent:.1f}%")
-        if mem_available is not None and mem_available < self.dynamic_worker_boost_min_memory_gb:
-            safe = False
-            reasons.append(f"可用内存 {mem_available:.1f}GB")
-
-        now = time.time()
-        last = self._last_dynamic_boost_log_at.get(parent_id, 0.0)
-        if not safe:
-            if now - last >= 20:
-                self._last_dynamic_boost_log_at[parent_id] = now
-                detail = "，".join(reasons) if reasons else "资源状态未满足"
-                self.append_log(parent_id, f"[BOOST] 暂不增加临时 worker：{detail}")
-            return base_workers
-
-        limit = min(pool_capacity, base_workers + self.dynamic_worker_boost_extra)
-        if now - last >= 20:
-            self._last_dynamic_boost_log_at[parent_id] = now
-            cpu_text = "-" if cpu is None else f"{cpu:.1f}%"
-            mem_text = "-" if mem_percent is None else f"{mem_percent:.1f}%"
-            avail_text = "-" if mem_available is None else f"{mem_available:.1f}GB"
-            self.append_log(parent_id, f"[BOOST] CPU/内存允许，临时并发上限提高到 {limit}：CPU={cpu_text}，内存={mem_text}，可用={avail_text}")
-        return limit
-
-    def _maybe_log_parallel_monitor(self, parent_id: str, running_count: int, base_workers: int, pool_capacity: int) -> None:
-        now = time.time()
-        last = self._last_parallel_monitor_log_at.get(parent_id, 0.0)
-        if now - last < max(5.0, self.parallel_monitor_interval_seconds):
-            return
-        self._last_parallel_monitor_log_at[parent_id] = now
-        snapshot = self._parallel_monitor_snapshot()
-        cpu = snapshot.get("cpu")
-        mem_percent = snapshot.get("memory_percent")
-        mem_available = snapshot.get("memory_available_gb")
-        cpu_text = "-" if cpu is None else f"{cpu:.1f}%"
-        mem_text = "-" if mem_percent is None else f"{mem_percent:.1f}%"
-        avail_text = "-" if mem_available is None else f"{mem_available:.1f}GB"
-        self.append_log(
-            parent_id,
-            f"[MONITOR] CPU={cpu_text}，内存={mem_text}，可用内存={avail_text}，运行 worker={running_count}/{base_workers}，池容量={pool_capacity}",
-        )
 
     def _run_parallel_task(self, parent_id: str, jobs: List[Dict[str, Any]], max_workers: int):
+        if self._distributed_execution_enabled():
+            return self._run_parallel_task_dask(parent_id, jobs, max_workers)
+
         total = len(jobs)
         max_workers = max(1, min(int(max_workers or 1), max(1, total)))
-        parent_task = self.get_task(parent_id) or {}
-        parent_inputs = parent_task.get("inputs") or {}
-
-        def _job_progress_units(job: Dict[str, Any]) -> int:
-            inputs = job.get("inputs") or {}
-            for key in ("_parallel_chunk_file_count", "_parallel_tile_count"):
-                try:
-                    value = int(inputs.get(key) or 0)
-                    if value > 0:
-                        return value
-                except Exception:
-                    pass
-            return 1
-
-        progress_total = sum(_job_progress_units(job) for job in jobs) or total
-        progress_unit = "files" if progress_total != total else "jobs"
-        progress_label = "输入文件" if progress_unit == "files" else "子任务"
 
         self.update_task(
             parent_id,
             status="running",
             started_at=now_iso(),
-            parallel_total=progress_total,
+            parallel_total=total,
             parallel_done=0,
             parallel_failed=0,
-            parallel_progress_unit=progress_unit,
-            parallel_progress_label=progress_label,
             max_workers=max_workers,
         )
 
-        self.append_log(parent_id, f"[PARALLEL] 并行任务启动：输入文件数={progress_total}，分组数={total}，实际并行 worker={max_workers}")
-        fast_refill = bool(parent_inputs.get("_parallel_fast_refill"))
+        self.append_log(parent_id, f"[PARALLEL] 并行任务启动：总任务数={total}，实际并行数={max_workers}")
+        parent_task = self.get_task(parent_id) or {}
+        parent_inputs = parent_task.get("inputs") or {}
         link_modes = parent_inputs.get("_parallel_chunk_link_modes") or []
         if link_modes:
             self.append_log(
                 parent_id,
                 f"[LINK] 子任务输入文件引用方式：{', '.join(str(x) for x in link_modes)}；系统未复制原始输入大文件到 runtime。"
             )
-        if fast_refill:
-            self.append_log(parent_id, "[POOL] 快速补位已启用：子任务完成后立即补下一个，不使用自适应错峰等待。")
-        model_reuse_info = parent_inputs.get("_parallel_model_reuse_info") or {}
-        if model_reuse_info:
-            self.append_log(
-                parent_id,
-                (
-                    "[MODEL] 大模型复用分组已启用："
-                    f"原计划约 {model_reuse_info.get('original_job_count', '-')} 个子进程，"
-                    f"现在合并为 {model_reuse_info.get('grouped_job_count', total)} 个文件组；"
-                    f"同时运行 {max_workers} 个 worker；"
-                    f"固定模型/资源约 {float(model_reuse_info.get('fixed_resource_gb') or 0.0):.2f}GB。"
-                ),
-            )
-            thread_counts: List[int] = []
-            for spec in jobs[:max_workers]:
-                env = spec.get("env") or {}
-                raw_threads = (
-                    env.get("LOCAL_WEB_RUNTIME_THREADS")
-                    or env.get("OMP_NUM_THREADS")
-                    or env.get("OPENBLAS_NUM_THREADS")
-                )
-                try:
-                    thread_counts.append(max(1, int(raw_threads or 1)))
-                except Exception:
-                    pass
-            if thread_counts:
-                unique_threads = sorted(set(thread_counts))
-                thread_text = (
-                    str(unique_threads[0])
-                    if len(unique_threads) == 1
-                    else ",".join(str(x) for x in unique_threads)
-                )
-                self.append_log(
-                    parent_id,
-                    (
-                        "[THREAD] 模型复用 worker 内部线程数="
-                        f"{thread_text}；首批预计计算线程总数={sum(thread_counts)}。"
-                    ),
-                )
         self.append_log(parent_id, "[POOL] 稳定进程池：最多同时运行 max_workers 个子任务；一个完成后补一个；检测到高负载时先等已有子任务完成，再决定是否补位。")
         self.append_log(parent_id, "[SAFE] 不再按模型文件大小直接降为 1；启动新子进程前检查 CPU/内存/磁盘，真正接近危险阈值时才暂停补位。")
 
-        if model_reuse_info:
-            first_thread_counts: List[int] = []
-            first_inner_workers: List[int] = []
-            for spec in jobs[:max_workers]:
-                env = spec.get("env") or {}
-                inputs = spec.get("inputs") or {}
-                try:
-                    first_thread_counts.append(max(1, int(
-                        env.get("LOCAL_WEB_RUNTIME_THREADS")
-                        or env.get("OMP_NUM_THREADS")
-                        or env.get("OPENBLAS_NUM_THREADS")
-                        or 1
-                    )))
-                except Exception:
-                    pass
-                try:
-                    first_inner_workers.append(max(1, int(inputs.get("parallel_workers") or inputs.get("_parallel_workers") or 1)))
-                except Exception:
-                    pass
-            if first_thread_counts or first_inner_workers:
-                thread_values = sorted(set(first_thread_counts or [1]))
-                inner_values = sorted(set(first_inner_workers or [1]))
-                thread_text = str(thread_values[0]) if len(thread_values) == 1 else ",".join(str(x) for x in thread_values)
-                inner_text = str(inner_values[0]) if len(inner_values) == 1 else ",".join(str(x) for x in inner_values)
-                self.append_log(
-                    parent_id,
-                    (
-                        "[POOL] 外层并行进程数="
-                        f"{max_workers}；子任务 config.parallel_workers={inner_text}；"
-                        f"每进程计算线程={thread_text}；预计总计算线程={sum(first_thread_counts or [max_workers])}。"
-                    ),
-                )
-
         progress = {"done": 0, "failed": 0}
-        progress_state = self._prepare_parallel_output_progress(jobs)
-        completed_success_units = 0
-        pool_capacity = min(
-            total,
-            max_workers + (self.dynamic_worker_boost_extra if self.dynamic_worker_boost_enabled else 0),
-        )
-        pool_capacity = max(max_workers, pool_capacity)
-        if progress_state.get("enabled"):
-            self.append_log(parent_id, "[PROGRESS] 已启用输出目录实时扫描：输出文件落盘后立即更新输入文件进度。")
-        output_driven_progress = bool(progress_state.get("enabled") and progress_state.get("require_outputs"))
-        if self.dynamic_worker_boost_enabled and pool_capacity > max_workers:
-            self.append_log(
-                parent_id,
-                (
-                    "[BOOST] 动态 CPU 监控已启用："
-                    f"CPU 低于 {self.dynamic_worker_boost_cpu_below:.0f}%、"
-                    f"内存低于 {self.dynamic_worker_boost_memory_below:.0f}%、"
-                    f"可用内存不少于 {self.dynamic_worker_boost_min_memory_gb:.1f}GB 时，"
-                    f"临时 worker 上限最多提高到 {pool_capacity}。"
-                ),
-            )
         with self.lock:
             start_gate = self.child_start_gate_locks.setdefault(parent_id, threading.Lock())
         learned_interval = self.learned_child_start_intervals.get(parent_id)
@@ -2341,21 +2091,12 @@ class TaskManager:
         failures = 0
         next_index = 0
 
-        with ThreadPoolExecutor(max_workers=pool_capacity) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             running: Dict[Any, int] = {}
             paused_by_pressure = False
             while (next_index < total or running) and parent_id not in self.cancel_flags:
                 launched_any = False
-                self._maybe_log_parallel_monitor(parent_id, len(running), max_workers, pool_capacity)
-                self._apply_parallel_output_progress(parent_id, progress, progress_total, progress_label, progress_state)
-                desired_workers = self._dynamic_parallel_worker_limit(
-                    parent_id,
-                    max_workers,
-                    pool_capacity,
-                    len(running),
-                    total - next_index,
-                )
-                while next_index < total and len(running) < desired_workers and parent_id not in self.cancel_flags:
+                while next_index < total and len(running) < max_workers and parent_id not in self.cancel_flags:
                     spec = jobs[next_index]
                     label = spec.get("label") or f"子任务 {next_index + 1}"
 
@@ -2364,7 +2105,7 @@ class TaskManager:
                     if paused_by_pressure and running:
                         break
 
-                    reason = self._runtime_pressure_reason(fast_refill=fast_refill)
+                    reason = self._runtime_pressure_reason()
                     if reason:
                         paused_by_pressure = True
                         now = time.time()
@@ -2373,32 +2114,32 @@ class TaskManager:
                             self._last_pressure_log_at[parent_id] = now
                             self.append_log(
                                 parent_id,
-                                f"[SAFE] 暂停启动新子任务 {label}：{reason}。当前运行 {len(running)} 个；已完成 {progress['done']}/{progress_total} 个{progress_label}。",
+                                f"[SAFE] 暂停启动新子任务 {label}：{reason}。当前运行 {len(running)} 个；已完成 {progress['done']}/{total}。",
                             )
                         break
 
                     with start_gate:
-                        self._wait_until_safe_to_start_child(parent_id, str(label), fast_refill=fast_refill)
+                        self._wait_until_safe_to_start_child(parent_id, str(label))
                         if parent_id in self.cancel_flags:
                             break
-                        if self.adaptive_child_start_enabled and not fast_refill and learned_interval is not None:
+                        if self.adaptive_child_start_enabled and learned_interval is not None:
                             if not self._sleep_before_adaptive_child_launch(parent_id, str(label), learned_interval, last_child_launch_at):
                                 break
-                            self._wait_until_safe_to_start_child(parent_id, str(label), fast_refill=fast_refill)
+                            self._wait_until_safe_to_start_child(parent_id, str(label))
                             if parent_id in self.cancel_flags:
                                 break
 
                         future = executor.submit(run_one, next_index, spec)
                         running[future] = next_index
-                        self.append_log(parent_id, f"[PARALLEL] 已提交分组 {next_index + 1}/{total}；当前运行 {len(running)}/{desired_workers}")
+                        self.append_log(parent_id, f"[PARALLEL] 已提交 {next_index + 1}/{total}；当前运行 {len(running)}/{max_workers}")
                         next_index += 1
                         launched_any = True
                         last_child_launch_at = time.time()
 
-                    if self.adaptive_child_start_enabled and not fast_refill and learned_interval is None and next_index < total:
+                    if self.adaptive_child_start_enabled and learned_interval is None and next_index < total:
                         learned_interval = self._learn_child_start_interval_after_first_launch(parent_id, str(label))
                         self.learned_child_start_intervals[parent_id] = learned_interval
-                    elif self.child_start_stagger_seconds > 0 and not fast_refill:
+                    elif self.child_start_stagger_seconds > 0:
                         time.sleep(self.child_start_stagger_seconds)
 
                 if not running:
@@ -2406,10 +2147,8 @@ class TaskManager:
                     time.sleep(max(1.0, self.child_launch_wait_seconds))
                     continue
 
-                self._apply_parallel_output_progress(parent_id, progress, progress_total, progress_label, progress_state)
                 done_set, _ = wait(set(running.keys()), timeout=1.0, return_when=FIRST_COMPLETED)
                 if not done_set and not launched_any:
-                    self._apply_parallel_output_progress(parent_id, progress, progress_total, progress_label, progress_state)
                     time.sleep(0.5)
                     continue
 
@@ -2419,7 +2158,6 @@ class TaskManager:
                 for future in done_set:
                     idx = running.pop(future, -1)
                     label = jobs[idx].get("label") if 0 <= idx < len(jobs) else "子任务"
-                    units = _job_progress_units(jobs[idx]) if 0 <= idx < len(jobs) else 1
                     try:
                         result = future.result()
                         child_id, status = result if result else (None, "cancelled")
@@ -2427,65 +2165,26 @@ class TaskManager:
                             failures += 1
                             if child_id:
                                 self._append_child_failure_to_parent(parent_id, child_id, label)
-                            progress["failed"] += units
-                        else:
-                            completed_success_units += units
-                            if not output_driven_progress:
-                                progress["done"] = max(
-                                    progress["done"],
-                                    min(progress_total, completed_success_units),
-                                )
+                        progress["done"] += 1
+                        progress["failed"] = failures
                         self.update_task(parent_id, parallel_done=progress["done"], parallel_failed=progress["failed"])
-                        self.append_log(parent_id, f"[PARALLEL] 完成 {progress['done'] + progress['failed']}/{progress_total} 个{progress_label}: {label}，状态={status}")
+                        self.append_log(parent_id, f"[PARALLEL] 完成 {progress['done']}/{total}: {label}，状态={status}")
                     except Exception as exc:
                         failures += 1
-                        progress["failed"] += units
+                        progress["done"] += 1
+                        progress["failed"] = failures
                         self.update_task(parent_id, parallel_done=progress["done"], parallel_failed=progress["failed"])
                         self.append_log(parent_id, f"[PARALLEL-ERROR] 子任务异常: {type(exc).__name__}: {exc}")
                         self.append_log(parent_id, traceback.format_exc())
 
         parent = self.get_task(parent_id) or {}
-        self._apply_parallel_output_progress(parent_id, progress, progress_total, progress_label, progress_state, force_log=True)
         children = parent.get("children") or []
         child_statuses = [(self.get_task(cid) or {}).get("status") for cid in children]
-
-        if parent_id not in self.cancel_flags and failures == 0 and progress_state.get("require_outputs"):
-            if progress_state.get("enabled"):
-                output_done = min(progress_total, len(progress_state.get("seen_ids") or set()))
-                if output_done < progress_total:
-                    missing = progress_total - output_done
-                    failures += missing
-                    progress["done"] = output_done
-                    progress["failed"] = max(progress["failed"], missing)
-                    self.update_task(parent_id, parallel_done=progress["done"], parallel_failed=progress["failed"])
-                    self.append_log(
-                        parent_id,
-                        (
-                            f"[OUTPUT-ERROR] 输出校验失败：预期生成 {progress_total} 个{progress_label}结果，"
-                            f"实际只识别到 {output_done} 个。EXE 可能返回了 0 但没有写出结果。"
-                        ),
-                    )
-            else:
-                failures += 1
-                progress["failed"] = max(progress["failed"], 1)
-                self.update_task(parent_id, parallel_failed=progress["failed"])
-                self.append_log(parent_id, "[OUTPUT-ERROR] 输出校验已启用，但没有找到可扫描的输出目录或输入标识。")
-
-        if (
-            parent_id not in self.cancel_flags
-            and failures == 0
-            and progress["done"] == progress_total
-            and all(s == "success" for s in child_statuses)
-        ):
-            if not self._run_parallel_tile_merge(parent_id):
-                failures += 1
-                progress["failed"] = failures
-                self.update_task(parent_id, parallel_failed=failures)
 
         if parent_id in self.cancel_flags or any(s == "cancelled" for s in child_statuses):
             final_status = "cancelled"
             return_code = -1
-        elif failures > 0 or progress["done"] < progress_total or any(s != "success" for s in child_statuses):
+        elif failures > 0 or progress["done"] < total or any(s != "success" for s in child_statuses):
             final_status = "failed"
             return_code = 1
         else:
@@ -2498,7 +2197,7 @@ class TaskManager:
             return_code=return_code,
             ended_at=now_iso(),
             parallel_done=progress["done"],
-            parallel_failed=max(progress["failed"], sum(1 for s in child_statuses if s != "success")),
+            parallel_failed=sum(1 for s in child_statuses if s != "success"),
         )
 
         self.append_log(parent_id, f"[PARALLEL] 并行任务结束，状态={final_status}")
@@ -2552,6 +2251,14 @@ class TaskManager:
             self.cancel_flags.add(task_id)
             any_stopped = False
             for child_id in task.get("children") or []:
+                dask_future = self.dask_futures.get(child_id)
+                if dask_future is not None:
+                    self._signal_dask_cancel(child_id)
+                    try:
+                        dask_future.cancel()
+                        any_stopped = True
+                    except Exception:
+                        pass
                 process = self.processes.get(child_id)
                 if process is not None:
                     try:
@@ -2575,6 +2282,24 @@ class TaskManager:
             self._save_tasks()
             self._cleanup_runtime_roots_for_task(task_id, reason="并行任务取消")
             return True or any_stopped
+
+        dask_future = self.dask_futures.get(task_id)
+        if dask_future is not None:
+            self._signal_dask_cancel(task_id)
+            try:
+                dask_future.cancel()
+            except Exception:
+                pass
+            with self.lock:
+                task = self.tasks.get(task_id)
+                if task:
+                    task["status"] = "cancelled"
+                    task["ended_at"] = now_iso()
+                    task["return_code"] = -1
+                    task.setdefault("logs", []).append("[SYSTEM] Dask 任务已请求取消")
+                self.dask_futures.pop(task_id, None)
+            self._save_tasks()
+            return True
 
         process = self.processes.get(task_id)
         if process is None:

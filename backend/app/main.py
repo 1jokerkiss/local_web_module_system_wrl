@@ -3,7 +3,6 @@ import sys
 import base64
 import json
 import io
-import math
 import os
 import re
 import shutil
@@ -22,33 +21,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 import stat
 import time
-from .auth import (
-    admin_reset_password,
-    create_token,
-    create_user,
-    delete_user,
-    get_current_user,
-    get_security_question,
-    load_users,
-    register_user,
-    remove_token,
-    require_admin,
-    reset_password_by_security_answer,
-    sanitize_user,
-    update_user_enabled,
-    update_user_role,
-    verify_user,
-)
+from .auth import (admin_reset_password,create_token,create_user,delete_user,get_current_user,get_security_question,load_users,register_user,remove_token,require_admin,reset_password_by_security_answer,sanitize_user,update_user_enabled,update_user_role,verify_user,)
 from .task_manager import TaskManager
-from .tif_tiles import (
-    build_tile_windows,
-    crop_tif_windows,
-    describe_tif,
-    distribute_windows_to_groups,
-    format_tif_profile,
-    get_tif_size,
-    is_tif_file,
-)
+from .dask_cluster_manager import DaskClusterError, DaskClusterManager
 
 
 def now_iso() -> str:
@@ -69,18 +44,9 @@ INSTALLED_MODULES_DIR.mkdir(parents=True, exist_ok=True)
 PYTHON_WHEELS_DIR = BASE_DIR / "python_wheels"
 PYTHON_WHEELS_DIR.mkdir(parents=True, exist_ok=True)
 
-STRICT_LOCAL_BINARY_PACKAGES = {
-    "gdal",
-    "rasterio",
-    "pyproj",
-    "cartopy",
-}
+STRICT_LOCAL_BINARY_PACKAGES = {"gdal","rasterio","pyproj","cartopy",}
 
-PREFER_LOCAL_BINARY_PACKAGES = {
-    "numpy",
-    "h5py",
-    "netcdf4",
-}
+PREFER_LOCAL_BINARY_PACKAGES = {"numpy","h5py","netcdf4",}
 # Python 源码模块的独立运行环境目录。
 # 方案二：不再把 Python 源码打包成 exe，而是为每个 Python 模块创建独立 venv，
 # 运行时使用该 venv 的 python.exe 执行入口脚本，并传入平台生成的 config.json。
@@ -91,7 +57,7 @@ PYTHON_MODULE_ENVS_DIR.mkdir(parents=True, exist_ok=True)
 MODULE_DROP_DIR = PROJECT_ROOT / "module_drop"
 MODULE_DROP_DIR.mkdir(parents=True, exist_ok=True)
 
-RUNTIME_DIR = Path(os.environ.get("LOCAL_WEB_RUNTIME_DIR") or (BASE_DIR / "runtime")).resolve()
+RUNTIME_DIR = BASE_DIR / "runtime"
 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
@@ -106,7 +72,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+dask_cluster_manager = DaskClusterManager(BASE_DIR, project_root=PROJECT_ROOT)
 task_manager = TaskManager(TASKS_FILE)
+task_manager.set_cluster_manager(dask_cluster_manager)
 
 
 @app.get("/api/system/resources")
@@ -149,7 +117,6 @@ class AddUserRequest(BaseModel):
 
 class UpdateUserRoleRequest(BaseModel):
     role: str
-
 
 class UpdateUserEnabledRequest(BaseModel):
     enabled: bool
@@ -223,25 +190,198 @@ class PythonFolderModuleUploadRequest(BaseModel):
 
 class PythonModuleConfigRequest(BaseModel):
     path: str
+
+
+class DaskInstallRequest(BaseModel):
+    package_spec: str = ""
+    upgrade: bool = False
+
+
+class DaskStartHeadRequest(BaseModel):
+    bind_ip: str = ""
+    scheduler_port: int = 8786
+    dashboard_port: int = 8787
+    api_port: int = 8000
+    worker_name: str = ""
+    nworkers: int = 1
+    nthreads: int = 1
+    memory_limit: str = "auto"
+    shared_runtime_root: str = ""
+    auto_install: bool = True
+
+
+class DaskJoinRequest(BaseModel):
+    head_ip: str
+    api_port: int = 8000
+    join_token: str
+    worker_name: str = ""
+    nworkers: int = 1
+    nthreads: int = 1
+    memory_limit: str = "auto"
+    auto_install: bool = True
+
+
+class DaskExecutionModeRequest(BaseModel):
+    mode: str = "local"
+    shared_runtime_root: str = ""
+
+
+class DaskFirewallRequest(BaseModel):
+    api_port: int = 8000
+    scheduler_port: int = 8786
+    dashboard_port: int = 8787
+
+
+class DaskSharedPathRequest(BaseModel):
+    path: str = ""
+
+
+# =========================
+# Dask 分布式集群管理 API
+# =========================
+@app.get("/api/distributed/status")
+def api_distributed_status(authorization: str | None = Header(default=None)):
+    user = get_current_user(authorization)
+    status = dask_cluster_manager.status()
+    if user.role != "admin":
+        status["join_token"] = ""
+    return status
+
+
+@app.post("/api/distributed/install")
+def api_distributed_install(
+    payload: DaskInstallRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return dask_cluster_manager.install(
+            package_spec=payload.package_spec,
+            upgrade=payload.upgrade,
+        )
+    except DaskClusterError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/distributed/firewall")
+def api_distributed_firewall(
+    payload: DaskFirewallRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    return dask_cluster_manager.open_firewall(
+        api_port=payload.api_port,
+        scheduler_port=payload.scheduler_port,
+        dashboard_port=payload.dashboard_port,
+    )
+
+
+@app.post("/api/distributed/start-head")
+def api_distributed_start_head(
+    payload: DaskStartHeadRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return dask_cluster_manager.start_head(
+            bind_ip=payload.bind_ip,
+            scheduler_port=payload.scheduler_port,
+            dashboard_port=payload.dashboard_port,
+            api_port=payload.api_port,
+            worker_name=payload.worker_name,
+            nworkers=payload.nworkers,
+            nthreads=payload.nthreads,
+            memory_limit=payload.memory_limit,
+            shared_runtime_root=payload.shared_runtime_root,
+            auto_install=payload.auto_install,
+        )
+    except DaskClusterError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/distributed/join-info")
+def api_distributed_join_info(token: str):
+    # 此接口供子节点后端执行加入握手；使用独立高强度随机令牌验证，
+    # 不复用浏览器登录 token。
+    try:
+        return dask_cluster_manager.get_join_info(token)
+    except DaskClusterError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+
+@app.post("/api/distributed/join")
+def api_distributed_join(
+    payload: DaskJoinRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return dask_cluster_manager.join_cluster(
+            head_ip=payload.head_ip,
+            api_port=payload.api_port,
+            join_token=payload.join_token,
+            worker_name=payload.worker_name,
+            nworkers=payload.nworkers,
+            nthreads=payload.nthreads,
+            memory_limit=payload.memory_limit,
+            auto_install=payload.auto_install,
+        )
+    except DaskClusterError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/distributed/leave")
+def api_distributed_leave(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    return dask_cluster_manager.leave_cluster()
+
+
+@app.post("/api/distributed/stop")
+def api_distributed_stop(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    return dask_cluster_manager.stop_cluster()
+
+
+@app.post("/api/distributed/execution-mode")
+def api_distributed_execution_mode(
+    payload: DaskExecutionModeRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return dask_cluster_manager.set_execution_mode(
+            payload.mode,
+            payload.shared_runtime_root,
+        )
+    except DaskClusterError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/distributed/test-shared-path")
+def api_distributed_test_shared_path(
+    payload: DaskSharedPathRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return dask_cluster_manager.test_shared_path(payload.path)
+    except DaskClusterError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/distributed/logs")
+def api_distributed_logs(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    return dask_cluster_manager.tail_logs()
+
+
 # 通用辅助函数
-VALID_PARALLEL_MODES = {
-    "none",
-    "auto",
-    "single_file",
-    "tif_tiles",
-    "folder_chunks",
-    "module_internal",
-    "batch_group",
-}
+VALID_PARALLEL_MODES = {"none","auto","single_file","folder_chunks","module_internal","batch_group",}
 DEFAULT_PARALLEL_PATTERNS = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
 
 # 初始默认工具栏。现在云反演 / 气溶胶反演也按普通动态工具栏处理，
 # 只在第一次创建 toolbars.json 时写入；之后不会强制重新合并回来。
-DEFAULT_TOOLBARS = [
-    {"key": "cloud", "label": "云反演", "system": False},
-    {"key": "aerosol", "label": "气溶胶反演", "system": False},
-]
-
+DEFAULT_TOOLBARS = [{"key": "cloud", "label": "云反演", "system": False},{"key": "aerosol", "label": "气溶胶反演", "system": False},]
 
 CHINESE_PATH_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 PATH_LIKE_KEY_PATTERN = re.compile(
@@ -254,49 +394,8 @@ def contains_chinese_text(value: Any) -> bool:
     return bool(CHINESE_PATH_PATTERN.search(str(value or "")))
 
 
-CHINESE_TEXT_METADATA_KEYS = {
-    # 这些字段是 UI 展示文案，不是文件系统路径，允许中文。
-    "label",
-    "placeholder",
-    "help_text",
-    "description",
-    "name",
-    "module_name",
-    "title",
-    "tool_type_label",
-    "category_label",
-    "display_name",
-    "message",
-    "suggestion",
-    "example",
-    "unit",
-    "group",
-}
-
-
-def _last_key_segment(key_path: str) -> str:
-    text = str(key_path or "")
-    if not text:
-        return ""
-    # 例如：可执行模块配置路径.inputs[0].help_text -> help_text
-    last = text.split(".")[-1]
-    # 例如：inputs[0] -> inputs
-    if "[" in last:
-        last = last.split("[", 1)[0]
-    return last.strip()
-
-
-def is_chinese_text_metadata_key(key_path: str) -> bool:
-    return _last_key_segment(key_path) in CHINESE_TEXT_METADATA_KEYS
-
-
 def is_path_like_key(key: str) -> bool:
     return bool(PATH_LIKE_KEY_PATTERN.search(str(key or "")))
-
-
-def is_path_like_leaf_key(key: str) -> bool:
-    """只根据最后一级字段名判断是否像路径，避免 inputs[0].label 被误判。"""
-    return bool(PATH_LIKE_KEY_PATTERN.search(_last_key_segment(key)))
 
 
 def is_path_like_value(value: str) -> bool:
@@ -324,16 +423,7 @@ def collect_chinese_path_items(value: Any, prefix: str = "路径") -> list[dict]
 
         if isinstance(v, str):
             text = v.strip()
-            if not text or not contains_chinese_text(text):
-                return
-
-            # label / placeholder / help_text / description 等是 UI 文案，允许中文。
-            if is_chinese_text_metadata_key(key_path):
-                return
-
-            # 只有“值本身像路径”，或者“最后一级字段名像路径”时，才按中文路径处理。
-            # 这样 inputs[0].label = "PARASOL 输入文件" 不再被误判为路径。
-            if is_path_like_value(text) or is_path_like_leaf_key(key_path):
+            if text and contains_chinese_text(text) and (is_path_like_value(text) or is_path_like_key(key_path)):
                 items.append({"field": key_path or "路径", "path": text})
             return
 
@@ -712,7 +802,6 @@ def normalize_module_record(module: dict) -> dict:
         return {}
     copied = dict(module)
     copied["tool_type"] = guess_module_tool_type(copied)
-    copied["category"] = copied["tool_type"]
     copied["parallel"] = normalize_parallel_config(copied)
     # 旧版本的并行平铺字段不再写回，避免管理页面变乱。
     for key in [
@@ -1514,34 +1603,12 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
     if run_mode == "platform_split":
         jobs = prepare_parallel_jobs(module, inputs, workers)
 
-        if jobs:
+        if len(jobs) > 1:
             task_inputs = dict(inputs)
             task_inputs["parallel_workers"] = workers
             task_inputs["_parallel_workers"] = workers
             task_inputs["_parallel_job_count"] = len(jobs)
             task_inputs["_parallel_mode"] = str(normalize_parallel_config(module).get("mode") or "auto")
-
-            actual_parallel_mode = next((job.get("actual_parallel_mode") for job in jobs if job.get("actual_parallel_mode")), None)
-            if actual_parallel_mode:
-                task_inputs["_parallel_mode"] = str(actual_parallel_mode)
-
-            # 关键修改：PARASOL 强制开启快速补位
-            module_id_lower = str(module.get("id") or "").lower()
-            module_name_lower = str(module.get("name") or "").lower()
-            if "parasol" in module_id_lower or "parasol" in module_name_lower:
-                task_inputs["_parallel_fast_refill"] = True
-            model_reuse_info = next((job.get("model_reuse_info") for job in jobs if job.get("model_reuse_info")), None)
-            if model_reuse_info:
-                task_inputs["_parallel_model_reuse_grouped"] = True
-                task_inputs["_parallel_model_reuse_info"] = model_reuse_info
-                task_inputs["_parallel_fast_refill"] = True
-            tile_merge_plan = next((job.get("tile_merge_plan") for job in jobs if job.get("tile_merge_plan")), None)
-            if tile_merge_plan:
-                task_inputs["_parallel_mode"] = "tif_tiles"
-                task_inputs["_parallel_fast_refill"] = True
-                task_inputs["_parallel_tile_merge_plan"] = tile_merge_plan
-            elif any(job.get("fast_refill") for job in jobs):
-                task_inputs["_parallel_fast_refill"] = True
 
             task = task_manager.submit_parallel_module_task(
                 module_id=module["id"],
@@ -1611,21 +1678,6 @@ def _is_path_inside(child: Path, parent: Path) -> bool:
         return False
 
 
-def _make_path_writable(path: Path):
-    try:
-        mode = path.stat().st_mode
-        os.chmod(path, mode | stat.S_IWRITE | stat.S_IREAD)
-    except Exception:
-        pass
-
-
-def _remove_readonly_and_retry(func, path: str, exc_info):
-    target = Path(path)
-    _make_path_writable(target)
-    time.sleep(0.1)
-    func(path)
-
-
 def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
     """
     只允许删除指定安全目录下的文件或文件夹。
@@ -1646,12 +1698,8 @@ def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
 
     try:
         if path.is_dir():
-            for item in path.rglob("*"):
-                _make_path_writable(item)
-            _make_path_writable(path)
-            shutil.rmtree(path, ignore_errors=False, onerror=_remove_readonly_and_retry)
+            shutil.rmtree(path, ignore_errors=False)
         else:
-            _make_path_writable(path)
             path.unlink()
 
         return {
@@ -1659,16 +1707,9 @@ def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
             "status": "deleted",
         }
     except Exception as exc:
-        if isinstance(exc, PermissionError):
-            reason = (
-                f"删除模块本地文件失败: {path}，原因: {exc}。"
-                "请先确认该模块的 EXE/DLL 没有正在运行，也没有被资源管理器或杀毒软件占用。"
-            )
-        else:
-            reason = f"删除模块本地文件失败: {path}，原因: {exc}"
         raise HTTPException(
             status_code=500,
-            detail=reason,
+            detail=f"删除模块本地文件失败: {path}，原因: {exc}",
         )
 
 
@@ -2026,10 +2067,6 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
         """
         cpu_count = max(1, int(os.cpu_count() or 1))
 
-        forced_threads = values.get("_force_runtime_threads")
-        if forced_threads not in (None, ""):
-            return max(1, min(cpu_count, _as_int(forced_threads, 1)))
-
         explicit = os.environ.get("LOCAL_WEB_CHILD_NUM_THREADS", "").strip()
         if explicit:
             return max(1, min(cpu_count, _as_int(explicit, 1)))
@@ -2056,6 +2093,18 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
             1,
         )
 
+        # 总计算线程预算：默认只用一部分 CPU，避免多进程 + 多线程把电脑打满。
+        total_budget = _as_int(
+            os.environ.get("LOCAL_WEB_TOTAL_COMPUTE_THREADS"),
+            max(1, min(cpu_count, max(2, cpu_count // 2))),
+        )
+
+        # 单个子进程最多线程数。
+        max_threads_per_child = _as_int(
+            os.environ.get("LOCAL_WEB_MAX_THREADS_PER_CHILD"),
+            4,
+        )
+
         is_platform_child = bool(
             values.get("_parallel_index")
             or values.get("_parallel_total")
@@ -2063,58 +2112,9 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
             or values.get("_batch_index")
             or values.get("_batch_total")
         )
-        is_model_reuse_child = bool(values.get("_parallel_model_reuse_grouped"))
-
-        if is_model_reuse_child:
-            fixed_resource_gb = 0.0
-            try:
-                fixed_resource_gb = float(values.get("_parallel_model_reuse_fixed_resource_gb") or 0.0)
-            except Exception:
-                fixed_resource_gb = 0.0
-
-            # 大模型复用时 worker 数量少且生命周期长，可以比通用策略多用一些 CPU。
-            # 但 sklearn/joblib 模型会在 predict 内部再并行，2GB 以上模型默认收紧到约 3 线程/worker，
-            # 避免 4 个外层 worker * 多个内层 joblib 进程把内存瞬间打爆。
-            if fixed_resource_gb >= 2.0:
-                default_total_budget = min(cpu_count, max(pool_size, pool_size * 4))
-            elif fixed_resource_gb >= 1.0:
-                default_total_budget = min(cpu_count, max(pool_size, pool_size * 4))
-            else:
-                default_total_budget = cpu_count
-
-            total_budget = _as_int(
-                os.environ.get("LOCAL_WEB_MODEL_REUSE_TOTAL_THREADS")
-                or os.environ.get("LOCAL_WEB_TOTAL_COMPUTE_THREADS"),
-                default_total_budget,
-            )
-            total_budget = max(1, min(cpu_count, total_budget))
-            default_max_threads_per_child = max(1, int(math.ceil(total_budget / max(1, pool_size))))
-            max_threads_per_child = _as_int(
-                os.environ.get("LOCAL_WEB_MODEL_REUSE_MAX_THREADS_PER_CHILD")
-                or os.environ.get("LOCAL_WEB_MAX_THREADS_PER_CHILD"),
-                default_max_threads_per_child,
-            )
-            max_threads_per_child = max(1, min(cpu_count, max_threads_per_child))
-        else:
-            # 总计算线程预算：默认只用一部分 CPU，避免多进程 + 多线程把电脑打满。
-            total_budget = _as_int(
-                os.environ.get("LOCAL_WEB_TOTAL_COMPUTE_THREADS"),
-                max(1, min(cpu_count, max(2, cpu_count // 2))),
-            )
-            total_budget = max(1, min(cpu_count, total_budget))
-
-            # 单个子进程最多线程数。
-            max_threads_per_child = _as_int(
-                os.environ.get("LOCAL_WEB_MAX_THREADS_PER_CHILD"),
-                4,
-            )
-            max_threads_per_child = max(1, min(cpu_count, max_threads_per_child))
 
         if mode in {"single_file", "folder_chunks", "batch_group"} or is_platform_child:
-            if is_model_reuse_child:
-                per_child = max(1, int(math.ceil(total_budget / max(1, pool_size))))
-            else:
-                per_child = max(1, total_budget // max(1, pool_size))
+            per_child = max(1, total_budget // max(1, pool_size))
             return max(1, min(cpu_count, max_threads_per_child, per_child))
 
         if mode in {"none", "module_internal"}:
@@ -2131,7 +2131,6 @@ def build_runtime_for_module(module: dict, inputs: Dict[str, Any]) -> tuple[list
     runtime_env["MKL_NUM_THREADS"] = str(runtime_threads)
     runtime_env["NUMEXPR_NUM_THREADS"] = str(runtime_threads)
     runtime_env["LOCAL_WEB_RUNTIME_THREADS"] = str(runtime_threads)
-    runtime_env["LOKY_MAX_CPU_COUNT"] = str(runtime_threads)
     # 统一 Python 子进程输出编码，避免中文路径、tqdm 进度条在日志窗口乱码
     runtime_env["PYTHONIOENCODING"] = "utf-8"
     runtime_env["PYTHONUTF8"] = "1"
@@ -3471,18 +3470,12 @@ def _normalize_new_executable_manifest(module_root: Path, manifest_path: Path, r
 
     inputs = _infer_executable_inputs_from_config(param_json or {}, source_path, {"parallel": parallel_cfg})
 
-    # 如果声明了 PARASOL 成对输入，不再强制只认 JD/JL。
-    # 旧数据可能是 JD/JL，新 ICARE L1_B 常见是 MD/ML；
-    # 这里默认允许扫描全部无扩展名原始文件，后续由动态配对规则筛选主文件。
-    if isinstance(parallel_cfg, dict) and (
-        parallel_cfg.get("jd_jl_pair") is True
-        or parallel_cfg.get("jd_only") is True
-        or str(parallel_cfg.get("pair_mode") or "").strip().lower() in {"auto", "dynamic", "suffix_pair", "paired"}
-    ):
+    # 如果声明了 JD/JL 配对，确保输入字段只按 JD 生成任务。
+    if isinstance(parallel_cfg, dict) and (parallel_cfg.get("jd_jl_pair") is True or parallel_cfg.get("jd_only") is True):
         for item in inputs:
             if item.get("batch_role") == "input":
-                item["file_patterns"] = parallel_cfg.get("file_patterns") or "*"
-                item.pop("batch_include_regex", None)
+                item["file_patterns"] = parallel_cfg.get("file_patterns") or "*jd*;*JD*"
+                item["batch_include_regex"] = r"(?i)jd(?=[_.-])"
 
     # 内部 module 记录仍沿用 executable 字段。
     # 如果 source_dir 不是根目录，executable 需要保存为相对模块根目录的路径，
@@ -5025,7 +5018,7 @@ def api_install_modules_from_local_drop(
 # =========================
 # 并行执行辅助逻辑
 # =========================
-VALID_PARALLEL_MODES = {"none", "auto", "single_file", "tif_tiles", "folder_chunks", "module_internal", "batch_group"}
+VALID_PARALLEL_MODES = {"none", "auto", "single_file", "folder_chunks", "module_internal"}
 DEFAULT_PARALLEL_PATTERNS = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
 
 
@@ -5253,31 +5246,16 @@ def resolve_run_parallel_mode(module: dict, inputs: dict, workers: int) -> str:
     if mode == "batch_group":
         return "batch_group"
 
-    # 显式平台拆分：无论 workers 是 1 还是多个，都走平台拆分。
-    # 这样用户传入文件夹时，平台始终先拆成单文件子任务；
-    # workers=1 表示“一个 exe 顺序跑这些子任务”，workers>1 表示“多个 exe 并行跑”。
-    if mode in {"single_file", "tif_tiles", "folder_chunks"}:
-        return "platform_split"
+    # 显式平台拆分。
+    if mode in {"single_file", "folder_chunks"}:
+        return "platform_split" if workers > 1 else "none"
 
     # auto 模式：
     # 1. 如果配置了 batch_role，例如 B01/B03/B06/SOLAR，走批处理；
-    # 2. 如果输入字段是文件夹，也走平台拆分，即使 workers=1；
-    # 3. workers>1 时继续沿用原来的自动平台拆分行为；
-    # 4. 其它情况才普通单进程运行。
+    # 2. 否则 workers > 1 才走平台拆分；
+    # 3. workers == 1 就普通运行。
     if _is_batch_request(module, inputs):
         return "batch_group"
-
-    input_key = choose_parallel_input_key(module, inputs)
-    if input_key:
-        input_value = inputs.get(input_key)
-        if input_value not in ("", None):
-            try:
-                p = Path(str(input_value))
-                inferred_mode = infer_parallel_mode(module, inputs, input_key)
-                if p.is_dir() and inferred_mode in {"single_file", "tif_tiles", "folder_chunks"}:
-                    return "platform_split"
-            except Exception:
-                pass
 
     if workers > 1:
         return "platform_split"
@@ -5445,365 +5423,18 @@ def split_evenly(items: list[Path], parts: int) -> list[list[Path]]:
     return [bucket for bucket in buckets if bucket]
 
 
-def split_files_by_size(items: list[Path], parts: int) -> list[list[Path]]:
-    parts = max(1, min(int(parts or 1), max(1, len(items))))
-    buckets: list[list[Path]] = [[] for _ in range(parts)]
-    loads = [0 for _ in range(parts)]
-
-    def file_size(path: Path) -> int:
-        try:
-            return int(path.stat().st_size)
-        except Exception:
-            return 0
-
-    for item in sorted(items, key=file_size, reverse=True):
-        idx = min(range(parts), key=lambda i: (loads[i], len(buckets[i])))
-        buckets[idx].append(item)
-        loads[idx] += file_size(item)
-
-    for bucket in buckets:
-        bucket.sort(key=lambda p: str(p).lower())
-    return [bucket for bucket in buckets if bucket]
-
-
-def should_group_folder_chunks_for_model_reuse(
-    module: dict,
-    files: list[Path],
-    workers: int,
-    files_per_job: int,
-) -> tuple[bool, dict]:
-    flag = str(os.environ.get("LOCAL_WEB_MODEL_REUSE_GROUP_CHUNKS", "1") or "1").strip().lower()
-    if flag in {"0", "false", "no", "off"}:
-        return False, {}
-
-    workers = max(1, int(workers or 1))
-    files_per_job = max(1, int(files_per_job or 1))
-    current_job_count = int(math.ceil(len(files) / files_per_job)) if files else 0
-    load_once = _env_bool("LOCAL_WEB_MODEL_LOAD_ONCE", False) or flag in {"once", "single", "one", "load_once"}
-
-    if not load_once and (len(files) <= workers or current_job_count <= workers):
-        return False, {}
-
-    try:
-        override_group_count = int(os.environ.get("LOCAL_WEB_MODEL_REUSE_WORKERS", "") or 0)
-    except Exception:
-        override_group_count = 0
-
-    resource_bytes, resource_examples = estimate_fixed_resource_bytes(module)
-    resource_gb = _gb(resource_bytes)
-    threshold_gb = _env_float("LOCAL_WEB_MODEL_REUSE_MIN_RESOURCE_GB", 1.0, minimum=0.0)
-    force = flag in {"force", "always", "on_force"}
-    enabled = load_once or force or resource_gb >= threshold_gb
-    if not enabled:
-        return False, {
-            "fixed_resource_gb": resource_gb,
-            "threshold_gb": threshold_gb,
-        }
-
-    large_resource_group_cap_gb = _env_float("LOCAL_WEB_MODEL_REUSE_LARGE_RESOURCE_GROUP_CAP_GB", 2.0, minimum=0.0)
-    large_resource_group_cap_applied = False
-    if load_once:
-        grouped_job_count = 1
-    elif override_group_count > 0:
-        grouped_job_count = max(1, min(override_group_count, current_job_count, len(files)))
-    elif large_resource_group_cap_gb > 0 and resource_gb >= large_resource_group_cap_gb and not force:
-        # Big model/resource files are expensive to reload. For these modules, fewer long-lived
-        # workers beat extra refill groups because every extra group reloads the fixed resources.
-        grouped_job_count = min(current_job_count, workers, len(files))
-        large_resource_group_cap_applied = True
-    else:
-        refill_multiplier = _env_int("LOCAL_WEB_MODEL_REUSE_REFILL_MULTIPLIER", 2, minimum=1)
-        grouped_job_count = min(current_job_count, max(workers, workers * refill_multiplier), len(files))
-
-    return True, {
-        "fixed_resource_gb": resource_gb,
-        "threshold_gb": threshold_gb,
-        "original_job_count": current_job_count,
-        "grouped_job_count": grouped_job_count,
-        "large_resource_group_cap_gb": large_resource_group_cap_gb,
-        "large_resource_group_cap_applied": large_resource_group_cap_applied,
-        "files_per_job": files_per_job,
-        "resource_examples": resource_examples,
-        "forced": force,
-        "load_once": load_once,
-    }
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw in (None, ""):
-        return default
-    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
-
-
-def _env_int(name: str, default: int, minimum: int = 0) -> int:
-    try:
-        return max(minimum, int(os.environ.get(name, "") or default))
-    except Exception:
-        return max(minimum, default)
-
-
-def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
-    try:
-        return max(minimum, float(os.environ.get(name, "") or default))
-    except Exception:
-        return max(minimum, default)
-
-
-def choose_parallel_output_key(module: dict, inputs: dict) -> str:
-    explicit = str(normalize_parallel_config(module).get("output_key") or "").strip()
-    if explicit:
-        return explicit
-
-    for field in module.get("inputs", []) or []:
-        key = field.get("key")
-        if key and is_output_field(field) and key in inputs:
-            return str(key)
-    return ""
-
-
-def _tile_output_suffix(module: dict) -> str:
-    suffix = str(normalize_parallel_config(module).get("output_suffix") or ".tif").strip() or ".tif"
-    if not suffix.startswith("."):
-        suffix = "." + suffix
-    return suffix
-
-
-def _resolve_tif_tile_final_output(module: dict, inputs: dict, output_key: str, source_file: Path) -> Path:
-    if not output_key:
-        raise HTTPException(
-            status_code=400,
-            detail="TIF 瓦片并行需要明确输出字段，请在模块输入里配置输出文件或输出目录。",
-        )
-
-    output_value = str(inputs.get(output_key) or "").strip()
-    if not output_value:
-        raise HTTPException(status_code=400, detail=f"TIF 瓦片并行输出字段为空: {output_key}")
-
-    suffix = _tile_output_suffix(module)
-    output_path = Path(output_value)
-    if is_probably_dir_output(module, output_key, output_value):
-        output_path.mkdir(parents=True, exist_ok=True)
-        return (output_path / f"{source_file.stem}{suffix}").resolve()
-
-    if output_path.suffix:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        return output_path.resolve()
-
-    output_path.mkdir(parents=True, exist_ok=True)
-    return (output_path / f"{source_file.stem}{suffix}").resolve()
-
-
-def _should_split_tif_tiles(module: dict, source_file: Path, workers: int) -> bool:
-    if workers <= 1 or not is_tif_file(source_file):
-        return False
-
-    flag = str(os.environ.get("LOCAL_WEB_TIF_TILE_SPLIT", "0") or "0").strip().lower()
-    if flag in {"0", "false", "no", "off"}:
-        return False
-
-    explicit_mode = str(normalize_parallel_config(module).get("mode") or "").strip().lower()
-    force = explicit_mode == "tif_tiles" or flag in {"force", "always", "on_force"}
-    if force:
-        return True
-
-    min_mb = _env_float("LOCAL_WEB_TIF_TILE_MIN_MB", 64.0, minimum=0.0)
-    try:
-        size_mb = source_file.stat().st_size / (1024 * 1024)
-    except Exception:
-        size_mb = min_mb
-    return size_mb >= min_mb
-
-
-def _can_group_tif_tiles_for_model_reuse(module: dict, inputs: dict, input_key: str, output_key: str) -> bool:
-    if not _env_bool("LOCAL_WEB_TIF_TILE_GROUP_WORKERS", True):
-        return False
-    if not output_key:
-        return False
-
-    input_meta = field_meta(module, input_key)
-    output_value = str(inputs.get(output_key) or "").strip()
-    if not output_value:
-        return False
-
-    # Directory-style modules can usually process all files inside the folder in one process.
-    # That lets a large model load once per worker instead of once per tile.
-    return (
-        str(input_meta.get("type") or "").lower() == "dir_path"
-        and is_probably_dir_output(module, output_key, output_value)
-    )
-
-
-def _make_tif_tile_job_inputs(base_inputs: dict, input_key: str, input_value: Path, output_key: str, output_value: Path | None, workers: int) -> dict:
-    job_inputs = dict(base_inputs)
-    job_inputs[input_key] = str(input_value.resolve())
-    if output_key and output_value is not None:
-        job_inputs[output_key] = str(output_value.resolve())
-
-    job_inputs["parallel_workers"] = 1
-    job_inputs["_parallel_workers"] = 1
-    job_inputs["_parallel_pool_size"] = max(1, int(workers or 1))
-    job_inputs["_force_runtime_threads"] = 1
-    job_inputs["_parallel_tif_tile"] = True
-    return job_inputs
-
-
-def build_tif_tile_parallel_jobs(
-    module: dict,
-    inputs: dict,
-    input_key: str,
-    source_file: Path,
-    workers: int,
-) -> list[dict]:
-    workers = clamp_parallel_workers(workers)
-    output_key = choose_parallel_output_key(module, inputs)
-    final_output = _resolve_tif_tile_final_output(module, inputs, output_key, source_file)
-    width, height = get_tif_size(source_file)
-
-    multiplier = _env_int("LOCAL_WEB_TIF_TILE_MULTIPLIER", 4, minimum=1)
-    overlap = _env_int("LOCAL_WEB_TIF_TILE_OVERLAP_PIXELS", 0, minimum=0)
-    windows = build_tile_windows(width, height, workers, multiplier=multiplier, overlap=overlap)
-    if len(windows) <= 1:
-        return []
-
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    safe_stem = sanitize_filename(source_file.stem) or "input"
-    tile_root = RUNTIME_DIR / "parallel_chunks" / f"tif_tiles_{run_id}_{safe_stem}"
-    tile_root.mkdir(parents=True, exist_ok=True)
-
-    suffix = _tile_output_suffix(module)
-    grouped = _can_group_tif_tiles_for_model_reuse(module, inputs, input_key, output_key)
-    merge_plan: dict[str, Any] = {
-        "kind": "tif_tiles",
-        "source_path": str(source_file.resolve()),
-        "output_path": str(final_output.resolve()),
-        "width": int(width),
-        "height": int(height),
-        "overlap": int(overlap),
-        "tiles": [],
-    }
-
-    jobs: list[dict] = []
-    crop_specs: list[dict[str, Any]] = []
-
-    def add_tile_to_plan(win: dict, tile_input: Path, expected_output: Path | None, output_dir: Path | None):
-        tile_stem = tile_input.stem
-        merge_plan["tiles"].append({
-            **win,
-            "input_path": str(tile_input.resolve()),
-            "tile_stem": tile_stem,
-            "expected_output_path": str(expected_output.resolve()) if expected_output is not None else "",
-            "output_dir": str(output_dir.resolve()) if output_dir is not None else "",
-        })
-
-    if grouped:
-        groups = distribute_windows_to_groups(windows, workers)
-        for group_idx, group in enumerate(groups, start=1):
-            group_input_dir = tile_root / "inputs" / f"worker_{group_idx:02d}"
-            group_output_dir = tile_root / "outputs" / f"worker_{group_idx:02d}"
-            group_input_dir.mkdir(parents=True, exist_ok=True)
-            group_output_dir.mkdir(parents=True, exist_ok=True)
-
-            for win in group:
-                tile_name = f"{safe_stem}_tile_{int(win['index']):04d}.tif"
-                tile_input = group_input_dir / tile_name
-                crop_specs.append({
-                    "path": str(tile_input.resolve()),
-                    "x": int(win["read_x"]),
-                    "y": int(win["read_y"]),
-                    "width": int(win["read_width"]),
-                    "height": int(win["read_height"]),
-                })
-                add_tile_to_plan(win, tile_input, None, group_output_dir)
-
-            job_inputs = _make_tif_tile_job_inputs(
-                inputs,
-                input_key,
-                group_input_dir,
-                output_key,
-                group_output_dir,
-                workers,
-            )
-            job_inputs["_parallel_index"] = group_idx
-            job_inputs["_parallel_total"] = len(groups)
-            job_inputs["_parallel_tile_count"] = len(group)
-            command, working_dir, runtime_env = build_runtime_for_module(module, job_inputs)
-            jobs.append({
-                "module_id": module.get("id", ""),
-                "module_name": module.get("name", module.get("id", "")),
-                "label": f"{source_file.name} tiles worker {group_idx}/{len(groups)} ({len(group)} tiles)",
-                "command": command,
-                "working_dir": working_dir,
-                "env": runtime_env,
-                "inputs": job_inputs,
-                "cleanup_root": str(tile_root.resolve()),
-                "tile_merge_plan": merge_plan,
-            })
-    else:
-        input_dir = tile_root / "inputs"
-        output_dir = tile_root / "outputs"
-        input_dir.mkdir(parents=True, exist_ok=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        for idx, win in enumerate(windows, start=1):
-            tile_name = f"{safe_stem}_tile_{int(win['index']):04d}.tif"
-            tile_input = input_dir / tile_name
-            tile_output = output_dir / tile_name
-            crop_specs.append({
-                "path": str(tile_input.resolve()),
-                "x": int(win["read_x"]),
-                "y": int(win["read_y"]),
-                "width": int(win["read_width"]),
-                "height": int(win["read_height"]),
-            })
-            add_tile_to_plan(win, tile_input, tile_output, None)
-
-            job_inputs = _make_tif_tile_job_inputs(
-                inputs,
-                input_key,
-                tile_input,
-                output_key,
-                tile_output,
-                workers,
-            )
-            job_inputs["_parallel_index"] = idx
-            job_inputs["_parallel_total"] = len(windows)
-            command, working_dir, runtime_env = build_runtime_for_module(module, job_inputs)
-            jobs.append({
-                "module_id": module.get("id", ""),
-                "module_name": module.get("name", module.get("id", "")),
-                "label": f"{source_file.name} tile {idx}/{len(windows)}",
-                "command": command,
-                "working_dir": working_dir,
-                "env": runtime_env,
-                "inputs": job_inputs,
-                "cleanup_root": str(tile_root.resolve()),
-                "tile_merge_plan": merge_plan,
-            })
-
-    crop_engines = crop_tif_windows(source_file, crop_specs)
-
-    for job in jobs:
-        job["tile_merge_plan"]["crop_engines"] = sorted(crop_engines)
-        job["tile_merge_plan"]["grouped_for_model_reuse"] = bool(grouped)
-        job["tile_merge_plan"]["tile_count"] = len(windows)
-        job["tile_merge_plan"]["job_count"] = len(jobs)
-        job["tile_merge_plan"]["workers"] = workers
-
-    return jobs
-
-
 def link_or_copy_file(src: Path, dst: Path) -> str:
-    """为并行子任务创建输入文件引用，不复制输入大文件。
+    """为并行子任务创建输入文件引用，默认只创建符号链接，不复制输入大文件。
 
     说明：
-    - hardlink：普通用户可创建，不是物理复制，但要求源文件和 runtime 在同一磁盘分区；
-    - symlink：目录中显示为链接，但 Windows 普通用户通常需要开发者模式或管理员权限；
+    - symlink：目录中显示为链接，最能直观看出不是复制文件；
+    - hardlink：不是物理复制，但资源管理器里看起来像普通文件，容易被误认为复制；
     - copy/copy2：本函数已彻底禁用，不会再把 NC/HDF/TIF 大文件复制到 runtime。
 
     默认策略：
-    - 优先 hardlink，保证双击启动脚本时不需要管理员权限；
-    - 如需 symlink，可显式设置 LOCAL_WEB_ALLOW_INPUT_SYMLINKS=1 并开启 Windows 开发者模式。
+    - 只尝试 symlink；
+    - 如果需要兼容不支持 symlink 的环境，可显式设置 LOCAL_WEB_ALLOW_INPUT_HARDLINKS=1，
+      此时 symlink 失败后才允许 hardlink。
     """
     src = Path(src).resolve()
     dst = Path(dst)
@@ -5826,15 +5457,16 @@ def link_or_copy_file(src: Path, dst: Path) -> str:
 
     errors: list[str] = []
 
-    raw_order = str(os.environ.get("LOCAL_WEB_INPUT_LINK_ORDER", "hardlink,symlink") or "hardlink,symlink")
+    # 默认只用 symlink，避免 hardlink 在资源管理器里显示成“普通大文件”而被误判为复制。
+    raw_order = str(os.environ.get("LOCAL_WEB_INPUT_LINK_ORDER", "symlink") or "symlink")
     order = [
         item.strip().lower()
         for item in raw_order.replace("；", ",").replace(";", ",").split(",")
         if item.strip()
-    ] or ["hardlink", "symlink"]
+    ] or ["symlink"]
 
-    allow_symlink = str(os.environ.get("LOCAL_WEB_ALLOW_INPUT_SYMLINKS", "0")).strip().lower() in {"1", "true", "yes", "on"}
-    allow_hardlink = str(os.environ.get("LOCAL_WEB_ALLOW_INPUT_HARDLINKS", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    allow_symlink = str(os.environ.get("LOCAL_WEB_ALLOW_INPUT_SYMLINKS", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    allow_hardlink = str(os.environ.get("LOCAL_WEB_ALLOW_INPUT_HARDLINKS", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
     def try_symlink() -> str | None:
         if not allow_symlink:
@@ -5862,7 +5494,7 @@ def link_or_copy_file(src: Path, dst: Path) -> str:
             return None
 
     tried: set[str] = set()
-    for mode in order + ["hardlink"]:
+    for mode in order + ["symlink"]:
         if mode in tried:
             continue
         tried.add(mode)
@@ -5881,17 +5513,18 @@ def link_or_copy_file(src: Path, dst: Path) -> str:
     raise HTTPException(
         status_code=400,
         detail={
-            "message": "无法为并行子任务创建输入文件引用。为避免复制输入大文件，系统已中止任务。",
+            "message": "无法为并行子任务创建输入文件符号链接。为避免复制输入大文件，系统已中止任务。",
             "errors": [
                 {
-                    "field": "parallel.input_link",
+                    "field": "parallel.input_symlink",
                     "message": f"源文件: {src}；目标位置: {dst}",
-                    "suggestion": "默认使用 hardlink，无需管理员权限；hardlink 要求输入文件和 runtime 在同一磁盘分区。请把输入数据放到项目同一盘，或开启 Windows 开发者模式后允许 symlink。",
+                    "suggestion": "请用管理员身份运行 start_backend.bat，或开启 Windows 开发者模式，以允许创建符号链接。",
                 }
             ],
             "suggestions": [
-                "推荐：把输入数据和项目目录放在同一个磁盘分区，例如都放在 D: 盘；系统会用 hardlink 引用文件，不会复制大文件。",
-                "如必须跨盘读取输入文件，可开启 Windows 开发者模式，并设置 LOCAL_WEB_ALLOW_INPUT_SYMLINKS=1 后使用 symlink。",
+                "Windows 推荐：设置 → 系统 → 开发者选项 → 开启开发人员模式，然后重启系统。",
+                "或者右键 start_backend.bat，选择“以管理员身份运行”。",
+                "如果你接受 hardlink 形式，可在启动脚本中设置 LOCAL_WEB_ALLOW_INPUT_HARDLINKS=1；hardlink 不是复制，但资源管理器里看起来像普通文件。",
                 "本版本已禁用 copy/copy2，不会再把 NC/HDF/TIF 大文件复制到 runtime。",
             ],
             "debug": "; ".join(errors),
@@ -5915,26 +5548,14 @@ def unique_chunk_filename(src: Path, used: set[str]) -> str:
 
 
 def is_parasol_jd_pair_module(module: dict) -> bool:
-    """PARASOL AOD 专用：输入目录里存在成对文件，平台只给“主数据文件”生成任务。
-
-    兼容旧 JD/JL 命名，也兼容 ICARE L1_B 常见的 MD/ML 命名。
-    判断规则不是固定只认 JD，而是按“除成对标记外其它文件名完全一致”来配对：
-      P3L1TBG1025190JD  <->  P3L1TBG1025190JL
-      P3L1TBG1025190MD  <->  P3L1TBG1025190ML
-      P3L1TBG1025190JD_xxx  <->  P3L1TBG1025190JL_xxx
+    """PARASOL AOD 专用：输入目录里 JD/JL 成对出现，但 exe 只需要 JD 主输入。
 
     只对 PARASOL 模块启用，避免影响其它模块的普通批处理/并行逻辑。
-    旧配置仍兼容：
+    如果以后有类似模块，也可以在 module.json 的 parallel 里显式写：
       "jd_jl_pair": true
-      "jd_only": true
-    新配置推荐：
-      "pair_mode": "auto"
-      "pair_suffixes": "JD:JL;MD:ML"
     """
     parallel_cfg = module.get("parallel") if isinstance(module.get("parallel"), dict) else {}
     if parallel_cfg.get("jd_jl_pair") is True or parallel_cfg.get("jd_only") is True:
-        return True
-    if str(parallel_cfg.get("pair_mode") or "").strip().lower() in {"auto", "dynamic", "suffix_pair", "paired"}:
         return True
 
     tags = module.get("tags") or []
@@ -5951,189 +5572,26 @@ def is_parasol_jd_pair_module(module: dict) -> bool:
     return "parasol" in text
 
 
-def _parse_parasol_pair_suffixes(module: dict) -> list[tuple[str, str]]:
-    """读取 PARASOL 成对文件后缀。
+def is_parasol_jd_input_file(path: Path) -> bool:
+    """识别 PARASOL 主输入 JD 文件。
 
-    默认支持：JD/JL、MD/ML。也允许在 module.json 的 parallel 里自定义：
-      "pair_suffixes": "JD:JL;MD:ML"
-    或：
-      "pair_suffixes": [["JD", "JL"], ["MD", "ML"]]
-    每一组第一个后缀是主文件，第二个后缀是配套文件。
+    示例：
+      P3L1TBG1017047JD_n45_00_N35_00_e115_00_E125_00
+      P3L1TBG1017047JD_n45_00_N35_00_e115_00_E125_01
+
+    配套 JL 文件会由算法/exe 根据 JD 文件名自己匹配，不应单独生成平台任务。
     """
-    parallel_cfg = module.get("parallel") if isinstance(module.get("parallel"), dict) else {}
-    raw = parallel_cfg.get("pair_suffixes") or parallel_cfg.get("paired_suffixes")
-    pairs: list[tuple[str, str]] = []
-
-    if isinstance(raw, list):
-        for item in raw:
-            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                a, b = str(item[0]).strip().upper(), str(item[1]).strip().upper()
-                if a and b:
-                    pairs.append((a, b))
-            elif isinstance(item, str):
-                text = item.replace("->", ":").replace("=", ":")
-                parts = [x.strip().upper() for x in re.split(r"[:/|,]", text) if x.strip()]
-                if len(parts) >= 2:
-                    pairs.append((parts[0], parts[1]))
-    elif isinstance(raw, str) and raw.strip():
-        text = raw.replace("；", ";").replace("，", ",")
-        for group in [x.strip() for x in text.split(";") if x.strip()]:
-            group = group.replace("->", ":").replace("=", ":")
-            parts = [x.strip().upper() for x in re.split(r"[:/|,]", group) if x.strip()]
-            if len(parts) >= 2:
-                pairs.append((parts[0], parts[1]))
-
-    if not pairs:
-        pairs = [("JD", "JL"), ("MD", "ML")]
-
-    # 去重且保持顺序。
-    result: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for a, b in pairs:
-        key = (a.upper(), b.upper())
-        if a and b and key not in seen:
-            result.append(key)
-            seen.add(key)
-    return result or [("JD", "JL"), ("MD", "ML")]
-
-
-def _split_parasol_pair_token(module: dict, path: Path) -> dict | None:
-    """解析一个 PARASOL 文件名属于哪组配对。
-
-    返回：
-      {
-        "pair": ("MD", "ML"),
-        "role": "primary" / "secondary",
-        "token": "MD",
-        "key": "P3L1TBG1025190"   # 去掉 MD/ML/JD/JL 后的比较键
-      }
-
-    关键点：只要去掉成对标记后其它部分完全一样，就认为可配对。
-    """
-    name = path.name
-    upper = name.upper()
-
-    for primary, secondary in _parse_parasol_pair_suffixes(module):
-        # 标记可以在文件名末尾，也可以出现在 . _ - 前面，例如 JD_n45、MD、MD.xxx。
-        pattern = rf"({re.escape(primary)}|{re.escape(secondary)})(?=$|[_.-])"
-        match = re.search(pattern, upper)
-        if not match:
-            continue
-        token = match.group(1).upper()
-        key = upper[:match.start()] + upper[match.end():]
-        role = "primary" if token == primary else "secondary"
-        return {
-            "pair": (primary, secondary),
-            "role": role,
-            "token": token,
-            "key": key,
-        }
-    return None
-
-
-def is_parasol_jd_input_file(path: Path, module: dict | None = None) -> bool:
-    """兼容旧函数名：现在识别 JD 或 MD 等“主数据文件”。"""
-    module = module or {}
-    info = _split_parasol_pair_token(module, path)
-    return bool(info and info.get("role") == "primary")
-
-
-def build_parasol_pair_companion_map(module: dict, files: list[Path]) -> dict[Path, Path]:
-    """返回 {主文件: 配套文件}，例如 {xxxMD: xxxML, xxxJD: xxxJL}。"""
-    groups: dict[tuple[tuple[str, str], str], dict[str, list[Path]]] = {}
-    resolved_to_original: dict[Path, Path] = {}
-
-    for item in files:
-        try:
-            rp = item.resolve()
-        except Exception:
-            rp = item
-        resolved_to_original[rp] = item
-        info = _split_parasol_pair_token(module, item)
-        if not info:
-            continue
-        gkey = (tuple(info["pair"]), str(info["key"]))
-        bucket = groups.setdefault(gkey, {"primary": [], "secondary": []})
-        bucket[str(info["role"])].append(item)
-
-    mapping: dict[Path, Path] = {}
-    for bucket in groups.values():
-        primary_items = bucket.get("primary") or []
-        secondary_items = bucket.get("secondary") or []
-        if not primary_items or not secondary_items:
-            continue
-        # 正常每组一主一配；如果存在重复，使用排序后的第一个配套文件。
-        secondary_items = sorted(secondary_items, key=lambda p: p.name.lower())
-        companion = secondary_items[0]
-        for primary in sorted(primary_items, key=lambda p: p.name.lower()):
-            try:
-                mapping[primary.resolve()] = companion.resolve()
-            except Exception:
-                mapping[primary] = companion
-    return mapping
+    name = path.name.upper()
+    return bool(re.search(r"JD(?=[_.-])", name))
 
 
 def filter_parasol_jd_files_for_jobs(module: dict, files: list[Path]) -> list[Path]:
-    """兼容旧函数名：从 JD/JL 或 MD/ML 成对文件中筛选主文件生成任务。"""
     if not is_parasol_jd_pair_module(module):
         return files
 
-    companion_map = build_parasol_pair_companion_map(module, files)
-    primary_files: list[Path] = []
-    for item in files:
-        info = _split_parasol_pair_token(module, item)
-        if not info or info.get("role") != "primary":
-            continue
-        try:
-            rp = item.resolve()
-        except Exception:
-            rp = item
-        # 只有真正找到配套文件时才生成任务，避免 MD/JD 孤立文件导致算法找不到 ML/JL。
-        if rp in companion_map:
-            primary_files.append(item)
-
-    primary_files.sort(key=lambda x: str(x).lower())
-    return primary_files
-
-
-def describe_parasol_pair_filter(module: dict, total_files: int, primary_files: list[Path]) -> str:
-    pair_names = "/".join([f"{a}-{b}" for a, b in _parse_parasol_pair_suffixes(module)])
-    return (
-        f"目录中共 {total_files} 个候选文件，按动态配对规则 {pair_names} 识别到 "
-        f"{len(primary_files)} 个主数据任务；配套文件由模块自动匹配"
-    )
-
-
-def discover_parasol_pair_candidates(input_value: str, patterns: list[str], module: dict) -> list[Path]:
-    """PARASOL 配对模块的文件发现。
-
-    旧模块可能仍写着 file_patterns='*JD*;*jd*'。为了兼容 MD/ML，
-    只要识别为 PARASOL 成对模块，就优先扫描目录下全部文件，再由动态配对规则筛选。
-    """
-    root = Path(str(input_value)).expanduser()
-    if root.is_file():
-        return [root.resolve()]
-    # 对 PARASOL 成对模块不要受旧 *JD* 规则限制，否则 MD/ML 会被漏掉。
-    return discover_batch_files(str(input_value), ["*"])
-
-
-def _with_parasol_companion_files(module: dict, primary_files: list[Path], companion_map: dict[Path, Path]) -> list[Path]:
-    """给 chunk 目录准备 hardlink 时，把主文件和对应配套文件都放进去。"""
-    result: list[Path] = []
-    seen: set[str] = set()
-    for src in primary_files:
-        for item in [src, companion_map.get(src.resolve() if src.exists() else src)]:
-            if item is None:
-                continue
-            try:
-                marker = str(item.resolve()).lower()
-            except Exception:
-                marker = str(item).lower()
-            if marker not in seen:
-                result.append(item)
-                seen.add(marker)
-    return result
-
+    jd_files = [item for item in files if is_parasol_jd_input_file(item)]
+    # 只有在确实识别到 JD 文件时才过滤；如果没识别到，直接报错比继续把 JL 当任务更安全。
+    return jd_files
 
 def is_probably_dir_output(module: dict, output_key: str, output_value: str) -> bool:
     meta = field_meta(module, output_key)
@@ -6178,86 +5636,6 @@ def apply_single_file_output_mapping(module: dict, base_inputs: dict, input_file
     return new_inputs
 
 
-def apply_parasol_single_file_output_mapping(module: dict, base_inputs: dict, input_file: Path) -> dict:
-    """PARASOL EXE expects one input file and writes outputDir\\basename(outputDir).TIF."""
-    new_inputs = apply_single_file_output_mapping(module, base_inputs, input_file)
-    output_key = str(normalize_parallel_config(module).get("output_key") or "").strip()
-    if not output_key or output_key not in base_inputs:
-        return new_inputs
-
-    output_value = str(base_inputs.get(output_key) or "").strip()
-    if not output_value or not is_probably_dir_output(module, output_key, output_value):
-        return new_inputs
-
-    parent_dir = Path(output_value)
-    child_dir = parent_dir / input_file.stem
-    child_dir.mkdir(parents=True, exist_ok=True)
-    new_inputs[output_key] = str(child_dir.resolve())
-    new_inputs["_parasol_parent_output_dir"] = str(parent_dir.resolve())
-    return new_inputs
-
-
-def progress_tokens_for_input_file(path: Path) -> list[str]:
-    stem = path.stem.lower()
-    name = path.name.lower()
-    tokens = {stem, name}
-    if stem.startswith("nc_"):
-        tokens.add(stem[3:])
-
-    for pattern in (
-        r"h\d{2}_\d{8}_\d{4}",
-        r"\d{8}_\d{4}",
-    ):
-        for match in re.finditer(pattern, stem):
-            tokens.add(match.group(0).lower())
-
-    return sorted(token for token in tokens if len(token) >= 6)
-
-
-def build_parallel_progress_watch_spec(module: dict, inputs: dict, files: list[Path]) -> dict:
-    output_key = choose_parallel_output_key(module, inputs)
-    if not output_key:
-        return {}
-
-    output_value = str(inputs.get(output_key) or "").strip()
-    if not output_value:
-        return {}
-
-    output_path = Path(output_value)
-    if is_probably_dir_output(module, output_key, output_value):
-        output_path.mkdir(parents=True, exist_ok=True)
-        output_dirs = [str(output_path.resolve())]
-    elif output_path.suffix:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_dirs = [str(output_path.parent.resolve())]
-    else:
-        output_path.mkdir(parents=True, exist_ok=True)
-        output_dirs = [str(output_path.resolve())]
-
-    suffix = str(normalize_parallel_config(module).get("output_suffix") or ".tif").strip() or ".tif"
-    if not suffix.startswith("."):
-        suffix = "." + suffix
-    extensions = sorted({suffix.lower(), ".tif", ".tiff"})
-
-    watched_inputs = []
-    for file_path in files:
-        tokens = progress_tokens_for_input_file(file_path)
-        if tokens:
-            watched_inputs.append({
-                "id": file_path.name,
-                "tokens": tokens,
-            })
-
-    if not watched_inputs:
-        return {}
-
-    return {
-        "output_dirs": output_dirs,
-        "output_extensions": extensions,
-        "inputs": watched_inputs,
-    }
-
-
 def infer_parallel_mode(module: dict, inputs: dict, input_key: str) -> str:
     mode = str(normalize_parallel_config(module).get("mode") or "auto").strip() or "auto"
     if mode not in VALID_PARALLEL_MODES:
@@ -6278,11 +5656,10 @@ def infer_parallel_mode(module: dict, inputs: dict, input_key: str) -> str:
 
 
 def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> list[dict]:
-    workers = max(1, clamp_parallel_workers(parallel_workers))
+    workers = clamp_parallel_workers(parallel_workers)
+    if workers <= 1:
+        return []
 
-    # 注意：workers=1 也必须拆任务。
-    # 它表示“只允许 1 个 exe 同时运行”，不是“不拆文件夹”。
-    # 如果这里提前 return []，文件夹会被原样传给 exe，导致 C++ 端 f.open(目录) 失败。
     input_key = choose_parallel_input_key(module, inputs)
     mode = infer_parallel_mode(module, inputs, input_key) if input_key else "none"
 
@@ -6301,42 +5678,25 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
         raise HTTPException(status_code=400, detail=f"并行输入字段为空: {input_key}")
 
     patterns = parse_parallel_patterns(normalize_parallel_config(module).get("file_patterns"))
-    if is_parasol_jd_pair_module(module):
-        files = discover_parasol_pair_candidates(str(input_value), patterns, module)
-    else:
-        files = discover_batch_files(str(input_value), patterns)
+    files = discover_batch_files(str(input_value), patterns)
     if not files:
         raise HTTPException(status_code=400, detail=f"未匹配到可并行处理的文件，匹配规则: {';'.join(patterns)}")
 
-    # PARASOL AOD：输入目录里成对文件可能是 JD/JL，也可能是 MD/ML。
-    # 平台只给主数据文件生成任务，配套文件不单独生成任务。
+    # PARASOL AOD：输入目录里 JD/JL 成对出现，但平台只应该给 JD 主输入创建任务。
+    # JL 文件由 AOD_AHI.exe / 算法自己按文件名匹配，不能单独生成任务。
     files_before_parasol_filter = len(files)
-    parasol_pair_companions: dict[Path, Path] = {}
     if is_parasol_jd_pair_module(module):
-        parasol_pair_companions = build_parasol_pair_companion_map(module, files)
         files = filter_parasol_jd_files_for_jobs(module, files)
         if not files:
-            pair_names = "/".join([f"{a}-{b}" for a, b in _parse_parasol_pair_suffixes(module)])
             raise HTTPException(
                 status_code=400,
-                detail=f"PARASOL 输入目录中没有识别到完整成对数据，当前规则: {pair_names}。请确认 MD/ML 或 JD/JL 是否成对存在，且除成对标记外其它文件名完全一致。"
+                detail="PARASOL 输入目录中没有识别到 JD 主输入文件，不能生成任务。请检查文件名是否包含 JD_ 或 JD-。"
             )
-        # ParasolAOD.exe 的第一个参数是单个 Level-1 数据文件，不是目录。
-        # 即使模块配置写成 folder_chunks，这里也强制按单文件子任务运行。
-        mode = "single_file"
-
-    if len(files) == 1 and mode in {"single_file", "tif_tiles", "folder_chunks"} and _should_split_tif_tiles(module, files[0], workers):
-        tile_jobs = build_tif_tile_parallel_jobs(module, inputs, input_key, files[0], workers)
-        if len(tile_jobs) > 1:
-            return tile_jobs
 
     jobs: list[dict] = []
-    if mode in {"single_file", "tif_tiles"}:
+    if mode == "single_file":
         for idx, file_path in enumerate(files, start=1):
-            if is_parasol_jd_pair_module(module):
-                job_inputs = apply_parasol_single_file_output_mapping(module, inputs, file_path)
-            else:
-                job_inputs = apply_single_file_output_mapping(module, inputs, file_path)
+            job_inputs = apply_single_file_output_mapping(module, inputs, file_path)
             job_inputs[input_key] = str(file_path)
 
             # 平台已经负责并发，单个子任务内部默认只处理当前文件。
@@ -6348,9 +5708,10 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
             job_inputs["_parallel_total"] = len(files)
             job_inputs["_parallel_pool_size"] = workers
             if is_parasol_jd_pair_module(module) and files_before_parasol_filter != len(files):
-                job_inputs["_parasol_jd_filter"] = describe_parasol_pair_filter(module, files_before_parasol_filter, files)
-            if is_parasol_jd_pair_module(module):
-                job_inputs["_parallel_require_outputs"] = True
+                job_inputs["_parasol_jd_filter"] = (
+                    f"目录中共 {files_before_parasol_filter} 个文件，仅 JD 主输入生成 {len(files)} 个任务；"
+                    "JL 文件由模块自动匹配"
+                )
             command, working_dir, runtime_env = build_runtime_for_module(module, job_inputs)
             jobs.append({
                 "module_id": module.get("id", ""),
@@ -6360,9 +5721,6 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
                 "working_dir": working_dir,
                 "env": runtime_env,
                 "inputs": job_inputs,
-                "actual_parallel_mode": "single_file",
-                "require_outputs": bool(is_parasol_jd_pair_module(module)),
-                "progress_watch": build_parallel_progress_watch_spec(module, job_inputs, [file_path]),
             })
         return jobs
 
@@ -6382,24 +5740,31 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
             files_per_job = 1
         files_per_job = max(1, files_per_job)
 
-        group_for_model_reuse, model_reuse_info = should_group_folder_chunks_for_model_reuse(
-            module,
-            files,
-            workers,
-            files_per_job,
-        )
-
         job_units: list[list[Path]] = []
-        if group_for_model_reuse:
-            model_reuse_group_count = max(1, int(model_reuse_info.get("grouped_job_count") or workers))
-            job_units = split_files_by_size(files, model_reuse_group_count)
-        elif files_per_job <= 1:
+        if files_per_job <= 1:
             job_units = [[f] for f in files]
         else:
             for i in range(0, len(files), files_per_job):
                 job_units.append(files[i:i + files_per_job])
 
-        chunk_root = RUNTIME_DIR / "parallel_chunks" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        if dask_cluster_manager.distributed_execution_enabled():
+            shared_runtime_root = dask_cluster_manager.get_shared_runtime_root()
+            if not shared_runtime_root:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "分布式 folder_chunks 模式需要所有节点可访问的共享运行目录。"
+                        "请先在“分布式”页面填写 UNC 路径并检测，例如 "
+                        r"\\192.168.2.100\local_web_runtime"
+                    ),
+                )
+            chunk_root = (
+                Path(shared_runtime_root)
+                / "parallel_chunks"
+                / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            )
+        else:
+            chunk_root = RUNTIME_DIR / "parallel_chunks" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         chunk_root.mkdir(parents=True, exist_ok=True)
 
         for idx, chunk in enumerate(job_units, start=1):
@@ -6407,16 +5772,7 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
             chunk_dir.mkdir(parents=True, exist_ok=True)
             used_names: set[str] = set()
             link_modes: list[str] = []
-            # PARASOL 成对文件：chunk 目录里必须同时放主文件和配套文件。
-            # 例如 P3L1TBG1025190MD 与 P3L1TBG1025190ML。
-            link_sources = _with_parasol_companion_files(module, chunk, parasol_pair_companions) if is_parasol_jd_pair_module(module) else chunk
-            if is_parasol_jd_pair_module(module) and len(link_sources) < len(chunk) * 2:
-                missing = ", ".join(item.name for item in chunk if item.resolve() not in parasol_pair_companions)
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"PARASOL 子任务缺少配套文件，无法运行：{missing or '未知文件'}。请确认 MD/ML 或 JD/JL 成对存在。",
-                )
-            for src in link_sources:
+            for src in chunk:
                 dst = chunk_dir / unique_chunk_filename(src, used_names)
                 link_modes.append(link_or_copy_file(src, dst))
 
@@ -6424,24 +5780,17 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
             job_inputs["_parallel_chunk_link_modes"] = sorted(set(link_modes))
             job_inputs[input_key] = str(chunk_dir.resolve())
             if is_parasol_jd_pair_module(module) and files_before_parasol_filter != len(files):
-                job_inputs["_parasol_jd_filter"] = describe_parasol_pair_filter(module, files_before_parasol_filter, files)
-            if is_parasol_jd_pair_module(module):
-                job_inputs["_parallel_require_outputs"] = True
-                job_inputs["_parasol_pair_chunk_file_count"] = len(link_sources)
-            job_inputs["parallel_workers"] = 1
+                job_inputs["_parasol_jd_filter"] = (
+                    f"目录中共 {files_before_parasol_filter} 个文件，仅 JD 主输入生成 {len(files)} 个任务；"
+                    "JL 文件由模块自动匹配"
+                )
             job_inputs["_parallel_workers"] = 1
             job_inputs["_parallel_index"] = idx
             job_inputs["_parallel_total"] = len(job_units)
             job_inputs["_parallel_chunk_file_count"] = len(chunk)
             job_inputs["_parallel_pool_size"] = workers
-            if group_for_model_reuse:
-                job_inputs["_parallel_model_reuse_grouped"] = True
-                job_inputs["_parallel_model_reuse_original_jobs"] = model_reuse_info.get("original_job_count")
-                job_inputs["_parallel_model_reuse_fixed_resource_gb"] = round(float(model_reuse_info.get("fixed_resource_gb") or 0.0), 3)
             command, working_dir, runtime_env = build_runtime_for_module(module, job_inputs)
-            if group_for_model_reuse:
-                label = f"worker_{idx:02d} ({len(chunk)} files, model-reuse)"
-            elif len(chunk) == 1:
+            if len(chunk) == 1:
                 label = f"{idx}/{len(job_units)} {chunk[0].name}"
             else:
                 label = f"job_{idx:04d} ({len(chunk)} files)"
@@ -6455,11 +5804,6 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
                 "inputs": job_inputs,
                 "cleanup_root": str(chunk_root.resolve()),
                 "link_modes": sorted(set(link_modes)),
-                "actual_parallel_mode": "folder_chunks",
-                "require_outputs": bool(is_parasol_jd_pair_module(module)),
-                "fast_refill": bool(group_for_model_reuse),
-                "model_reuse_info": model_reuse_info if group_for_model_reuse else {},
-                "progress_watch": build_parallel_progress_watch_spec(module, job_inputs, chunk),
             })
         return jobs
 
@@ -6675,22 +6019,6 @@ def _list_batch_files(value: str, field: dict) -> list[Path]:
                     seen.add(rp)
                     found.append(rp)
 
-    # 兼容旧 PARASOL 模块：历史配置可能给输入字段写死 batch_include_regex=JD。
-    # 现在 ICARE L1_B 常见是 MD/ML；如果按旧 JD 正则没有扫到文件，
-    # 则去掉该 include_regex 再扫描一次，后续由动态配对规则决定哪些是主任务。
-    include_regex = str(field.get("batch_include_regex") or "").lower()
-    if not found and "jd" in include_regex:
-        relaxed_field = dict(field)
-        relaxed_field.pop("batch_include_regex", None)
-        relaxed_field["file_patterns"] = "*"
-        fallback_patterns = ["*"]
-        for item in p.iterdir():
-            if item.is_file() and _batch_file_allowed(item, relaxed_field, fallback_patterns):
-                rp = item.resolve()
-                if rp not in seen:
-                    seen.add(rp)
-                    found.append(rp)
-
     found.sort(key=lambda x: x.name.lower())
     return found
 
@@ -6834,147 +6162,6 @@ def _format_batch_validation_error(message: str, missing: list[dict] | None = No
     return "\n".join(parts)
 
 
-def _collect_tif_profiles_for_job(module: dict, job_inputs: dict, max_items: int = 12) -> list[str]:
-    profiles: list[str] = []
-    seen: set[str] = set()
-
-    for field in module.get("inputs", []) or []:
-        if len(profiles) >= max_items:
-            break
-        key = str(field.get("key") or "").strip()
-        if not key:
-            continue
-        value = job_inputs.get(key)
-        if value in ("", None):
-            continue
-        try:
-            path = Path(str(value))
-            if not path.is_absolute():
-                path = (resolve_module_dir(module) / path).resolve()
-            else:
-                path = path.resolve()
-            marker = str(path).lower()
-            if marker in seen or not path.is_file() or not is_tif_file(path):
-                continue
-            seen.add(marker)
-            profiles.append(format_tif_profile(describe_tif(path), label=key))
-        except Exception as exc:
-            profiles.append(f"{key}: profile_error={type(exc).__name__}: {exc}")
-
-    return profiles
-
-
-def _is_h8_aod_module(module: dict) -> bool:
-    module_id = str(module.get("id") or module.get("module_id") or "").strip().lower()
-    exe_name = Path(str(module.get("executable") or module.get("entry") or "")).name.lower()
-    name = str(module.get("name") or "").strip().lower()
-    return module_id == "h8aod" or exe_name == "aod_ahi.exe" or "h8 aod" in name
-
-
-def _resolve_job_input_path(module: dict, job_inputs: dict, key: str) -> Optional[Path]:
-    value = job_inputs.get(key)
-    if value in ("", None):
-        return None
-
-    path = Path(str(value))
-    if path.is_absolute():
-        return path.resolve()
-
-    field = next((item for item in module.get("inputs", []) or [] if item.get("key") == key), {})
-    if field.get("path_mode") == "relative_to_module":
-        return (resolve_module_dir(module) / path).resolve()
-
-    return (PROJECT_ROOT / path).resolve()
-
-
-def _size_text(size: tuple[int, int]) -> str:
-    return f"{size[0]}x{size[1]}"
-
-
-def _size_matches(actual: tuple[int, int], expected: tuple[int, int], tolerance: int = 1) -> bool:
-    return abs(int(actual[0]) - int(expected[0])) <= tolerance and abs(int(actual[1]) - int(expected[1])) <= tolerance
-
-
-def _half_size_options(size: tuple[int, int]) -> set[tuple[int, int]]:
-    width, height = int(size[0]), int(size[1])
-    widths = {width // 2, math.ceil(width / 2)}
-    heights = {height // 2, math.ceil(height / 2)}
-    return {(w, h) for w in widths for h in heights if w > 0 and h > 0}
-
-
-def _validate_h8_aod_job_inputs(module: dict, job_inputs: dict, slot: str) -> list[str]:
-    if not _is_h8_aod_module(module):
-        return []
-
-    paths: dict[str, Path] = {}
-    errors: list[str] = []
-    for key in ("B01_file", "B03_file", "B06_file", "SOLAR_file", "GEO1_file", "al_dem"):
-        path = _resolve_job_input_path(module, job_inputs, key)
-        if path is None:
-            errors.append(f"slot={slot}: 缺少 {key}")
-            continue
-        if not path.exists() or not path.is_file():
-            errors.append(f"slot={slot}: {key} 文件不存在: {path}")
-            continue
-        paths[key] = path
-
-    if errors:
-        return errors
-
-    sizes: dict[str, tuple[int, int]] = {}
-    for key, path in paths.items():
-        if not is_tif_file(path):
-            if key != "al_dem":
-                errors.append(f"slot={slot}: {key} 不是 TIF 文件: {path}")
-            continue
-        try:
-            sizes[key] = get_tif_size(path)
-        except Exception as exc:
-            errors.append(f"slot={slot}: 无法读取 {key} 尺寸: {path} ({type(exc).__name__}: {exc})")
-
-    if errors:
-        return errors
-
-    geo_size = sizes.get("GEO1_file")
-    if not geo_size:
-        return [f"slot={slot}: 无法读取 GEO1_file 尺寸，停止运行以避免 AOD_AHI.exe 崩溃"]
-
-    def add_mismatch(key: str, expected_text: str, actual_size: tuple[int, int]):
-        errors.append(
-            f"slot={slot}: {key} 尺寸为 {_size_text(actual_size)}，期望 {expected_text}；"
-            "当前 H8 AOD 模块使用固定裁剪区域资源，输入影像必须和 GEO/DEM 资源处在同一网格范围。"
-        )
-
-    b01_size = sizes.get("B01_file")
-    if b01_size and not _size_matches(b01_size, geo_size):
-        add_mismatch("B01_file", f"与 GEO1_file 一致 ({_size_text(geo_size)})", b01_size)
-
-    b03_size = sizes.get("B03_file")
-    expected_b03 = (geo_size[0] * 2, geo_size[1] * 2)
-    if b03_size and not _size_matches(b03_size, expected_b03):
-        add_mismatch("B03_file", f"GEO1_file 的 2 倍 ({_size_text(expected_b03)})", b03_size)
-
-    half_options = _half_size_options(geo_size)
-    half_text = " 或 ".join(_size_text(item) for item in sorted(half_options))
-
-    b06_size = sizes.get("B06_file")
-    if b06_size and not any(_size_matches(b06_size, item) for item in half_options):
-        add_mismatch("B06_file", f"GEO1_file 的 1/2 ({half_text})", b06_size)
-
-    solar_size = sizes.get("SOLAR_file")
-    if solar_size:
-        if b06_size and not _size_matches(solar_size, b06_size):
-            add_mismatch("SOLAR_file", f"与 B06_file 一致 ({_size_text(b06_size)})", solar_size)
-        elif not any(_size_matches(solar_size, item) for item in half_options):
-            add_mismatch("SOLAR_file", f"GEO1_file 的 1/2 ({half_text})", solar_size)
-
-    dem_size = sizes.get("al_dem")
-    if dem_size and not _size_matches(dem_size, geo_size):
-        add_mismatch("al_dem", f"与 GEO1_file 一致 ({_size_text(geo_size)})", dem_size)
-
-    return errors
-
-
 def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: int) -> tuple[list[dict], list[Path]]:
     batch_fields = _get_batch_input_fields(module)
     if not batch_fields:
@@ -7015,21 +6202,19 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
     jobs: list[dict] = []
     output_paths: list[Path] = []
     missing: list[dict] = []
-    preflight_errors: list[str] = []
     used_by_role: dict[str, set[str]] = {role: set() for role in role_files}
 
     primary_files = role_files[primary_role]
     primary_files_before_parasol_filter = len(primary_files)
 
-    # PARASOL AOD：成对输入可能是 JD/JL，也可能是 MD/ML。
-    # 平台只用主数据文件生成子任务，配套文件由模块内部按同名前缀匹配。
+    # PARASOL AOD：JD/JL 是成对输入。平台只用 JD 文件生成子任务；
+    # JL 文件由模块内部根据 JD 文件名自动匹配，不能把 JL 当成独立任务启动。
     if is_parasol_jd_pair_module(module):
         primary_files = filter_parasol_jd_files_for_jobs(module, primary_files)
         if not primary_files:
-            pair_names = "/".join([f"{a}-{b}" for a, b in _parse_parasol_pair_suffixes(module)])
             raise HTTPException(
                 status_code=400,
-                detail=f"PARASOL 输入目录中没有识别到完整成对数据，当前规则: {pair_names}。请确认 MD/ML 或 JD/JL 是否成对存在，且除成对标记外其它文件名完全一致。"
+                detail="PARASOL 输入目录中没有识别到 JD 主输入文件，无法生成任务。请检查文件名是否包含 JD_ 或 JD-。"
             )
         role_files[primary_role] = primary_files
         role_indexes[primary_role] = _build_role_index(primary_files)
@@ -7070,12 +6255,10 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
                         selected = candidates[0]
                         break
 
-                # SOLAR 数据有时文件名使用太阳几何产品日期，和 B01/B03/B06 的观测日期不一致。
-                # 如果 SOLAR 数量和主输入数量完全一致，则按排序一一配对；仍然禁止“全部任务共用第一个文件”的隐式兜底。
-                if selected is None and str(role).upper() == "SOLAR" and len(files) == total:
-                    ordinal_candidate = files[idx - 1] if idx - 1 < len(files) else None
-                    if ordinal_candidate is not None:
-                        selected = ordinal_candidate
+                # 临时兼容：SOLAR 没有对应时次时，允许用排序第一个文件先跑通流程。
+                # 正式生产建议把 SOLAR 文件准备成对应时次，或显式配置 match_mode=timeslot。
+                if selected is None and str(role).upper() == "SOLAR":
+                    selected = files[0]
 
             if selected is None:
                 ok = False
@@ -7090,11 +6273,6 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
             used_by_role.setdefault(role, set()).add(str(selected.resolve()))
 
         if not ok:
-            continue
-
-        h8_errors = _validate_h8_aod_job_inputs(module, job_inputs, slot)
-        if h8_errors:
-            preflight_errors.extend(h8_errors)
             continue
 
         job_inputs, out_path = _make_batch_output_value(module, job_inputs, slot, primary_path)
@@ -7119,7 +6297,10 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
         job_inputs["parallel_workers"] = 1
 
         if is_parasol_jd_pair_module(module) and primary_files_before_parasol_filter != len(primary_files):
-            job_inputs["_parasol_jd_filter"] = describe_parasol_pair_filter(module, primary_files_before_parasol_filter, primary_files)
+            job_inputs["_parasol_jd_filter"] = (
+                f"目录中共 {primary_files_before_parasol_filter} 个文件，仅 JD 主输入生成 {len(primary_files)} 个任务；"
+                "JL 文件由模块自动匹配"
+            )
 
         # 不把平台内部字段写给 exe，除非模块显式要求。
         exe_inputs = {
@@ -7128,7 +6309,6 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
         }
 
         command, working_dir, runtime_env = build_runtime_for_module(module, exe_inputs)
-        input_profiles = _collect_tif_profiles_for_job(module, exe_inputs) if idx == 1 else []
         jobs.append({
             "module_id": module.get("id", ""),
             "module_name": module.get("name", module.get("id", "")),
@@ -7137,34 +6317,24 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
             "working_dir": working_dir,
             "env": runtime_env,
             "inputs": exe_inputs,
-            "input_profiles": input_profiles,
         })
 
-    if missing or preflight_errors:
+    if missing:
         extras: list[dict] = []
         for role, files in role_files.items():
             unused = [str(f) for f in files if str(f.resolve()) not in used_by_role.get(role, set())]
             if unused:
                 extras.append({"role": role, "files": unused})
-
-        detail_parts: list[str] = []
-        if missing:
-            detail_parts.append(_format_batch_validation_error(
+        raise HTTPException(
+            status_code=400,
+            detail=_format_batch_validation_error(
                 "批量输入不匹配，请检查各输入目录文件名时次是否对应。"
-                " SOLAR 目录有多个文件时必须按时次匹配；如果确实要把同一个 SOLAR 给所有时次共用，"
-                "请只保留一个 SOLAR 文件，或把该字段显式配置为 first/shared。",
+                " 如果只是临时测试 SOLAR，可以把 SOLAR_file 的 match_mode 改成 first；"
+                "本版也会在 SOLAR 找不到时次时自动取第一个文件兜底。",
                 missing,
                 extras,
-            ))
-        if preflight_errors:
-            detail_parts.append(
-                "H8 AOD 输入尺寸预检查失败，已停止运行，避免 AOD_AHI.exe 因输入网格不一致而崩溃：\n"
-                + "\n".join(f"{idx}. {item}" for idx, item in enumerate(preflight_errors[:40], start=1))
-            )
-            if len(preflight_errors) > 40:
-                detail_parts.append(f"... 还有 {len(preflight_errors) - 40} 条预检查错误")
-
-        raise HTTPException(status_code=400, detail="\n\n".join(detail_parts))
+            ),
+        )
 
     if not jobs:
         raise HTTPException(status_code=400, detail="没有生成任何批处理 job，请检查输入目录和 batch_role 配置")
@@ -7689,3 +6859,4 @@ if FRONTEND_DIST_DIR.exists():
         if index_file.exists():
             return FileResponse(str(index_file))
         raise HTTPException(status_code=404, detail="前端未构建")
+
