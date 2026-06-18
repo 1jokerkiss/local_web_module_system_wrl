@@ -15,6 +15,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -102,6 +103,11 @@ class DaskClusterManager:
 
         self.state = self._load_state()
 
+        # 独立的集群加入握手服务。它监听 0.0.0.0，不依赖当前 FastAPI/Uvicorn
+        # 是否只绑定在 127.0.0.1，因此子节点可以直接通过局域网加入。
+        self._join_server = None
+        self._join_server_thread = None
+
     def _default_state(self) -> dict:
         return {
             "role": "standalone",
@@ -112,7 +118,7 @@ class DaskClusterManager:
             "head_api_url": "",
             "scheduler_port": 8786,
             "dashboard_port": 8787,
-            "api_port": 8000,
+            "api_port": 8790,
             "scheduler_pid": None,
             "worker_pid": None,
             "worker_name": socket.gethostname(),
@@ -240,6 +246,118 @@ class DaskClusterManager:
                 except Exception:
                     pass
 
+
+    def _stop_join_server(self):
+        server = self._join_server
+        self._join_server = None
+        self._join_server_thread = None
+        if server is None:
+            return
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+        try:
+            server.server_close()
+        except Exception:
+            pass
+
+    def _start_join_server(self, preferred_port: int = 8790) -> int:
+        """启动独立的集群加入握手服务，并返回实际监听端口。"""
+        self._stop_join_server()
+        manager = self
+
+        class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        class JoinInfoHandler(BaseHTTPRequestHandler):
+            server_version = "LocalWebDaskJoin/1.0"
+
+            def _send_json(self, status_code: int, payload: dict):
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path not in {"/api/distributed/join-info", "/join-info", "/health"}:
+                    self._send_json(404, {"detail": "Not Found"})
+                    return
+
+                if parsed.path == "/health":
+                    self._send_json(200, {"ok": True, "role": manager.state.get("role")})
+                    return
+
+                token = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
+                try:
+                    self._send_json(200, manager.get_join_info(token))
+                except DaskClusterError as exc:
+                    self._send_json(403, {"detail": str(exc)})
+                except Exception as exc:
+                    self._send_json(
+                        500,
+                        {"detail": f"{type(exc).__name__}: {exc}"},
+                    )
+
+            def log_message(self, _format, *_args):
+                # 避免把每次握手请求写入控制台。
+                return
+
+        preferred = int(preferred_port or 8790)
+        candidate_ports = []
+        for port in [preferred, 8790, 8791, 8792, 8793, 8794, 8795, 8796, 8797, 8798, 8799]:
+            if port > 0 and port not in candidate_ports:
+                candidate_ports.append(port)
+
+        last_error = ""
+        for port in candidate_ports:
+            try:
+                server = ReusableThreadingHTTPServer(("0.0.0.0", port), JoinInfoHandler)
+                thread = threading.Thread(
+                    target=server.serve_forever,
+                    name=f"dask-join-server-{port}",
+                    daemon=True,
+                )
+                thread.start()
+                self._join_server = server
+                self._join_server_thread = thread
+                return port
+            except OSError as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                continue
+
+        raise DaskClusterError(
+            "无法启动集群加入服务。端口 8790-8799 均不可用。"
+            f"最后错误：{last_error}"
+        )
+
+    def _ensure_join_server(self) -> int:
+        """主节点后端重启后，自动恢复加入握手服务。"""
+        if self.state.get("role") != "head":
+            return 0
+
+        server = self._join_server
+        if server is not None:
+            try:
+                return int(server.server_address[1])
+            except Exception:
+                pass
+
+        actual_port = self._start_join_server(
+            int(self.state.get("api_port") or 8790)
+        )
+        node_ip = self.local_ip()
+        with self.lock:
+            self.state["api_port"] = actual_port
+            self.state["head_api_url"] = f"http://{node_ip}:{actual_port}"
+        self._save_state()
+        return actual_port
+
     def install(self, package_spec: str = "", upgrade: bool = False) -> dict:
         spec = (package_spec or self.state.get("package_spec") or DASK_PACKAGE_SPEC).strip()
         # Python 3.9 从 Dask 2024.8.1 起不再受支持，因此默认固定到 2024.7.1。
@@ -300,12 +418,12 @@ class DaskClusterManager:
             return
         raise DaskClusterError("当前 Python 环境未安装 Dask Distributed，请先点击“安装 Dask”。")
 
-    def open_firewall(self, api_port: int = 8000, scheduler_port: int = 8786, dashboard_port: int = 8787) -> dict:
+    def open_firewall(self, api_port: int = 8790, scheduler_port: int = 8786, dashboard_port: int = 8787) -> dict:
         if os.name != "nt":
             return {"success": True, "message": "非 Windows 系统无需执行 Windows 防火墙命令", "results": []}
 
         ports = [
-            ("LocalWeb-Dask-API", int(api_port)),
+            ("LocalWeb-Dask-Join", int(api_port)),
             ("LocalWeb-Dask-Scheduler", int(scheduler_port)),
             ("LocalWeb-Dask-Dashboard", int(dashboard_port)),
         ]
@@ -418,7 +536,7 @@ class DaskClusterManager:
         bind_ip: str = "",
         scheduler_port: int = 8786,
         dashboard_port: int = 8787,
-        api_port: int = 8000,
+        api_port: int = 8790,
         worker_name: str = "",
         nworkers: int = 1,
         nthreads: int = 1,
@@ -432,7 +550,7 @@ class DaskClusterManager:
         node_ip = (bind_ip or self.local_ip()).strip()
         scheduler_port = int(scheduler_port or 8786)
         dashboard_port = int(dashboard_port or 8787)
-        api_port = int(api_port or 8000)
+        api_port = int(api_port or 8790)
         worker_name = (worker_name or f"{socket.gethostname()}-head").strip()
 
         self.scheduler_log.write_text("", encoding="utf-8")
@@ -475,7 +593,7 @@ class DaskClusterManager:
                     "cluster_id": cluster_id,
                     "join_token": join_token,
                     "scheduler_address": scheduler_address,
-                    "head_api_url": f"http://{node_ip}:{api_port}",
+                    "head_api_url": "",
                     "scheduler_port": scheduler_port,
                     "dashboard_port": dashboard_port,
                     "api_port": api_port,
@@ -491,7 +609,14 @@ class DaskClusterManager:
                     "last_error": "",
                 })
             self._save_state()
-            self.open_firewall(api_port, scheduler_port, dashboard_port)
+
+            # 使用独立握手服务，不要求主 FastAPI 必须绑定 0.0.0.0。
+            actual_join_port = self._start_join_server(api_port)
+            with self.lock:
+                self.state["api_port"] = actual_join_port
+                self.state["head_api_url"] = f"http://{node_ip}:{actual_join_port}"
+            self._save_state()
+            self.open_firewall(actual_join_port, scheduler_port, dashboard_port)
 
             # 等待本机 Worker 注册。
             end = time.time() + 30
@@ -506,6 +631,12 @@ class DaskClusterManager:
 
             return self.status()
         except Exception:
+            self._stop_join_server()
+            try:
+                if "worker_pid" in locals() and worker_pid:
+                    self._terminate_pid(worker_pid)
+            except Exception:
+                pass
             self._terminate_pid(scheduler_process.pid)
             raise
 
@@ -525,30 +656,53 @@ class DaskClusterManager:
             "package_spec": self.state.get("package_spec") or DASK_PACKAGE_SPEC,
             "shared_runtime_root": self.state.get("shared_runtime_root") or "",
             "dashboard_port": self.state.get("dashboard_port") or 8787,
+            "api_port": self.state.get("api_port") or 8790,
         }
 
     @staticmethod
     def _request_join_info(head_ip: str, api_port: int, token: str) -> dict:
         host = str(head_ip or "").strip()
+        if not host:
+            raise DaskClusterError("主节点 IP 不能为空")
+
+        urls: list[str] = []
         if host.startswith("http://") or host.startswith("https://"):
             base = host.rstrip("/")
-            # 用户可能输入 http://ip:8000
             parsed = urllib.parse.urlparse(base)
             if parsed.port is None:
-                base = f"{base}:{int(api_port)}"
-        else:
-            base = f"http://{host}:{int(api_port)}"
-
-        url = f"{base}/api/distributed/join-info?token={urllib.parse.quote(token)}"
-        try:
-            with urllib.request.urlopen(url, timeout=12) as response:
-                raw = response.read().decode("utf-8", errors="replace")
-                return json.loads(raw)
-        except Exception as exc:
-            raise DaskClusterError(
-                f"无法从主节点获取集群信息：{url}\n{type(exc).__name__}: {exc}\n"
-                "请确认主节点后端使用 --host 0.0.0.0 启动，并已开放 API 端口。"
+                base = f"{base}:{int(api_port or 8790)}"
+            urls.append(
+                f"{base}/api/distributed/join-info?token={urllib.parse.quote(token)}"
             )
+        else:
+            ports: list[int] = []
+            for value in [int(api_port or 8790), 8790, 8000]:
+                if value > 0 and value not in ports:
+                    ports.append(value)
+            for port in ports:
+                urls.append(
+                    f"http://{host}:{port}/api/distributed/join-info"
+                    f"?token={urllib.parse.quote(token)}"
+                )
+
+        errors: list[str] = []
+        for url in urls:
+            try:
+                with urllib.request.urlopen(url, timeout=6) as response:
+                    raw = response.read().decode("utf-8", errors="replace")
+                    data = json.loads(raw)
+                    if not isinstance(data, dict):
+                        raise ValueError("主节点返回的数据不是 JSON 对象")
+                    return data
+            except Exception as exc:
+                errors.append(f"{url} -> {type(exc).__name__}: {exc}")
+
+        raise DaskClusterError(
+            "无法从主节点获取集群信息。\n"
+            + "\n".join(errors)
+            + "\n请确认：主节点已创建集群；主节点和子节点位于同一局域网；"
+              "Windows 防火墙已开放加入端口和 8786；主节点 IP 填写正确。"
+        )
 
     def join_cluster(
         self,
@@ -561,7 +715,7 @@ class DaskClusterManager:
         memory_limit: str = "auto",
         auto_install: bool = True,
     ) -> dict:
-        join_info = self._request_join_info(head_ip, int(api_port or 8000), join_token)
+        join_info = self._request_join_info(head_ip, int(api_port or 8790), join_token)
         package_spec = str(join_info.get("package_spec") or DASK_PACKAGE_SPEC)
         self.state["package_spec"] = package_spec
 
@@ -593,7 +747,7 @@ class DaskClusterManager:
                 "join_token": "",
                 "scheduler_address": scheduler_address,
                 "head_api_url": str(join_info.get("head_api_url") or ""),
-                "api_port": int(api_port or 8000),
+                "api_port": int(join_info.get("api_port") or api_port or 8790),
                 "scheduler_pid": None,
                 "worker_pid": int(worker_pid),
                 "worker_name": worker_name,
@@ -622,6 +776,7 @@ class DaskClusterManager:
 
     def stop_local_processes(self, clear_identity: bool = True):
         self._close_client()
+        self._stop_join_server()
         worker_pid = self.state.get("worker_pid")
         scheduler_pid = self.state.get("scheduler_pid")
 
@@ -809,6 +964,15 @@ class DaskClusterManager:
         node_ip = self.local_ip()
         dashboard_port = int(self.state.get("dashboard_port") or 8787)
         role = str(self.state.get("role") or "standalone")
+        join_service_online = False
+        join_service_error = ""
+
+        if role == "head" and scheduler_alive:
+            try:
+                actual_join_port = self._ensure_join_server()
+                join_service_online = actual_join_port > 0
+            except Exception as exc:
+                join_service_error = f"{type(exc).__name__}: {exc}"
 
         return {
             "node": self._node_resources(),
@@ -822,7 +986,7 @@ class DaskClusterManager:
             "shared_runtime_root": self.state.get("shared_runtime_root") or "",
             "scheduler_port": self.state.get("scheduler_port") or 8786,
             "dashboard_port": dashboard_port,
-            "api_port": self.state.get("api_port") or 8000,
+            "api_port": self.state.get("api_port") or 8790,
             "dashboard_url": (
                 f"http://{node_ip}:{dashboard_port}/status"
                 if role == "head" and scheduler_alive
@@ -834,6 +998,8 @@ class DaskClusterManager:
             "worker_alive": worker_alive,
             "scheduler_online": scheduler_online,
             "scheduler_error": scheduler_error,
+            "join_service_online": join_service_online,
+            "join_service_error": join_service_error,
             "workers": workers,
             "worker_count": len(workers),
             "total_threads": sum(int(w.get("nthreads") or 0) for w in workers),

@@ -201,7 +201,7 @@ class DaskStartHeadRequest(BaseModel):
     bind_ip: str = ""
     scheduler_port: int = 8786
     dashboard_port: int = 8787
-    api_port: int = 8000
+    api_port: int = 8790
     worker_name: str = ""
     nworkers: int = 1
     nthreads: int = 1
@@ -212,7 +212,7 @@ class DaskStartHeadRequest(BaseModel):
 
 class DaskJoinRequest(BaseModel):
     head_ip: str
-    api_port: int = 8000
+    api_port: int = 8790
     join_token: str
     worker_name: str = ""
     nworkers: int = 1
@@ -227,7 +227,7 @@ class DaskExecutionModeRequest(BaseModel):
 
 
 class DaskFirewallRequest(BaseModel):
-    api_port: int = 8000
+    api_port: int = 8790
     scheduler_port: int = 8786
     dashboard_port: int = 8787
 
@@ -253,7 +253,8 @@ def api_distributed_install(
     payload: DaskInstallRequest,
     authorization: str | None = Header(default=None),
 ):
-    require_admin(authorization)
+    # 普通用户也允许在当前节点安装 Dask，以便把该电脑加入集群。
+    get_current_user(authorization)
     try:
         return dask_cluster_manager.install(
             package_spec=payload.package_spec,
@@ -314,7 +315,8 @@ def api_distributed_join(
     payload: DaskJoinRequest,
     authorization: str | None = Header(default=None),
 ):
-    require_admin(authorization)
+    # 普通用户可以把当前电脑作为 Worker 加入已有集群。
+    get_current_user(authorization)
     try:
         return dask_cluster_manager.join_cluster(
             head_ip=payload.head_ip,
@@ -332,7 +334,8 @@ def api_distributed_join(
 
 @app.post("/api/distributed/leave")
 def api_distributed_leave(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    # 普通用户可以让当前 Worker 退出集群。
+    get_current_user(authorization)
     return dask_cluster_manager.leave_cluster()
 
 
