@@ -239,8 +239,42 @@ function containsChineseChar(value) {
   return /[\u4e00-\u9fff]/.test(String(value ?? ''));
 }
 
+const CHINESE_TEXT_METADATA_KEYS = new Set([
+  // 这些字段是 UI 展示文案，不是文件系统路径，允许中文。
+  'label',
+  'placeholder',
+  'help_text',
+  'description',
+  'name',
+  'module_name',
+  'title',
+  'tool_type_label',
+  'category_label',
+  'display_name',
+  'message',
+  'suggestion',
+  'example',
+  'unit',
+  'group',
+]);
+
+function getLastKeySegment(keyPath) {
+  const text = String(keyPath || '');
+  if (!text) return '';
+  const last = text.split('.').pop() || '';
+  return last.includes('[') ? last.split('[')[0] : last;
+}
+
+function isChineseTextMetadataKey(keyPath) {
+  return CHINESE_TEXT_METADATA_KEYS.has(getLastKeySegment(keyPath));
+}
+
 function isPathLikeKey(key) {
   return /(path|dir|file|folder|executable|working_dir|source_dir|outpath|out_dir|output|input|config|runtime_env|python_executable|python_path)/i.test(String(key || ''));
+}
+
+function isPathLikeLeafKey(key) {
+  return /(path|dir|file|folder|executable|working_dir|source_dir|outpath|out_dir|output|input|config|runtime_env|python_executable|python_path)/i.test(getLastKeySegment(key));
 }
 
 function isPathLikeValue(value) {
@@ -266,11 +300,14 @@ function collectChinesePathItems(value, prefix = '路径') {
 
     if (typeof v === 'string') {
       const text = v.trim();
-      if (
-        text &&
-        containsChineseChar(text) &&
-        (isPathLikeValue(text) || isPathLikeKey(keyPath))
-      ) {
+      if (!text || !containsChineseChar(text)) return;
+
+      // label / placeholder / help_text / description 等是 UI 文案，允许中文。
+      if (isChineseTextMetadataKey(keyPath)) return;
+
+      // 只有“值本身像路径”，或者“最后一级字段名像路径”时，才按中文路径处理。
+      // 这样 inputs[0].label = "PARASOL 输入文件" 不再被误判为路径。
+      if (isPathLikeValue(text) || isPathLikeLeafKey(keyPath)) {
         items.push({
           field: keyPath || '路径',
           path: text,
@@ -849,9 +886,13 @@ function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
     const failed = Number.parseInt(String(task?.parallel_failed || 0), 10) || 0;
     const finished = Math.min(parallelTotal, done + failed);
     const percent = Math.max(0, Math.min(99, Math.round((finished / parallelTotal) * 100)));
+    const progressUnit = String(task?.parallel_progress_unit || task?.inputs?._parallel_progress_unit || '').toLowerCase();
+    const progressName = progressUnit === 'files'
+      ? '输入文件'
+      : (task?.parallel_progress_label || '子任务');
     return {
       percent,
-      label: `子任务进度：${finished}/${parallelTotal}`,
+      label: `${progressName}进度：${finished}/${parallelTotal}`,
       detail: `成功 ${done} 个，失败 ${failed} 个${elapsedText ? `，已运行 ${elapsedText}` : ''}`,
       mode: 'parallel',
       color: '#2d7cf6',
