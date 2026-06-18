@@ -2,7 +2,7 @@
   {
     "id": "h8aod",
     "name": "H8 AOD 反演",
-    "description": "H8 AOD 本地原生模块。用户按目录输入 B01、B03、B06、SOLAR，系统后端自动按文件名时次匹配并拆分为多个单文件 job，再按并发进程数调用 AOD_AHI.exe 执行。",
+    "description": "H8 AOD 本地原生模块。用户按目录输入 B01、B03、B06、SOLAR。",
     "runtime": "native",
     "entry": "AOD_AHI.exe",
     "executable": "backend/installed_modules/h8aod/AOD_AHI.exe",
@@ -169,159 +169,14 @@
     "tool_type": "aerosol",
     "parallel": {
       "mode": "batch_group",
+      "input_key": "",
+      "output_key": "",
       "file_patterns": "*.tif;*.tiff;*.img;*.hdf;*.HDF;*.h5;*.H5;*.nc;*.NC;*.dat;*.DAT",
       "output_suffix": ".tif",
-      "output_naming": "source_stem"
-    }
-  },
-  {
-    "id": "parasol_aod",
-    "name": "PARASOL AOD 反演",
-    "description": "PARASOL AOD 本地原生模块。用户选择 PARASOL 输入文件目录和输出目录，管理员固定配置 XML、LUT 和 IGBP 资源。",
-    "runtime": "native",
-    "entry": "ParasolAOD.exe",
-    "executable": "backend/installed_modules/parasol_aod/ParasolAOD.exe",
-    "working_dir": "backend/installed_modules/parasol_aod",
-    "config_mode": "none",
-    "dependency_dirs": [
-      "deps"
-    ],
-    "command_template": [
-      "{executable}",
-      "{input_file}",
-      "{output_dir}",
-      "{config_xml}"
-    ],
-    "parallel": {
-      "mode": "folder_chunks",
-      "input_key": "input_file",
-      "output_key": "output_dir",
-      "file_patterns": "*JD*;*JD_*;*JD-*;*.hdf;*.HDF;*.dat;*.DAT;*.nc;*.NC",
-      "output_suffix": ".tif",
-      "files_per_job": 2
+      "files_per_job": 1,
+      "chunk_multiplier": 1
     },
-    "tags": [
-      "parasol",
-      "aod",
-      "remote-sensing",
-      "native"
-    ],
-    "enabled": true,
-    "inputs": [
-      {
-        "key": "input_file",
-        "label": "PARASOL 输入文件目录",
-        "type": "dir_path",
-        "required": true,
-        "placeholder": "请选择 PARASOL Level-1 输入文件所在目录",
-        "default": "",
-        "help_text": "选择一个目录，平台会把目录中的输入文件拆成多个 job 并行运行。",
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "batch_role": "parasol",
-        "match_mode": "each_file"
-      },
-      {
-        "key": "output_dir",
-        "label": "输出目录",
-        "type": "dir_path",
-        "required": true,
-        "placeholder": "请选择输出目录",
-        "default": "",
-        "help_text": "程序会在该目录下生成输出文件。",
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "batch_role": "",
-        "match_mode": "none",
-        "output_ext": ".tif"
-      },
-      {
-        "key": "config_xml",
-        "label": "PARASOL 配置 XML",
-        "type": "file_path",
-        "required": true,
-        "placeholder": "",
-        "default": "resources/ConfigXMLFile.xml",
-        "help_text": "管理员固定输入，用户界面隐藏。XML 中配置 LUT 和 IGBP 文件路径。",
-        "visible_to_user": false,
-        "admin_fixed": true,
-        "path_mode": "relative_to_module",
-        "batch_role": "",
-        "match_mode": "none"
-      }
-    ],
-    "tool_type": "aerosol"
-  },
-  {
-    "id": "H8_CLOUD_TYPE_EXE",
-    "name": "葵花8号云类型反演",
-    "tool_type": "cloud",
-    "description": "葵花8号云类型反演可执行模块，运行时读取 config.json，输入 NC 文件目录，输出云检测中间结果和最终 CARE_24CP 结果。",
-    "runtime": "executable",
-    "executable": "backend/installed_modules/H8_CLOUD_TYPE_EXE/CM_CTH.exe",
-    "working_dir": "backend/installed_modules/H8_CLOUD_TYPE_EXE",
-    "config_mode": "json_file",
-    "command_template": [
-      "{executable}",
-      "{config_path}"
-    ],
-    "inputs": [
-      {
-        "key": "file",
-        "label": "Input Folder",
-        "type": "dir_path",
-        "required": true,
-        "placeholder": "Select NC input folder",
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "input"
-      },
-      {
-        "key": "cm_files",
-        "label": "Cloud Mask Folder",
-        "type": "dir_path",
-        "required": true,
-        "placeholder": "Select cloud mask output folder",
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "output"
-      },
-      {
-        "key": "outpath",
-        "label": "Output Folder",
-        "type": "dir_path",
-        "required": true,
-        "placeholder": "Select final output folder",
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "output"
-      }
-    ],
-    "parallel": {
-      "mode": "folder_chunks",
-      "input_key": "file",
-      "output_key": "outpath",
-      "file_patterns": "*.nc;*.NC",
-      "output_suffix": ".tif",
-      "files_per_job": 2
-    },
-    "dependency_dirs": [
-      "_internal",
-      "deps"
-    ],
-    "auto_collect_deps": false,
-    "tags": [
-      "h8",
-      "cloud",
-      "cth",
-      "executable"
-    ],
-    "enabled": true
+    "category": "aerosol"
   },
   {
     "id": "CTH_FY",
@@ -367,7 +222,8 @@
       "output_key": "out_path",
       "file_patterns": "*.hdf;*.HDF",
       "output_suffix": ".tif",
-      "files_per_job": 2
+      "files_per_job": 2,
+      "chunk_multiplier": 1
     },
     "dependency_dirs": [
       "_internal",
@@ -381,5 +237,159 @@
       "executable"
     ],
     "enabled": true
+  },
+  {
+    "id": "H8_CLOUD_TYPE",
+    "name": "葵花8号云类型反演",
+    "description": "葵花8号卫星云类型反演 Python 源码模块",
+    "enabled": true,
+    "tool_type": "cloud",
+    "runtime_type": "python_venv",
+    "python_env_mode": "create_venv",
+    "base_python_executable": "D:\\develop\\py38\\python.exe",
+    "install_release": "20260612_195843",
+    "config_mode": "config_json",
+    "command_template": [
+      "{executable}",
+      "{entry_script}",
+      "{config_json}"
+    ],
+    "inputs": [
+      {
+        "key": "file",
+        "label": "file",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/local_web_module_system/NC1"
+      },
+      {
+        "key": "cm_files",
+        "label": "cm_files",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/local_web_module_system/CM_24"
+      },
+      {
+        "key": "outpath",
+        "label": "outpath",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "D:/local_web_module_system/NC_1"
+      }
+    ],
+    "param_template": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260612_195843/param_template.json",
+    "source_dir": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260612_195843/source",
+    "entry_file": "CM_CTH.py",
+    "entry_script": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260612_195843/source/CM_CTH.py",
+    "python_env_dir": "backend/module_envs/H8_CLOUD_TYPE_20260612_195843",
+    "executable": "backend/module_envs/H8_CLOUD_TYPE_20260612_195843/Scripts/python.exe",
+    "working_dir": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260612_195843/source",
+    "parallel": {
+      "mode": "auto",
+      "input_key": "",
+      "output_key": "",
+      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1
+    },
+    "category": "cloud"
+  },
+  {
+    "id": "parasol_aod",
+    "name": "PARASOL AOD 反演",
+    "tool_type": "aerosol",
+    "description": "PARASOL AOD 本地原生模块。用户选择 PARASOL Level-1 输入文件夹和输出目录。",
+    "runtime": "native",
+    "entry": "ParasolAOD.exe",
+    "executable": "backend/installed_modules/parasol_aod/ParasolAOD.exe",
+    "working_dir": "backend/installed_modules/parasol_aod",
+    "config_mode": "none",
+    "dependency_dirs": [
+      "deps"
+    ],
+    "resource_dirs": [
+      "resources"
+    ],
+    "command_template": [
+      "{executable}",
+      "{input_dir}",
+      "{output_dir}",
+      "{config_xml}"
+    ],
+    "parallel": {
+      "mode": "folder_chunks",
+      "input_key": "input_dir",
+      "output_key": "output_dir",
+      "file_patterns": "*MD;*JD;*md;*jd",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1
+    },
+    "tags": [
+      "parasol",
+      "aod",
+      "aerosol",
+      "remote-sensing",
+      "native"
+    ],
+    "enabled": true,
+    "inputs": [
+      {
+        "key": "input_dir",
+        "label": "PARASOL 输入文件夹",
+        "type": "dir_path",
+        "required": true,
+        "placeholder": "请选择 PARASOL Level-1 输入文件夹",
+        "default": "",
+        "help_text": "选择包含 MD/ML 或 JD/JL 成对文件的 PARASOL Level-1 输入文件夹。",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "input_dir",
+        "match_mode": "folder_chunks"
+      },
+      {
+        "key": "output_dir",
+        "label": "输出目录",
+        "type": "dir_path",
+        "required": true,
+        "placeholder": "请选择输出目录",
+        "default": "",
+        "help_text": "程序会在该目录下生成输出结果文件。",
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "batch_role": "output_dir",
+        "match_mode": "none"
+      },
+      {
+        "key": "config_xml",
+        "label": "PARASOL 配置 XML",
+        "type": "file_path",
+        "required": true,
+        "placeholder": "",
+        "default": "resources/ConfigXMLFile.xml",
+        "help_text": "管理员固定输入，用户界面隐藏。XML 中配置 LUT、IGBP 等固定资源路径。",
+        "visible_to_user": false,
+        "admin_fixed": true,
+        "path_mode": "relative_to_module",
+        "batch_role": "",
+        "match_mode": "none"
+      }
+    ],
+    "category": "aerosol"
   }
 ]

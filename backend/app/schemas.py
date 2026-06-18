@@ -92,6 +92,9 @@ class TaskInfo(BaseModel):
     parallel_done: int | None = None
     parallel_failed: int | None = None
     requested_workers: int | None = None
+    cpu_affinity_cores: list[int] = Field(default_factory=list)
+    cpu_affinity_label: str = ""
+    runtime_threads: int | None = None
     queued_at: str | None = None
     scheduled_at: str | None = None
     queue_position: int | None = None
