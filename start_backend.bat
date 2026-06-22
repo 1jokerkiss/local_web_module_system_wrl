@@ -3,18 +3,12 @@
 set LOCAL_WEB_CPU_AFFINITY=1
 set LOCAL_WEB_RESERVED_CORES=2
 set LOCAL_WEB_CORES_PER_PROCESS=5
-set LOCAL_WEB_MAX_PROCESS_SLOTS=4
-set LOCAL_WEB_SUGGESTED_PROCESS_SLOTS=4
-set LOCAL_WEB_DYNAMIC_WORKER_BOOST=0
 
 set LOCAL_WEB_MODEL_REUSE_LARGE_RESOURCE_GROUP_CAP_GB=0
 
-
 setlocal EnableExtensions
 
-
-
-REM ==================================================
+REM -----------------------
 
 REM Auto-scaling backend starter.
 
@@ -22,7 +16,7 @@ REM This version does not hard-code LOCAL_WEB_MAX_PROCESS_SLOTS.
 
 REM It detects CPU cores and memory, then calculates safe limits.
 
-REM ==================================================
+REM -----------------------
 
 
 
@@ -199,15 +193,9 @@ REM --------------------------------------------------
 
 if not defined LOCAL_WEB_MEMORY_PER_WORKER_GB set "LOCAL_WEB_MEMORY_PER_WORKER_GB=3"
 
-
-
-for /f "usebackq delims=" %%L in (`python -c "import os, ctypes, math; class M(ctypes.Structure): _fields_=[('dwLength',ctypes.c_ulong),('dwMemoryLoad',ctypes.c_ulong),('ullTotalPhys',ctypes.c_ulonglong),('ullAvailPhys',ctypes.c_ulonglong),('ullTotalPageFile',ctypes.c_ulonglong),('ullAvailPageFile',ctypes.c_ulonglong),('ullTotalVirtual',ctypes.c_ulonglong),('ullAvailVirtual',ctypes.c_ulonglong),('sullAvailExtendedVirtual',ctypes.c_ulonglong)]; m=M(); m.dwLength=ctypes.sizeof(M); ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)); cpu=os.cpu_count() or 1; total_gb=m.ullTotalPhys/(1024**3); reserve_gb=max(4.0,total_gb*0.20); per=float(os.environ.get('LOCAL_WEB_MEMORY_PER_WORKER_GB','3') or 3); by_mem=max(1,int((total_gb-reserve_gb)//per)); by_cpu=max(1,int(cpu*0.75)); max_slots=max(1,min(by_cpu,by_mem)); suggested=max(1,int(max_slots*0.5)); total_threads=max(1,int(cpu*0.75)); max_threads_per_child=max(1,min(4,max(1,total_threads//max(1,suggested)))); print(f'set LOCAL_WEB_DETECTED_CPU_COUNT={cpu}'); print(f'set LOCAL_WEB_DETECTED_MEMORY_GB={total_gb:.1f}'); print(f'set LOCAL_WEB_SUGGESTED_PROCESS_SLOTS={suggested}'); print(f'set LOCAL_WEB_MAX_PROCESS_SLOTS={max_slots}'); print(f'set LOCAL_WEB_TOTAL_COMPUTE_THREADS={total_threads}'); print(f'set LOCAL_WEB_MAX_THREADS_PER_CHILD={max_threads_per_child}')"`) do (
-
+for /f "usebackq delims=" %%L in (`python "%~dp0backend\detect_resources.py"`) do (
   %%L
-
 )
-
-
 
 echo [INFO] Detected CPU cores: %LOCAL_WEB_DETECTED_CPU_COUNT%
 
@@ -380,8 +368,6 @@ REM --------------------------------------------------
 REM Start server
 
 REM --------------------------------------------------
-set LOCAL_WEB_ADAPTIVE_CHILD_START=0
-set LOCAL_WEB_CHILD_START_STAGGER_SECONDS=0
 
 start "" http://127.0.0.1:8000
 

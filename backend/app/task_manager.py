@@ -7,7 +7,7 @@ import subprocess
 import threading
 import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -308,11 +308,22 @@ class TaskManager:
             while not future.done():
                 if task_id in self.cancel_flags:
                     self._signal_dask_cancel(task_id)
-                    try:
-                        future.cancel()
-                    except Exception:
-                        pass
-                    self.update_task(task_id, status="cancelled", ended_at=now_iso(), return_code=-1)
+                    # 先给远程 subprocess 时间读取共享取消标记并结束进程树，
+                    # 再取消 Future，避免取消文件被 finally 过早删除。
+                    deadline = time.time() + 5.0
+                    while time.time() < deadline and not future.done():
+                        time.sleep(0.2)
+                    if not future.done():
+                        try:
+                            future.cancel()
+                        except Exception:
+                            pass
+                    self.update_task(
+                        task_id,
+                        status="cancelled",
+                        ended_at=now_iso(),
+                        return_code=-1,
+                    )
                     return
                 time.sleep(0.5)
 
@@ -611,27 +622,6 @@ class TaskManager:
         except Exception as exc:
             self._mark_dask_parent_failed(parent_id, exc, "批处理")
 
-    def kick_scheduler(self):
-        """
-        外部主动唤醒调度器。
-        前端轮询 /api/tasks 或 /api/system/resources 时调用，
-        防止任务已经 queued 但调度器没有继续 drain。
-        """
-        try:
-            self._drain_scheduler_queue()
-        except Exception as exc:
-            try:
-                with self.lock:
-                    for item in self.scheduler_queue:
-                        task_id = str(item.get("task_id") or "")
-                        task = self.tasks.get(task_id)
-                        if task and task.get("status") == "queued":
-                            task["queue_reason"] = (
-                                f"调度器唤醒失败: {type(exc).__name__}: {exc}"
-                            )
-                self._save_tasks()
-            except Exception:
-                pass
     def kick_scheduler(self):
         """
         外部主动唤醒调度器。

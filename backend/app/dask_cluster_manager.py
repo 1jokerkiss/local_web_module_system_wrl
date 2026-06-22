@@ -451,14 +451,18 @@ class DaskClusterManager:
         all_ok = True
 
         for rule_name, port_text in ports:
+            # 删除旧规则的输出没有业务用途，直接丢弃，避免中文 netsh 输出在
+            # PYTHONUTF8=1 下被按 UTF-8 解码并触发 UnicodeDecodeError。
             subprocess.run(
                 [
                     "netsh", "advfirewall", "firewall", "delete", "rule",
                     f"name={rule_name}",
                 ],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=20,
                 shell=False,
+                check=False,
             )
 
             result = subprocess.run(
@@ -473,9 +477,12 @@ class DaskClusterManager:
                 ],
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
+                # Windows netsh 通常使用系统 ANSI 代码页，而不是 UTF-8。
+                encoding="mbcs",
                 errors="replace",
+                timeout=20,
                 shell=False,
+                check=False,
             )
 
             ok = result.returncode == 0
@@ -700,6 +707,7 @@ class DaskClusterManager:
             "head_api_url": self.state.get("head_api_url"),
             "package_spec": self.state.get("package_spec") or DASK_PACKAGE_SPEC,
             "shared_runtime_root": self.state.get("shared_runtime_root") or "",
+            "scheduler_port": self.state.get("scheduler_port") or 8786,
             "dashboard_port": self.state.get("dashboard_port") or 8787,
             "api_port": self.state.get("api_port") or 8790,
         }
@@ -817,17 +825,37 @@ class DaskClusterManager:
             })
         self._save_state()
 
-        # 等待 Worker 在 Scheduler 中出现。
+        # 等待“当前子节点”的 Worker 在 Scheduler 中出现。
+        # 不能只判断集群里存在任意 Worker，否则主节点 Worker 已在线时，
+        # 子节点即使注册失败也会被误报为加入成功。
+        registered = False
         end = time.time() + 30
         while time.time() < end:
             try:
                 info = self._scheduler_info()
-                names = {str(v.get("name") or "") for v in (info.get("workers") or {}).values()}
-                if worker_name in names or info.get("workers"):
+                names = {
+                    str(v.get("name") or "")
+                    for v in (info.get("workers") or {}).values()
+                }
+                registered = any(
+                    name == worker_name or name.startswith(f"{worker_name}-")
+                    for name in names
+                )
+                if registered:
                     break
             except Exception:
                 pass
             time.sleep(0.5)
+
+        if not registered:
+            self._terminate_pid(worker_pid)
+            self.state["worker_pid"] = None
+            self.state["last_error"] = (
+                f"Worker {worker_name} 在 30 秒内未注册到 Scheduler："
+                f"{scheduler_address}"
+            )
+            self._save_state()
+            raise DaskClusterError(self.state["last_error"])
 
         return self.status()
 
@@ -894,17 +922,43 @@ class DaskClusterManager:
                     "例如 \\\\192.168.2.100\\local_web_runtime"
                 )
 
+            probe = self.test_shared_path(
+                str(self.state.get("shared_runtime_root") or "")
+            )
+            if not probe.get("all_ready"):
+                raise DaskClusterError(
+                    "共享运行目录未通过全部节点的读写检测，不能启用分布式执行"
+                )
+
         self.state["execution_mode"] = mode
         self._save_state()
         return self.status()
 
-    def distributed_execution_enabled(self) -> bool:
+    def distributed_execution_requested(self) -> bool:
+        """用户是否明确选择了分布式执行模式。"""
         return (
             str(self.state.get("role") or "") == "head"
             and str(self.state.get("execution_mode") or "") == "distributed"
-            and bool(self.state.get("scheduler_address"))
-            and self._pid_alive(self.state.get("scheduler_pid"))
         )
+
+    def distributed_execution_enabled(self) -> bool:
+        """分布式模式是否真正可用。"""
+        if not self.distributed_execution_requested():
+            return False
+        if not str(self.state.get("scheduler_address") or "").strip():
+            return False
+        if not self._pid_alive(self.state.get("scheduler_pid")):
+            return False
+
+        try:
+            info = self._scheduler_info()
+            return bool(info.get("workers") or {})
+        except Exception as exc:
+            self.state["last_error"] = (
+                f"Scheduler/Worker 不可用：{type(exc).__name__}: {exc}"
+            )
+            self._save_state()
+            return False
 
     def get_shared_runtime_root(self) -> str:
         return str(self.state.get("shared_runtime_root") or "").strip()
