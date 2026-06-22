@@ -110,6 +110,22 @@ class TaskManager:
         """注入 DaskClusterManager，避免 TaskManager 直接依赖 FastAPI 层。"""
         self.cluster_manager = cluster_manager
 
+    def _distributed_execution_requested(self) -> bool:
+        manager = self.cluster_manager
+        if manager is None:
+            return False
+        try:
+            requested = getattr(manager, "distributed_execution_requested", None)
+            if callable(requested):
+                return bool(requested())
+            state = getattr(manager, "state", {}) or {}
+            return (
+                str(state.get("role") or "") == "head"
+                and str(state.get("execution_mode") or "") == "distributed"
+            )
+        except Exception:
+            return False
+
     def _distributed_execution_enabled(self) -> bool:
         manager = self.cluster_manager
         if manager is None:
@@ -120,8 +136,25 @@ class TaskManager:
             return False
 
     def _distributed_parent_slots(self, local_slots: int) -> int:
-        # Dask 任务本机只运行一个协调线程，不应占用 local_slots 个本机进程槽。
-        return 1 if self._distributed_execution_enabled() else max(1, int(local_slots or 1))
+        # 用户已选择分布式时，父任务只占一个本机协调槽。
+        # 即使 Scheduler 暂时不可用，也不应退回并占用多个本机执行槽。
+        return 1 if self._distributed_execution_requested() else max(1, int(local_slots or 1))
+
+    def _fail_when_dask_unavailable(self, task_id: str, task_kind: str = "任务"):
+        """用户选择分布式但集群不可用时直接失败，禁止静默退回本机执行。"""
+        message = (
+            "已选择分布式执行，但当前 Dask Scheduler 或 Worker 不可用。"
+            "系统不会自动退回本机运行，请检查主节点、Worker、共享目录和执行模式。"
+        )
+        self.append_log(task_id, f"[DASK-ERROR] {message}")
+        self.update_task(
+            task_id,
+            status="failed",
+            return_code=-1,
+            ended_at=now_iso(),
+            execution_backend="dask",
+            queue_reason=message,
+        )
 
     def _prepare_dask_payload(self, spec: Dict[str, Any], job_id: str) -> Dict[str, Any]:
         command = [str(x) for x in (spec.get("command") or [])]
@@ -1466,11 +1499,21 @@ class TaskManager:
 
         self._append_parallel_adjustment_log(task["id"], inputs)
         # 单个模块进程只占 1 个真实启动槽；parallel_workers 只写入配置，不作为父任务排队条件。
-        runner = self._run_dask_single_task if self._distributed_execution_enabled() else self._run_process_task
+        if self._distributed_execution_requested():
+            if self._distributed_execution_enabled():
+                runner = self._run_dask_single_task
+                runner_args = (task["id"], command, working_dir, env)
+            else:
+                runner = self._fail_when_dask_unavailable
+                runner_args = (task["id"], "单模块任务")
+        else:
+            runner = self._run_process_task
+            runner_args = (task["id"], command, working_dir, env)
+
         self._enqueue_task_runner(
             task["id"],
             runner,
-            (task["id"], command, working_dir, env),
+            runner_args,
             requested_slots=1,
         )
         return self.get_task(task["id"]) or task
@@ -1634,8 +1677,10 @@ class TaskManager:
         child_job_map: Dict[str, Dict[str, Any]],
         max_parallel: int,
     ):
-        if self._distributed_execution_enabled():
-            return self._run_batch_group_dask(parent_id, child_job_map, max_parallel)
+        if self._distributed_execution_requested():
+            if self._distributed_execution_enabled():
+                return self._run_batch_group_dask(parent_id, child_job_map, max_parallel)
+            return self._fail_when_dask_unavailable(parent_id, "批处理任务")
 
         total = len(child_job_map)
         max_parallel = max(1, int(max_parallel or 1))
@@ -2014,8 +2059,10 @@ class TaskManager:
             self._save_tasks()
 
     def _run_parallel_task(self, parent_id: str, jobs: List[Dict[str, Any]], max_workers: int):
-        if self._distributed_execution_enabled():
-            return self._run_parallel_task_dask(parent_id, jobs, max_workers)
+        if self._distributed_execution_requested():
+            if self._distributed_execution_enabled():
+                return self._run_parallel_task_dask(parent_id, jobs, max_workers)
+            return self._fail_when_dask_unavailable(parent_id, "并行任务")
 
         total = len(jobs)
         max_workers = max(1, min(int(max_workers or 1), max(1, total)))
@@ -2030,6 +2077,7 @@ class TaskManager:
             max_workers=max_workers,
         )
 
+        self.append_log(parent_id, "[BACKEND] 当前任务使用本机进程池（local），未提交到 Dask 集群")
         self.append_log(parent_id, f"[PARALLEL] 并行任务启动：总任务数={total}，实际并行数={max_workers}")
         parent_task = self.get_task(parent_id) or {}
         parent_inputs = parent_task.get("inputs") or {}

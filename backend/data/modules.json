@@ -168,7 +168,7 @@
     ],
     "tool_type": "aerosol",
     "parallel": {
-      "mode": "batch_group",
+      "mode": "auto",
       "input_key": "",
       "output_key": "",
       "file_patterns": "*.tif;*.tiff;*.img;*.hdf;*.HDF;*.h5;*.H5;*.nc;*.NC;*.dat;*.DAT",
@@ -237,75 +237,6 @@
       "executable"
     ],
     "enabled": true
-  },
-  {
-    "id": "H8_CLOUD_TYPE",
-    "name": "葵花8号云类型反演",
-    "description": "葵花8号卫星云类型反演 Python 源码模块",
-    "enabled": true,
-    "tool_type": "cloud",
-    "runtime_type": "python_venv",
-    "python_env_mode": "create_venv",
-    "base_python_executable": "D:\\develop\\py38\\python.exe",
-    "install_release": "20260612_195843",
-    "config_mode": "config_json",
-    "command_template": [
-      "{executable}",
-      "{entry_script}",
-      "{config_json}"
-    ],
-    "inputs": [
-      {
-        "key": "file",
-        "label": "file",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "input",
-        "default": "D:/local_web_module_system/NC1"
-      },
-      {
-        "key": "cm_files",
-        "label": "cm_files",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "input",
-        "default": "D:/local_web_module_system/CM_24"
-      },
-      {
-        "key": "outpath",
-        "label": "outpath",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "output",
-        "default": "D:/local_web_module_system/NC_1"
-      }
-    ],
-    "param_template": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260612_195843/param_template.json",
-    "source_dir": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260612_195843/source",
-    "entry_file": "CM_CTH.py",
-    "entry_script": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260612_195843/source/CM_CTH.py",
-    "python_env_dir": "backend/module_envs/H8_CLOUD_TYPE_20260612_195843",
-    "executable": "backend/module_envs/H8_CLOUD_TYPE_20260612_195843/Scripts/python.exe",
-    "working_dir": "backend/installed_modules/H8_CLOUD_TYPE/releases/20260612_195843/source",
-    "parallel": {
-      "mode": "auto",
-      "input_key": "",
-      "output_key": "",
-      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
-      "output_suffix": ".tif",
-      "files_per_job": 1,
-      "chunk_multiplier": 1
-    },
-    "category": "cloud"
   },
   {
     "id": "parasol_aod",
@@ -391,5 +322,73 @@
       }
     ],
     "category": "aerosol"
+  },
+  {
+    "id": "H8_CLOUD_TYPE_PY",
+    "name": "葵花8号云类型反演（Python源码）",
+    "description": "使用 Python 源码运行葵花8号云掩膜与云相态反演。",
+    "enabled": true,
+    "tool_type": "cloud",
+    "runtime_type": "python_venv",
+    "python_env_mode": "existing",
+    "base_python_executable": "D:\\envs\\h8_py38\\python.exe",
+    "install_release": "20260618_210850",
+    "config_mode": "config_json",
+    "command_template": [
+      "{executable}",
+      "{entry_script}",
+      "{config_json}"
+    ],
+    "inputs": [
+      {
+        "key": "file",
+        "label": "file",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/H8/data/input"
+      },
+      {
+        "key": "cm_files",
+        "label": "cm_files",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/H8/data/CM"
+      },
+      {
+        "key": "outpath",
+        "label": "outpath",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "D:/H8/data/output"
+      }
+    ],
+    "param_template": "backend/installed_modules/H8_CLOUD_TYPE_PY/releases/20260618_210850/param_template.json",
+    "source_dir": "backend/installed_modules/H8_CLOUD_TYPE_PY/releases/20260618_210850/source",
+    "entry_file": "CM_CTH_2_optimized.py",
+    "entry_script": "backend/installed_modules/H8_CLOUD_TYPE_PY/releases/20260618_210850/source/CM_CTH_2_optimized.py",
+    "python_env_dir": "D:\\envs",
+    "executable": "D:\\envs\\h8_py38\\python.exe",
+    "working_dir": "backend/installed_modules/H8_CLOUD_TYPE_PY/releases/20260618_210850/source",
+    "parallel": {
+      "mode": "auto",
+      "input_key": "",
+      "output_key": "",
+      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1
+    }
   }
 ]

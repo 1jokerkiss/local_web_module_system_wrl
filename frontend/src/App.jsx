@@ -146,13 +146,15 @@ const styles = {
   page: {
     minHeight: '100vh',
     width: '100%',
-    maxWidth: '100%',
+    maxWidth: '100vw',
     overflowX: 'hidden',
+    boxSizing: 'border-box',
     background: 'linear-gradient(180deg, #eef4fa 0%, #e7f0f8 100%)',
     color: '#113459',
   },
   topbar: {
     minHeight: 74,
+    height: 'auto',
     background: 'linear-gradient(135deg, #0b315a 0%, #12487f 55%, #1a67b6 100%)',
     color: '#fff',
     display: 'flex',
@@ -160,6 +162,9 @@ const styles = {
     justifyContent: 'space-between',
     flexWrap: 'wrap',
     gap: 12,
+    width: '100%',
+    minWidth: 0,
+    boxSizing: 'border-box',
     padding: '10px 18px',
     boxShadow: '0 8px 22px rgba(7,39,76,0.22)',
   },
@@ -1930,7 +1935,6 @@ function DistributedPage({
   busy,
   message,
   sharedPathTest,
-  canManage = false,
   onRefresh,
   onInstall,
   onFirewall,
@@ -1940,6 +1944,7 @@ function DistributedPage({
   onStop,
   onSetMode,
   onTestSharedPath,
+  isAdmin = false,
 }) {
   const info = status || {};
   const node = info.node || {};
@@ -1974,7 +1979,7 @@ function DistributedPage({
   );
 
   const field = (label, key, type = 'text', placeholder = '') => (
-    <label style={{ display: 'grid', gap: 6, minWidth: 0 }}>
+    <label style={{ display: 'grid', gap: 6, minWidth: 0, maxWidth: '100%' }}>
       <span style={{ fontWeight: 800, color: '#24486d', fontSize: 13 }}>{label}</span>
       <input
         type={type}
@@ -1996,15 +2001,18 @@ function DistributedPage({
   };
 
   return (
-    <section style={{
-      minHeight: 'calc(100vh - 98px)',
-      width: '100%',
-      maxWidth: '100%',
-      minWidth: 0,
-      overflowX: 'hidden',
-      display: 'grid',
-      gap: 16,
-    }}>
+    <section
+      style={{
+        minHeight: 'calc(100vh - 98px)',
+        display: 'grid',
+        gap: 16,
+        width: '100%',
+        maxWidth: '100%',
+        minWidth: 0,
+        overflowX: 'hidden',
+        boxSizing: 'border-box',
+      }}
+    >
       <div
         style={{
           ...styles.card,
@@ -2016,6 +2024,10 @@ function DistributedPage({
           backgroundSize: 'cover',
           backgroundPosition: 'center',
           color: '#fff',
+          width: '100%',
+          maxWidth: '100%',
+          minWidth: 0,
+          boxSizing: 'border-box',
         }}
       >
         <div style={{ padding: '28px 32px', maxWidth: 900 }}>
@@ -2029,7 +2041,6 @@ function DistributedPage({
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 18 }}>
             {statusBadge(pkg.installed, `Dask ${pkg.distributed_version || ''} 已安装`, 'Dask 未安装')}
             {statusBadge(info.scheduler_online, 'Scheduler 在线', 'Scheduler 未连接')}
-            {info.role === 'head' && statusBadge(info.join_service_online, '加入服务在线', '加入服务未启动')}
             {statusBadge(info.worker_count > 0, `${info.worker_count || 0} 个 Worker`, '暂无 Worker')}
             <span style={{
               display: 'inline-flex',
@@ -2067,20 +2078,23 @@ function DistributedPage({
         </div>
       )}
 
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 420px), 1fr))',
-        gap: 16,
-        width: '100%',
-        minWidth: 0,
-      }}>
-        <div style={{ ...styles.card, padding: 18, minWidth: 0 }}>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 500px), 1fr))',
+          gap: 16,
+          width: '100%',
+          maxWidth: '100%',
+          minWidth: 0,
+        }}
+      >
+        <div style={{ ...styles.card, padding: 18, minWidth: 0, maxWidth: '100%', width: '100%', boxSizing: 'border-box' }}>
           <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
             当前节点信息
           </div>
           <div style={{
             display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 260px), 1fr))',
             gap: 10,
           }}>
             {[
@@ -2121,7 +2135,7 @@ function DistributedPage({
             <button style={styles.whiteBtn} disabled={!!busy} onClick={onInstall}>
               {pkg.installed ? '重新检查/升级 Dask' : '一键安装 Dask'}
             </button>
-            {canManage && (
+            {isAdmin && (
               <button style={styles.whiteBtn} disabled={!!busy} onClick={onFirewall}>
                 配置 Windows 防火墙
               </button>
@@ -2137,18 +2151,32 @@ function DistributedPage({
           </div>
         </div>
 
-        {canManage ? (
-        <div style={{ ...styles.card, padding: 18, minWidth: 0 }}>
-            <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
+        {isAdmin ? (
+        <div style={{ ...styles.card, padding: 18, minWidth: 0, maxWidth: '100%', width: '100%', boxSizing: 'border-box' }}>
+          <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
             创建主节点
           </div>
           <div style={{ display: 'grid', gap: 10 }}>
             {field('主节点对外 IP（留空自动识别）', 'bind_ip', 'text', node.ip || '192.168.2.100')}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, minWidth: 0 }}>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 170px), 1fr))',
+                gap: 10,
+                minWidth: 0,
+              }}
+            >
               {field('Scheduler 端口', 'scheduler_port', 'number')}
               {field('Dashboard 端口', 'dashboard_port', 'number')}
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, minWidth: 0 }}>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 170px), 1fr))',
+                gap: 10,
+                minWidth: 0,
+              }}
+            >
               {field('本机 Worker 进程数', 'head_nworkers', 'number')}
               {field('每个 Worker 线程数', 'head_nthreads', 'number')}
             </div>
@@ -2174,7 +2202,7 @@ function DistributedPage({
                   复制
                 </button>
                 <br />
-                加入服务端口：<b>{info.api_port || 8790}</b>
+                API 端口：<b>{info.api_port || 8000}</b>
                 <br />
                 加入令牌：<code style={{ overflowWrap: 'anywhere' }}>{info.join_token || '-'}</code>
                 <button style={{ ...styles.whiteBtn, padding: '4px 8px', marginLeft: 8 }} onClick={() => copyText(info.join_token)}>
@@ -2185,37 +2213,63 @@ function DistributedPage({
           )}
         </div>
         ) : (
-          <div style={{ ...styles.card, padding: 18, minWidth: 0 }}>
+          <div
+            style={{
+              ...styles.card,
+              padding: 18,
+              minWidth: 0,
+              maxWidth: '100%',
+              width: '100%',
+              boxSizing: 'border-box',
+            }}
+          >
             <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 10 }}>
-              集群使用权限
+              集群使用说明
             </div>
-            <div style={{ color: '#49627f', lineHeight: 1.8 }}>
-              普通用户可以查看节点状态、安装 Dask、把当前电脑加入或退出已有集群。
-              创建主节点、停止集群、配置防火墙以及切换全局执行模式由管理员负责。
+            <div style={{ color: '#49627f', lineHeight: 1.8, fontSize: 14 }}>
+              普通用户可以查看集群状态、安装 Dask，并将当前电脑作为 Worker 加入已有集群。
+              创建主节点、停止整个集群、配置防火墙和切换全局执行模式由管理员完成。
             </div>
           </div>
         )}
       </div>
 
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 420px), 1fr))',
-        gap: 16,
-        width: '100%',
-        minWidth: 0,
-      }}>
-        <div style={{ ...styles.card, padding: 18, minWidth: 0 }}>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 500px), 1fr))',
+          gap: 16,
+          width: '100%',
+          maxWidth: '100%',
+          minWidth: 0,
+        }}
+      >
+        <div style={{ ...styles.card, padding: 18, minWidth: 0, maxWidth: '100%', width: '100%', boxSizing: 'border-box' }}>
           <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
             加入已有集群
           </div>
           <div style={{ display: 'grid', gap: 10 }}>
             {field('主节点 IP', 'head_ip', 'text', '192.168.2.100')}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, minWidth: 0 }}>
-              {field('主节点加入端口', 'api_port', 'number')}
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 170px), 1fr))',
+                gap: 10,
+                minWidth: 0,
+              }}
+            >
+              {field('主节点 API 端口', 'api_port', 'number')}
               {field('节点名称', 'worker_name', 'text', node.hostname || 'worker-01')}
             </div>
             {field('加入令牌', 'join_token', 'password', '主节点页面生成的令牌')}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, minWidth: 0 }}>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 170px), 1fr))',
+                gap: 10,
+                minWidth: 0,
+              }}
+            >
               {field('Worker 进程数', 'nworkers', 'number')}
               {field('每个 Worker 线程数', 'nthreads', 'number')}
             </div>
@@ -2232,12 +2286,12 @@ function DistributedPage({
             )}
           </div>
           <div style={{ marginTop: 12, color: '#6a7f96', fontSize: 12, lineHeight: 1.7 }}>
-            子节点需要先启动本系统。主节点创建集群后会自动启动独立的局域网加入服务，
-            不再要求主 FastAPI 必须使用 <code>--host 0.0.0.0</code>。
+            子节点必须先启动本系统后端。主节点后端需要使用 <code>--host 0.0.0.0</code>，
+            才能允许其他电脑完成加入握手。
           </div>
         </div>
 
-        <div style={{ ...styles.card, padding: 18, minWidth: 0 }}>
+        <div style={{ ...styles.card, padding: 18, minWidth: 0, maxWidth: '100%', width: '100%', boxSizing: 'border-box' }}>
           <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
             任务执行模式与共享目录
           </div>
@@ -2248,7 +2302,7 @@ function DistributedPage({
           <div style={{ marginTop: 12 }}>
             {field('共享运行目录', 'shared_runtime_root', 'text', '\\\\主节点IP\\local_web_runtime')}
           </div>
-          {canManage ? (
+          {isAdmin ? (
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 14 }}>
               <button
                 style={info.execution_mode === 'distributed' ? styles.blueBtn : styles.whiteBtn}
@@ -2273,8 +2327,17 @@ function DistributedPage({
               </button>
             </div>
           ) : (
-            <div style={{ marginTop: 14, color: '#6a7f96', fontSize: 13 }}>
-              当前执行模式由管理员统一设置：<strong>{info.execution_mode === 'distributed' ? '分布式' : '本机'}</strong>
+            <div
+              style={{
+                marginTop: 14,
+                padding: '10px 12px',
+                borderRadius: 10,
+                background: '#eef6ff',
+                color: '#17406b',
+                fontWeight: 800,
+              }}
+            >
+              当前全局执行模式：{info.execution_mode === 'distributed' ? '分布式' : '本机'}
             </div>
           )}
           {sharedPathTest && (
@@ -2288,7 +2351,17 @@ function DistributedPage({
               <div style={{ fontWeight: 900 }}>
                 {sharedPathTest.all_ready ? '所有节点均可读写' : '部分节点无法访问共享目录'}
               </div>
-              <pre style={{ marginTop: 8, maxHeight: 220, fontSize: 12, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+              <pre
+                style={{
+                  marginTop: 8,
+                  maxHeight: 220,
+                  maxWidth: '100%',
+                  overflow: 'auto',
+                  whiteSpace: 'pre-wrap',
+                  overflowWrap: 'anywhere',
+                  fontSize: 12,
+                }}
+              >
                 {JSON.stringify(sharedPathTest, null, 2)}
               </pre>
             </div>
@@ -2296,12 +2369,22 @@ function DistributedPage({
         </div>
       </div>
 
-      <div style={{ ...styles.card, padding: 18, overflow: 'hidden', minWidth: 0, maxWidth: '100%' }}>
+      <div
+        style={{
+          ...styles.card,
+          padding: 18,
+          overflow: 'hidden',
+          minWidth: 0,
+          maxWidth: '100%',
+          width: '100%',
+          boxSizing: 'border-box',
+        }}
+      >
         <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
           集群节点
         </div>
-        <div style={{ overflow: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 900 }}>
+        <div style={{ width: '100%', maxWidth: '100%', minWidth: 0, overflowX: 'auto', overflowY: 'hidden' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 760 }}>
             <thead>
               <tr>
                 {['节点名称', '地址', '主机', '状态', '线程数', '内存限制', '已用内存', 'CPU', '执行任务'].map((x) => (
@@ -2330,20 +2413,48 @@ function DistributedPage({
         </div>
       </div>
 
-      <div style={{ ...styles.card, padding: 18, minWidth: 0 }}>
+      <div style={{ ...styles.card, padding: 18, minWidth: 0, maxWidth: '100%', width: '100%', boxSizing: 'border-box' }}>
         <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
           Dask 运行日志
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 360px), 1fr))', gap: 12, minWidth: 0 }}>
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 420px), 1fr))',
+            gap: 12,
+            width: '100%',
+            minWidth: 0,
+          }}
+        >
           <div>
             <div style={{ fontWeight: 800, marginBottom: 6 }}>Scheduler</div>
-            <pre style={{ minHeight: 180, maxHeight: 320, fontSize: 12, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+            <pre
+              style={{
+                minHeight: 180,
+                maxHeight: 320,
+                maxWidth: '100%',
+                overflow: 'auto',
+                whiteSpace: 'pre-wrap',
+                overflowWrap: 'anywhere',
+                fontSize: 12,
+              }}
+            >
               {info.logs?.scheduler || '暂无日志'}
             </pre>
           </div>
           <div>
             <div style={{ fontWeight: 800, marginBottom: 6 }}>Worker</div>
-            <pre style={{ minHeight: 180, maxHeight: 320, fontSize: 12, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+            <pre
+              style={{
+                minHeight: 180,
+                maxHeight: 320,
+                maxWidth: '100%',
+                overflow: 'auto',
+                whiteSpace: 'pre-wrap',
+                overflowWrap: 'anywhere',
+                fontSize: 12,
+              }}
+            >
               {info.logs?.worker || '暂无日志'}
             </pre>
           </div>
@@ -2397,17 +2508,17 @@ export default function App() {
     bind_ip: '',
     scheduler_port: '8786',
     dashboard_port: '8787',
-    api_port: '8790',
+    api_port: '8000',
     head_nworkers: '1',
     head_nthreads: '1',
-    head_memory_limit: 'auto',
+    head_memory_limit: '4GB',
     shared_runtime_root: '',
     head_ip: '',
     join_token: '',
     worker_name: '',
     nworkers: '1',
     nthreads: '1',
-    memory_limit: 'auto',
+    memory_limit: '4GB',
   });
 
   const [activeTab, setActiveTab] = useState(() => getSavedActiveTab() || 'module_mgmt');
@@ -2508,8 +2619,6 @@ export default function App() {
     if (isAdmin) {
       arr.push({ key: 'user_mgmt', label: '用户管理' });
     }
-    // 分布式页面对管理员和普通用户均可见；
-    // 普通用户可查看状态并加入/退出集群，管理操作仍由管理员控制。
     arr.push({ key: 'distributed', label: '分布式' });
 
     return arr;
@@ -3248,25 +3357,56 @@ async function installModuleFolder() {
 
   async function handleDaskFirewall() {
     return runDistributedAction('配置防火墙', () => openDaskFirewall({
-      api_port: Number(distributedForm.api_port || 8790),
+      api_port: Number(distributedForm.api_port || 8000),
       scheduler_port: Number(distributedForm.scheduler_port || 8786),
       dashboard_port: Number(distributedForm.dashboard_port || 8787),
     }));
   }
 
   async function handleDaskStartHead() {
-    return runDistributedAction('创建集群', () => startDaskHead({
+    const sharedRoot = String(distributedForm.shared_runtime_root || '').trim();
+    if (!sharedRoot) {
+      setDistributedMessage({
+        type: 'error',
+        text: '创建可执行分布式集群前必须填写所有节点都可访问的共享运行目录，例如 \\\\192.168.2.138\\local_web_runtime。',
+      });
+      return null;
+    }
+
+    const started = await runDistributedAction('创建集群', () => startDaskHead({
       bind_ip: distributedForm.bind_ip || '',
       scheduler_port: Number(distributedForm.scheduler_port || 8786),
       dashboard_port: Number(distributedForm.dashboard_port || 8787),
-      api_port: Number(distributedForm.api_port || 8790),
+      api_port: Number(distributedForm.api_port || 8000),
       worker_name: distributedForm.worker_name || '',
       nworkers: Number(distributedForm.head_nworkers || 1),
       nthreads: Number(distributedForm.head_nthreads || 1),
-      memory_limit: distributedForm.head_memory_limit || 'auto',
-      shared_runtime_root: distributedForm.shared_runtime_root || '',
+      memory_limit: distributedForm.head_memory_limit || '4GB',
+      shared_runtime_root: sharedRoot,
       auto_install: true,
     }));
+
+    if (!started) return null;
+
+    const probe = await runDistributedAction(
+      '检测共享目录',
+      () => testDaskSharedPath(sharedRoot),
+    );
+    if (!probe?.all_ready) {
+      setDistributedSharedPathTest(probe || null);
+      setDistributedMessage({
+        type: 'error',
+        text: '集群已创建，但部分 Worker 无法读写共享目录，因此尚未启用分布式任务调度。',
+      });
+      return started;
+    }
+
+    setDistributedSharedPathTest(probe);
+    await runDistributedAction(
+      '启用分布式任务调度',
+      () => setDistributedExecutionMode('distributed', sharedRoot),
+    );
+    return started;
   }
 
   async function handleDaskJoin() {
@@ -3280,12 +3420,12 @@ async function installModuleFolder() {
     }
     return runDistributedAction('加入集群', () => joinDaskCluster({
       head_ip: distributedForm.head_ip,
-      api_port: Number(distributedForm.api_port || 8790),
+      api_port: Number(distributedForm.api_port || 8000),
       join_token: distributedForm.join_token,
       worker_name: distributedForm.worker_name || '',
       nworkers: Number(distributedForm.nworkers || 1),
       nthreads: Number(distributedForm.nthreads || 1),
-      memory_limit: distributedForm.memory_limit || 'auto',
+      memory_limit: distributedForm.memory_limit || '4GB',
       auto_install: true,
     }));
   }
@@ -5148,9 +5288,9 @@ function renderTaskManagementPage() {
   return (
     <div style={styles.page}>
       <div style={styles.topbar}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 18, flexWrap: 'wrap', minWidth: 0, flex: '1 1 760px' }}>
-          <div style={{ fontSize: 26, fontWeight: 900 }}>云和气溶胶反演系统</div>
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 18, flexWrap: 'wrap', minWidth: 0, flex: '1 1 auto' }}>
+          <div style={{ fontSize: 26, fontWeight: 900, whiteSpace: 'nowrap', flexShrink: 0 }}>云和气溶胶反演系统</div>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', minWidth: 0 }}>
             {navItems.map((item) => (
                 <button
                     key={item.key}
@@ -5166,7 +5306,7 @@ function renderTaskManagementPage() {
           </div>
         </div>
 
-        <div style={{display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', minWidth: 0}}>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', minWidth: 0, flexShrink: 0 }}>
           <div style={{fontWeight: 700}}>
             当前用户：{currentUser.username}（{currentUser.role}）
           </div>
@@ -5174,7 +5314,16 @@ function renderTaskManagementPage() {
         </div>
       </div>
 
-      <div style={{ padding: 12, width: '100%', maxWidth: '100%', minWidth: 0, overflowX: 'hidden' }}>
+      <div
+        style={{
+          padding: 12,
+          width: '100%',
+          maxWidth: '100%',
+          minWidth: 0,
+          overflowX: 'hidden',
+          boxSizing: 'border-box',
+        }}
+      >
         {activeTab === 'module_mgmt' && isAdmin && (
           <section
             style={{
@@ -5642,7 +5791,6 @@ function renderTaskManagementPage() {
             busy={distributedBusy}
             message={distributedMessage}
             sharedPathTest={distributedSharedPathTest}
-            canManage={isAdmin}
             onRefresh={() => refreshDistributedStatus(false)}
             onInstall={handleDaskInstall}
             onFirewall={handleDaskFirewall}
@@ -5652,6 +5800,7 @@ function renderTaskManagementPage() {
             onStop={handleDaskStop}
             onSetMode={handleDaskSetMode}
             onTestSharedPath={handleDaskTestSharedPath}
+            isAdmin={isAdmin}
           />
         )}
       </div>
