@@ -205,7 +205,7 @@ class DaskStartHeadRequest(BaseModel):
     worker_name: str = ""
     nworkers: int = 1
     nthreads: int = 1
-    memory_limit: str = "auto"
+    memory_limit: str = "4GB"
     shared_runtime_root: str = ""
     auto_install: bool = True
 
@@ -217,7 +217,7 @@ class DaskJoinRequest(BaseModel):
     worker_name: str = ""
     nworkers: int = 1
     nthreads: int = 1
-    memory_limit: str = "auto"
+    memory_limit: str = "4GB"
     auto_install: bool = True
 
 

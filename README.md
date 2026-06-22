@@ -1,41 +1,23 @@
-# Dask 自动分布式执行修复
+# 代码检查与修复结果
 
-本修复解决：
+已通过：
+- Python 语法检查；
+- React/JSX esbuild 编译检查；
+- 前端 Dask API 与后端路由字段一致性检查。
 
-1. 集群在线但任务仍静默使用本机进程池；
-2. 用户选择 distributed 后 Scheduler/Worker 离线时自动回退本机；
-3. 创建主节点后忘记手动点击“启用分布式任务调度”；
-4. Worker 使用 auto 内存限制过低。
+已修复：
+1. 创建主节点时在共享目录检测前错误地直接启用 distributed；
+2. distributed_execution_enabled 只检查 PID，不检查 Scheduler/Worker；
+3. 子节点加入时只要集群已有任意 Worker 就误判加入成功；
+4. 启用 distributed 时未强制验证所有 Worker 共享目录；
+5. 单个 Dask 任务取消后过早删除共享取消标记；
+6. TaskManager 重复定义 kick_scheduler、重复导入 time；
+7. 前端并行进度把失败任务重复计数；
+8. 前端仍提示主 FastAPI 必须监听 0.0.0.0；
+9. Dask 2024.7.1 与残留 dask-expr 2.x 的依赖冲突；
+10. 后端 Dask Worker 默认内存限制与前端不一致。
 
-替换文件：
-
-- backend/app/dask_cluster_manager.py
-- backend/app/task_manager.py
-- frontend/src/App.jsx
-
-替换后执行：
-
-```bat
-cd /d D:\local_web_module_system\frontend
-npm run build
-```
-
-然后重启所有节点后端。
-
-推荐参数：
-
-- 每台电脑 Worker 进程数：1
-- 每个 Worker 线程数：1
-- 每个 Worker 内存限制：4GB（内存不足的电脑可改 2GB）
-- 共享运行目录：所有节点可读写的 UNC 路径
-
-创建主节点时，前端会：
-1. 强制要求共享目录；
-2. 创建 Scheduler 和主节点 Worker；
-3. 检测所有 Worker 的共享目录；
-4. 检测通过后自动切换为 distributed。
-
-任务日志判断：
-- `[DASK]`：使用集群
-- `[BACKEND] 当前任务使用本机进程池`：本机执行
-- `[DASK-ERROR]`：已选择分布式，但集群不可用，任务失败且不会静默回退本机
+仍需部署层面保证：
+- 各节点模块源码、模型和 Python/EXE 路径一致；
+- 输入、输出、shared_runtime_root 对全部 Worker 可访问；
+- 8790、8786、8787 防火墙端口可访问。

@@ -855,14 +855,15 @@ function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
 
   const parallelTotal = Number.parseInt(String(task?.parallel_total || 0), 10) || 0;
   if (parallelTotal > 0) {
-    const done = Number.parseInt(String(task?.parallel_done || 0), 10) || 0;
+    const completed = Number.parseInt(String(task?.parallel_done || 0), 10) || 0;
     const failed = Number.parseInt(String(task?.parallel_failed || 0), 10) || 0;
-    const finished = Math.min(parallelTotal, done + failed);
+    const finished = Math.min(parallelTotal, completed);
+    const succeeded = Math.max(0, finished - failed);
     const percent = Math.max(0, Math.min(99, Math.round((finished / parallelTotal) * 100)));
     return {
       percent,
       label: `子任务进度：${finished}/${parallelTotal}`,
-      detail: `成功 ${done} 个，失败 ${failed} 个${elapsedText ? `，已运行 ${elapsedText}` : ''}`,
+      detail: `成功 ${succeeded} 个，失败 ${failed} 个${elapsedText ? `，已运行 ${elapsedText}` : ''}`,
       mode: 'parallel',
       color: '#2d7cf6',
     };
@@ -2180,7 +2181,7 @@ function DistributedPage({
               {field('本机 Worker 进程数', 'head_nworkers', 'number')}
               {field('每个 Worker 线程数', 'head_nthreads', 'number')}
             </div>
-            {field('每个 Worker 内存限制', 'head_memory_limit', 'text', 'auto 或 8GB')}
+            {field('每个 Worker 内存限制', 'head_memory_limit', 'text', '例如 4GB')}
             {field('共享运行目录（推荐 UNC）', 'shared_runtime_root', 'text', '\\\\192.168.2.100\\local_web_runtime')}
           </div>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 14 }}>
@@ -2202,7 +2203,7 @@ function DistributedPage({
                   复制
                 </button>
                 <br />
-                API 端口：<b>{info.api_port || 8000}</b>
+                加入服务端口：<b>{info.api_port || 8790}</b>
                 <br />
                 加入令牌：<code style={{ overflowWrap: 'anywhere' }}>{info.join_token || '-'}</code>
                 <button style={{ ...styles.whiteBtn, padding: '4px 8px', marginLeft: 8 }} onClick={() => copyText(info.join_token)}>
@@ -2258,7 +2259,7 @@ function DistributedPage({
                 minWidth: 0,
               }}
             >
-              {field('主节点 API 端口', 'api_port', 'number')}
+              {field('主节点加入端口', 'api_port', 'number', '默认 8790')}
               {field('节点名称', 'worker_name', 'text', node.hostname || 'worker-01')}
             </div>
             {field('加入令牌', 'join_token', 'password', '主节点页面生成的令牌')}
@@ -2273,7 +2274,7 @@ function DistributedPage({
               {field('Worker 进程数', 'nworkers', 'number')}
               {field('每个 Worker 线程数', 'nthreads', 'number')}
             </div>
-            {field('每个 Worker 内存限制', 'memory_limit', 'text', 'auto 或 8GB')}
+            {field('每个 Worker 内存限制', 'memory_limit', 'text', '例如 4GB')}
           </div>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 14 }}>
             <button style={styles.blueBtn} disabled={!!busy} onClick={onJoin}>
@@ -2286,8 +2287,8 @@ function DistributedPage({
             )}
           </div>
           <div style={{ marginTop: 12, color: '#6a7f96', fontSize: 12, lineHeight: 1.7 }}>
-            子节点必须先启动本系统后端。主节点后端需要使用 <code>--host 0.0.0.0</code>，
-            才能允许其他电脑完成加入握手。
+            子节点必须先启动本系统后端。主节点创建集群后会启动独立加入服务，
+            默认监听 <code>8790</code>；请确认主节点防火墙已开放加入端口和 <code>8786</code>。
           </div>
         </div>
 
@@ -2508,7 +2509,7 @@ export default function App() {
     bind_ip: '',
     scheduler_port: '8786',
     dashboard_port: '8787',
-    api_port: '8000',
+    api_port: '8790',
     head_nworkers: '1',
     head_nthreads: '1',
     head_memory_limit: '4GB',
@@ -3357,7 +3358,7 @@ async function installModuleFolder() {
 
   async function handleDaskFirewall() {
     return runDistributedAction('配置防火墙', () => openDaskFirewall({
-      api_port: Number(distributedForm.api_port || 8000),
+      api_port: Number(distributedForm.api_port || 8790),
       scheduler_port: Number(distributedForm.scheduler_port || 8786),
       dashboard_port: Number(distributedForm.dashboard_port || 8787),
     }));
@@ -3377,7 +3378,7 @@ async function installModuleFolder() {
       bind_ip: distributedForm.bind_ip || '',
       scheduler_port: Number(distributedForm.scheduler_port || 8786),
       dashboard_port: Number(distributedForm.dashboard_port || 8787),
-      api_port: Number(distributedForm.api_port || 8000),
+      api_port: Number(distributedForm.api_port || 8790),
       worker_name: distributedForm.worker_name || '',
       nworkers: Number(distributedForm.head_nworkers || 1),
       nthreads: Number(distributedForm.head_nthreads || 1),
@@ -3420,7 +3421,7 @@ async function installModuleFolder() {
     }
     return runDistributedAction('加入集群', () => joinDaskCluster({
       head_ip: distributedForm.head_ip,
-      api_port: Number(distributedForm.api_port || 8000),
+      api_port: Number(distributedForm.api_port || 8790),
       join_token: distributedForm.join_token,
       worker_name: distributedForm.worker_name || '',
       nworkers: Number(distributedForm.nworkers || 1),
