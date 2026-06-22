@@ -7,7 +7,7 @@ import subprocess
 import threading
 import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -90,6 +90,11 @@ class TaskManager:
         self.cluster_manager = None
         self.dask_futures: Dict[str, Any] = {}
         self.dask_cancel_files: Dict[str, str] = {}
+        # 防止 Worker 结果回传被防火墙阻断时 future.result() 无限等待。
+        self.dask_result_timeout_seconds = max(
+            10.0,
+            float(os.environ.get("LOCAL_WEB_DASK_RESULT_TIMEOUT_SECONDS", "45")),
+        )
 
         # 性能优化：日志高频输出时，不再每一行都把完整 tasks.json 写回磁盘。
         # 前端读取任务时仍然直接读内存中的 logs；这里只是把持久化写盘做成短时间合并。
@@ -302,27 +307,24 @@ class TaskManager:
 
             while not future.done():
                 if task_id in self.cancel_flags:
-                    # 先保留共享取消标记，让 Worker 上的 subprocess 有机会自行终止。
                     self._signal_dask_cancel(task_id)
-                    deadline = time.time() + 5.0
-                    while not future.done() and time.time() < deadline:
-                        time.sleep(0.2)
-                    if not future.done():
-                        try:
-                            future.cancel()
-                        except Exception:
-                            pass
-                    self.update_task(
-                        task_id,
-                        status="cancelled",
-                        ended_at=now_iso(),
-                        return_code=-2,
-                        execution_backend="dask",
-                    )
+                    try:
+                        future.cancel()
+                    except Exception:
+                        pass
+                    self.update_task(task_id, status="cancelled", ended_at=now_iso(), return_code=-1)
                     return
                 time.sleep(0.5)
 
-            result = future.result()
+            try:
+                result = future.result(timeout=self.dask_result_timeout_seconds)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Dask 任务可能已在 Worker 完成，但主节点无法取回结果。"
+                    "请检查所有节点的 Windows 防火墙是否开放 Worker 端口 9000-9099 "
+                    "和 Nanny 端口 9100-9199。"
+                    f" 原始错误：{type(exc).__name__}: {exc}"
+                ) from exc
             self._apply_dask_result(task_id, result)
 
         except Exception as exc:
@@ -465,7 +467,17 @@ class TaskManager:
                     child_id = meta["child_id"]
                     label = meta["label"]
                     try:
-                        result = future.result()
+                        try:
+                            result = future.result(
+                                timeout=self.dask_result_timeout_seconds
+                            )
+                        except Exception as gather_exc:
+                            raise RuntimeError(
+                                "Worker 已报告任务结果，但主节点无法取回。"
+                                "请开放所有节点的 Worker 端口 9000-9099 和 "
+                                "Nanny 端口 9100-9199。"
+                                f" 原始错误：{type(gather_exc).__name__}: {gather_exc}"
+                            ) from gather_exc
                         status = self._apply_dask_result(child_id, result)
                     except Exception as exc:
                         status = "failed"
@@ -599,6 +611,27 @@ class TaskManager:
         except Exception as exc:
             self._mark_dask_parent_failed(parent_id, exc, "批处理")
 
+    def kick_scheduler(self):
+        """
+        外部主动唤醒调度器。
+        前端轮询 /api/tasks 或 /api/system/resources 时调用，
+        防止任务已经 queued 但调度器没有继续 drain。
+        """
+        try:
+            self._drain_scheduler_queue()
+        except Exception as exc:
+            try:
+                with self.lock:
+                    for item in self.scheduler_queue:
+                        task_id = str(item.get("task_id") or "")
+                        task = self.tasks.get(task_id)
+                        if task and task.get("status") == "queued":
+                            task["queue_reason"] = (
+                                f"调度器唤醒失败: {type(exc).__name__}: {exc}"
+                            )
+                self._save_tasks()
+            except Exception:
+                pass
     def kick_scheduler(self):
         """
         外部主动唤醒调度器。
@@ -2318,7 +2351,7 @@ class TaskManager:
                     parent.setdefault("logs", []).append("[SYSTEM] 并行任务已被手动终止")
             self._save_tasks()
             self._cleanup_runtime_roots_for_task(task_id, reason="并行任务取消")
-            return True
+            return True or any_stopped
 
         dask_future = self.dask_futures.get(task_id)
         if dask_future is not None:

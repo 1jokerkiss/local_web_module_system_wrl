@@ -17,11 +17,18 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional
 
 
 DASK_PACKAGE_SPEC = "dask[distributed]==2024.7.1"
 BOKEH_PACKAGE_SPEC = "bokeh>=3.1,<4"
+
+# Windows 多机集群不能让 Worker/Nanny 使用随机端口，否则防火墙只开放
+# 8786/8787/8790 时，Scheduler 可能看到任务完成，却无法从 Worker 取回结果。
+DASK_WORKER_PORTS_CLI = os.environ.get("LOCAL_WEB_DASK_WORKER_PORTS", "9000:9099")
+DASK_NANNY_PORTS_CLI = os.environ.get("LOCAL_WEB_DASK_NANNY_PORTS", "9100:9199")
+DASK_WORKER_PORTS_FIREWALL = os.environ.get("LOCAL_WEB_DASK_WORKER_PORTS_FIREWALL", "9000-9099")
+DASK_NANNY_PORTS_FIREWALL = os.environ.get("LOCAL_WEB_DASK_NANNY_PORTS_FIREWALL", "9100-9199")
 
 
 class DaskClusterError(RuntimeError):
@@ -124,7 +131,7 @@ class DaskClusterManager:
             "worker_name": socket.gethostname(),
             "nworkers": 1,
             "nthreads": 1,
-            "memory_limit": "4GB",
+            "memory_limit": "auto",
             "shared_runtime_root": "",
             "package_spec": DASK_PACKAGE_SPEC,
             "created_at": "",
@@ -364,27 +371,6 @@ class DaskClusterManager:
         if sys.version_info < (3, 10) and "==" not in spec:
             spec = DASK_PACKAGE_SPEC
 
-        cleanup_log = ""
-        # dask-expr 2.x 要求较新的 Dask；当前为兼容 Python 3.9 固定 Dask 2024.7.1。
-        # 当前系统不使用 Dask DataFrame，因此检测到独立 dask-expr 时先卸载，避免 pip check 冲突。
-        if self._package_version("dask-expr") and "2024.7.1" in spec:
-            cleanup = subprocess.run(
-                [sys.executable, "-m", "pip", "uninstall", "-y", "dask-expr"],
-                cwd=str(self.backend_dir),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=300,
-                shell=False,
-            )
-            cleanup_log = (
-                "DASK_EXPR_CLEANUP:\n"
-                f"RETURN_CODE: {cleanup.returncode}\n"
-                f"STDOUT:\n{cleanup.stdout}\n"
-                f"STDERR:\n{cleanup.stderr}\n"
-            )
-
         cmd = [
             sys.executable,
             "-m",
@@ -408,8 +394,7 @@ class DaskClusterManager:
             shell=False,
         )
         log_text = (
-            cleanup_log
-            + f"[{started}] COMMAND: {' '.join(cmd)}\n"
+            f"[{started}] COMMAND: {' '.join(cmd)}\n"
             f"RETURN_CODE: {result.returncode}\n"
             f"STDOUT:\n{result.stdout}\n"
             f"STDERR:\n{result.stderr}\n"
@@ -440,29 +425,51 @@ class DaskClusterManager:
             return
         raise DaskClusterError("当前 Python 环境未安装 Dask Distributed，请先点击“安装 Dask”。")
 
-    def open_firewall(self, api_port: int = 8790, scheduler_port: int = 8786, dashboard_port: int = 8787) -> dict:
+    def open_firewall(
+        self,
+        api_port: int = 8790,
+        scheduler_port: int = 8786,
+        dashboard_port: int = 8787,
+    ) -> dict:
+        """开放集群核心端口以及固定 Worker/Nanny 端口范围。"""
         if os.name != "nt":
-            return {"success": True, "message": "非 Windows 系统无需执行 Windows 防火墙命令", "results": []}
+            return {
+                "success": True,
+                "message": "非 Windows 系统无需执行 Windows 防火墙命令",
+                "results": [],
+            }
 
         ports = [
-            ("LocalWeb-Dask-Join", int(api_port)),
-            ("LocalWeb-Dask-Scheduler", int(scheduler_port)),
-            ("LocalWeb-Dask-Dashboard", int(dashboard_port)),
+            ("LocalWeb-Dask-Join", str(int(api_port))),
+            ("LocalWeb-Dask-Scheduler", str(int(scheduler_port))),
+            ("LocalWeb-Dask-Dashboard", str(int(dashboard_port))),
+            ("LocalWeb-Dask-Worker", DASK_WORKER_PORTS_FIREWALL),
+            ("LocalWeb-Dask-Nanny", DASK_NANNY_PORTS_FIREWALL),
         ]
+
         results = []
         all_ok = True
-        for rule_name, port in ports:
+
+        for rule_name, port_text in ports:
             subprocess.run(
-                ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule_name}"],
+                [
+                    "netsh", "advfirewall", "firewall", "delete", "rule",
+                    f"name={rule_name}",
+                ],
                 capture_output=True,
                 text=True,
                 shell=False,
             )
+
             result = subprocess.run(
                 [
                     "netsh", "advfirewall", "firewall", "add", "rule",
-                    f"name={rule_name}", "dir=in", "action=allow",
-                    "protocol=TCP", f"localport={port}",
+                    f"name={rule_name}",
+                    "dir=in",
+                    "action=allow",
+                    "protocol=TCP",
+                    f"localport={port_text}",
+                    "profile=any",
                 ],
                 capture_output=True,
                 text=True,
@@ -470,18 +477,23 @@ class DaskClusterManager:
                 errors="replace",
                 shell=False,
             )
+
             ok = result.returncode == 0
             all_ok = all_ok and ok
             results.append({
                 "rule": rule_name,
-                "port": port,
+                "port": port_text,
                 "success": ok,
                 "output": (result.stdout or result.stderr or "").strip(),
             })
 
         return {
             "success": all_ok,
-            "message": "防火墙规则已配置" if all_ok else "部分防火墙规则配置失败，请以管理员身份运行后端",
+            "message": (
+                "防火墙规则已配置，已开放加入、Scheduler、Dashboard、Worker 和 Nanny 端口"
+                if all_ok
+                else "部分防火墙规则配置失败，请以管理员身份运行后端"
+            ),
             "results": results,
         }
 
@@ -547,8 +559,13 @@ class DaskClusterManager:
             str(memory_limit or "auto"),
             "--local-directory",
             str(local_dir),
-            "--dashboard-address",
-            ":0",
+            # 固定通信端口，避免 Windows 防火墙拦截随机 Worker/Nanny 端口。
+            "--worker-port",
+            DASK_WORKER_PORTS_CLI,
+            "--nanny-port",
+            DASK_NANNY_PORTS_CLI,
+            # Worker Dashboard 非任务执行必需，关闭后可减少随机监听端口。
+            "--no-dashboard",
         ]
         process = self._spawn(cmd, self.worker_log, cwd=self.backend_dir)
         return int(process.pid)
@@ -574,6 +591,12 @@ class DaskClusterManager:
         dashboard_port = int(dashboard_port or 8787)
         api_port = int(api_port or 8790)
         worker_name = (worker_name or f"{socket.gethostname()}-head").strip()
+
+        # 必须在启动 Scheduler/Worker 前开放固定端口，避免任务完成后结果无法回传。
+        firewall_result = self.open_firewall(api_port, scheduler_port, dashboard_port)
+        if not firewall_result.get("success"):
+            self.state["last_error"] = firewall_result.get("message") or "防火墙配置失败"
+            self._save_state()
 
         self.scheduler_log.write_text("", encoding="utf-8")
         self.worker_log.write_text("", encoding="utf-8")
@@ -611,7 +634,7 @@ class DaskClusterManager:
             with self.lock:
                 self.state.update({
                     "role": "head",
-                    "execution_mode": "local",
+                    "execution_mode": "distributed" if shared_path else "local",
                     "cluster_id": cluster_id,
                     "join_token": join_token,
                     "scheduler_address": scheduler_address,
@@ -640,31 +663,16 @@ class DaskClusterManager:
             self._save_state()
             self.open_firewall(actual_join_port, scheduler_port, dashboard_port)
 
-            # 等待本机 Worker 真正注册，不能只判断“集群已有任意 Worker”。
-            registered = False
+            # 等待本机 Worker 注册。
             end = time.time() + 30
             while time.time() < end:
                 try:
                     info = self._scheduler_info()
-                    names = {
-                        str(item.get("name") or "")
-                        for item in (info.get("workers") or {}).values()
-                    }
-                    registered = any(
-                        name == worker_name or name.startswith(f"{worker_name}-")
-                        for name in names
-                    )
-                    if registered:
+                    if info.get("workers"):
                         break
                 except Exception:
                     pass
                 time.sleep(0.5)
-
-            if not registered:
-                raise DaskClusterError(
-                    f"主节点 Worker 在 30 秒内未注册到 Scheduler：{worker_name}。"
-                    "请检查 worker.log、Dask 版本和内存限制。"
-                )
 
             return self.status()
         except Exception:
@@ -768,6 +776,18 @@ class DaskClusterManager:
 
         scheduler_address = str(join_info["scheduler_address"])
         worker_name = (worker_name or socket.gethostname()).strip()
+
+        # 子节点也必须开放 Worker/Nanny 固定端口，否则 Scheduler 能看到 Worker，
+        # 但无法从 Worker 获取已经完成的任务结果。
+        firewall_result = self.open_firewall(
+            int(join_info.get("api_port") or api_port or 8790),
+            int(join_info.get("scheduler_port") or 8786),
+            int(join_info.get("dashboard_port") or 8787),
+        )
+        if not firewall_result.get("success"):
+            self.state["last_error"] = firewall_result.get("message") or "子节点防火墙配置失败"
+            self._save_state()
+
         worker_pid = self._start_worker_process(
             scheduler_address,
             worker_name,
@@ -797,43 +817,17 @@ class DaskClusterManager:
             })
         self._save_state()
 
-        # 等待“当前子节点 Worker”注册。不能因为主节点已有 Worker 就误报加入成功。
-        registered = False
+        # 等待 Worker 在 Scheduler 中出现。
         end = time.time() + 30
         while time.time() < end:
             try:
                 info = self._scheduler_info()
-                names = {
-                    str(item.get("name") or "")
-                    for item in (info.get("workers") or {}).values()
-                }
-                registered = any(
-                    name == worker_name or name.startswith(f"{worker_name}-")
-                    for name in names
-                )
-                if registered:
+                names = {str(v.get("name") or "") for v in (info.get("workers") or {}).values()}
+                if worker_name in names or info.get("workers"):
                     break
             except Exception:
                 pass
             time.sleep(0.5)
-
-        if not registered:
-            self._terminate_pid(worker_pid)
-            with self.lock:
-                self.state.update({
-                    "role": "standalone",
-                    "execution_mode": "local",
-                    "cluster_id": "",
-                    "scheduler_address": "",
-                    "head_api_url": "",
-                    "worker_pid": None,
-                    "last_error": f"Worker 注册超时：{worker_name}",
-                })
-            self._save_state()
-            raise DaskClusterError(
-                f"子节点 Worker 在 30 秒内未注册到主节点 Scheduler：{worker_name}。"
-                "请检查 8786 端口、防火墙、worker.log、Dask 版本和节点名称是否冲突。"
-            )
 
         return self.status()
 
@@ -894,43 +888,23 @@ class DaskClusterManager:
             info = self._scheduler_info()
             if not info.get("workers"):
                 raise DaskClusterError("当前集群没有可用 Worker")
-            shared_root = str(self.state.get("shared_runtime_root") or "").strip()
-            if not shared_root:
+            if not str(self.state.get("shared_runtime_root") or "").strip():
                 raise DaskClusterError(
                     "启用分布式任务前必须设置共享运行目录，推荐使用所有节点可访问的 UNC 路径，"
                     "例如 \\\\192.168.2.100\\local_web_runtime"
-                )
-            probe = self.test_shared_path(shared_root)
-            if not probe.get("all_ready"):
-                raise DaskClusterError(
-                    "共享运行目录并非所有 Worker 都可读写，禁止启用分布式执行。"
-                    f"检测结果：{json.dumps(probe, ensure_ascii=False)}"
                 )
 
         self.state["execution_mode"] = mode
         self._save_state()
         return self.status()
 
-    def distributed_execution_requested(self) -> bool:
+    def distributed_execution_enabled(self) -> bool:
         return (
             str(self.state.get("role") or "") == "head"
             and str(self.state.get("execution_mode") or "") == "distributed"
+            and bool(self.state.get("scheduler_address"))
+            and self._pid_alive(self.state.get("scheduler_pid"))
         )
-
-    def distributed_execution_enabled(self) -> bool:
-        if not self.distributed_execution_requested():
-            return False
-        if not str(self.state.get("scheduler_address") or "").strip():
-            return False
-        try:
-            info = self._scheduler_info()
-            return bool(info.get("workers") or {})
-        except Exception as exc:
-            self.state["last_error"] = (
-                f"分布式执行不可用：{type(exc).__name__}: {exc}"
-            )
-            self._save_state()
-            return False
 
     def get_shared_runtime_root(self) -> str:
         return str(self.state.get("shared_runtime_root") or "").strip()

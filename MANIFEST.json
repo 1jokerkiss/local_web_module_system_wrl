@@ -1,50 +1,14 @@
 {
   "README.md": {
-    "size": 1056,
-    "sha256": "fb5c643e37fcdf2f4ad111d17db706af83e6d89a870b981fb86d8d8f737d1d03"
-  },
-  "frontend/src/App.jsx": {
-    "size": 217894,
-    "sha256": "4bf5f08fa8559578abf9175211d6a17153e188146ee1a0705561d0493de0d4b5"
-  },
-  "frontend/src/api.js": {
-    "size": 17203,
-    "sha256": "a7a8ef8a94b5374210bdabee2b9011303f529fb3800526755066c22967e20c9a"
-  },
-  "frontend/src/main.jsx": {
-    "size": 241,
-    "sha256": "4ec8098eee9c3df835bed59c4af5dffcbcbc1bac58e8e3809f472baf8fa3bb0c"
-  },
-  "frontend/src/styles.css": {
-    "size": 4630,
-    "sha256": "5d93ce030bdf668d84eee60193953f1bf45d63e0332f8e6f8d8a1902114aa8c2"
+    "size": 2203,
+    "sha256": "dcea65429700303c0708571507c6ad9c5e7dcc78242b667c6a14eddb98cc2583"
   },
   "backend/app/dask_cluster_manager.py": {
-    "size": 41270,
-    "sha256": "ede7ea5926d60a4b27e5fb18a4c5eb8ed5d88c212ae3dd97fab3b463274cff78"
+    "size": 40247,
+    "sha256": "8987332dc3df1bcdf29316e5e9847f34d8545c50ec7a1e966ef053a50e783763"
   },
   "backend/app/task_manager.py": {
-    "size": 101986,
-    "sha256": "90ed94dbbeb7303dc7dda70ede3636826090a96a13d8c52f55c51ac2ad072e79"
-  },
-  "backend/app/main.py": {
-    "size": 257390,
-    "sha256": "087c21826d57e85a530bf055f8054add1c789bef1bf98d37ebe672447e4bb06d"
-  },
-  "backend/app/dask_job_runner.py": {
-    "size": 6617,
-    "sha256": "a7ffef8683c82c585c2f7250c53c2fbedc753be3ada11883a645d4ac775e75ee"
-  },
-  "backend/app/module_installer.py": {
-    "size": 7877,
-    "sha256": "833a247e5222e808c84b2030fe0c4710e0cdf70d13dc5fb9e70f81312c5ceb2b"
-  },
-  "backend/app/schemas.py": {
-    "size": 3482,
-    "sha256": "79e0ae63655406e987e21183e2ddf600f5afbcd5fae8264cd8d4eb5db5d843bd"
-  },
-  "backend/app/store.py": {
-    "size": 1734,
-    "sha256": "9364b35093fdb82ea7e49a68d31982f5d3f5f6d8db09290d3aa20daf2b97c64a"
+    "size": 103732,
+    "sha256": "207ee8bc323912a6c220f2eb20b7a9e24e805d5fe8d9d928e2312662910cca2b"
   }
 }

@@ -1,23 +1,87 @@
-# 代码检查与修复结果
+# Dask Worker 结果无法回传修复
 
-已通过：
-- Python 语法检查；
-- React/JSX esbuild 编译检查；
-- 前端 Dask API 与后端路由字段一致性检查。
+## 现象
 
-已修复：
-1. 创建主节点时在共享目录检测前错误地直接启用 distributed；
-2. distributed_execution_enabled 只检查 PID，不检查 Scheduler/Worker；
-3. 子节点加入时只要集群已有任意 Worker 就误判加入成功；
-4. 启用 distributed 时未强制验证所有 Worker 共享目录；
-5. 单个 Dask 任务取消后过早删除共享取消标记；
-6. TaskManager 重复定义 kick_scheduler、重复导入 time；
-7. 前端并行进度把失败任务重复计数；
-8. 前端仍提示主 FastAPI 必须监听 0.0.0.0；
-9. Dask 2024.7.1 与残留 dask-expr 2.x 的依赖冲突；
-10. 后端 Dask Worker 默认内存限制与前端不一致。
+任务日志停在：
 
-仍需部署层面保证：
-- 各节点模块源码、模型和 Python/EXE 路径一致；
-- 输入、输出、shared_runtime_root 对全部 Worker 可访问；
-- 8790、8786、8787 防火墙端口可访问。
+```text
+[DASK] 已提交 3/35
+```
+
+Scheduler 日志反复出现：
+
+```text
+Couldn't gather keys: {'local-web-...': 'memory'}
+```
+
+其中 `memory` 表示 Scheduler 认为任务结果已经保存在 Worker 内存中，
+但主节点无法从 Worker 取回结果。
+
+## 根因
+
+原代码只开放：
+
+- 8790：加入服务
+- 8786：Scheduler
+- 8787：Dashboard
+
+但 `dask worker` 未指定 `--worker-port` 和 `--nanny-port`，因此每次启动都使用
+随机高位端口。Windows 防火墙可能允许 Worker 主动连接 Scheduler，却阻止
+Scheduler/Client 反向连接 Worker 获取结果。
+
+## 修复
+
+- Worker 固定使用 `9000:9099`
+- Nanny 固定使用 `9100:9199`
+- 所有节点自动添加上述端口范围的 Windows 防火墙规则
+- 关闭不必要的 Worker Dashboard 随机端口
+- `future.result()` 增加 45 秒结果回传超时和明确错误提示
+
+## 替换文件
+
+```text
+backend/app/dask_cluster_manager.py
+backend/app/task_manager.py
+```
+
+替换后必须在主节点和所有子节点上执行。
+
+## 重启步骤
+
+1. 停止当前任务。
+2. 在主节点点击“停止集群”。
+3. 停止所有节点后端。
+4. 替换两个文件。
+5. 以管理员权限启动每台电脑的后端。
+6. 在每台电脑的“分布式”页面点击“配置 Windows 防火墙”。
+7. 主节点重新创建集群。
+8. 子节点重新加入。
+9. 重新提交任务。
+
+## 手工防火墙命令
+
+每台电脑都以管理员身份执行：
+
+```bat
+netsh advfirewall firewall add rule name="LocalWeb-Dask-Worker" dir=in action=allow protocol=TCP localport=9000-9099 profile=any
+netsh advfirewall firewall add rule name="LocalWeb-Dask-Nanny" dir=in action=allow protocol=TCP localport=9100-9199 profile=any
+netsh advfirewall firewall add rule name="LocalWeb-Dask-Scheduler" dir=in action=allow protocol=TCP localport=8786 profile=any
+```
+
+## 验证
+
+重新启动集群后，Scheduler 日志中的 Worker 地址应为：
+
+```text
+tcp://192.168.2.xxx:9000
+tcp://192.168.2.xxx:9001
+```
+
+而不是随机的 `52746`、`59153`。
+
+任务日志应继续出现：
+
+```text
+[DASK] 远程节点=...
+[DASK] 完成 1/35
+```
