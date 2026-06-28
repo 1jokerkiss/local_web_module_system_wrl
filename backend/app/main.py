@@ -24,6 +24,7 @@ import time
 from .auth import (admin_reset_password,create_token,create_user,delete_user,get_current_user,get_security_question,load_users,register_user,remove_token,require_admin,reset_password_by_security_answer,sanitize_user,update_user_enabled,update_user_role,verify_user,)
 from .task_manager import TaskManager
 from .dask_cluster_manager import DaskClusterError, DaskClusterManager
+from .htcondor_cluster_manager import HTCondorClusterError, HTCondorClusterManager
 
 
 def now_iso() -> str:
@@ -73,8 +74,10 @@ app.add_middleware(
 )
 
 dask_cluster_manager = DaskClusterManager(BASE_DIR, project_root=PROJECT_ROOT)
+htcondor_cluster_manager = HTCondorClusterManager(BASE_DIR, project_root=PROJECT_ROOT)
 task_manager = TaskManager(TASKS_FILE)
 task_manager.set_cluster_manager(dask_cluster_manager)
+task_manager.set_htcondor_manager(htcondor_cluster_manager)
 
 
 @app.get("/api/system/resources")
@@ -236,6 +239,23 @@ class DaskSharedPathRequest(BaseModel):
     path: str = ""
 
 
+class HTCondorExecutionModeRequest(BaseModel):
+    mode: str = "local"
+
+
+class HTCondorCreateParentRequest(BaseModel):
+    bind_ip: str = ""
+    low_port: int = 9700
+    high_port: int = 9800
+
+
+class HTCondorJoinParentRequest(BaseModel):
+    parent_ip: str = ""
+    child_ip: str = ""
+    low_port: int = 9700
+    high_port: int = 9800
+
+
 # =========================
 # Dask 分布式集群管理 API
 # =========================
@@ -376,6 +396,90 @@ def api_distributed_test_shared_path(
 def api_distributed_logs(authorization: str | None = Header(default=None)):
     require_admin(authorization)
     return dask_cluster_manager.tail_logs()
+
+
+# =========================
+# HTCondor 集群管理 API
+# =========================
+@app.get("/api/htcondor/status")
+def api_htcondor_status(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    return htcondor_cluster_manager.status()
+
+
+@app.post("/api/htcondor/execution-mode")
+def api_htcondor_execution_mode(
+    payload: HTCondorExecutionModeRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return htcondor_cluster_manager.set_execution_mode(payload.mode)
+    except HTCondorClusterError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/htcondor/smoke-test")
+def api_htcondor_smoke_test(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    try:
+        return htcondor_cluster_manager.smoke_test()
+    except HTCondorClusterError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/htcondor/logs")
+def api_htcondor_logs(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    return htcondor_cluster_manager.tail_logs()
+
+
+@app.get("/api/htcondor/nodes")
+def api_htcondor_nodes(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    return htcondor_cluster_manager.node_status()
+
+
+@app.post("/api/htcondor/create-parent")
+def api_htcondor_create_parent(
+    payload: HTCondorCreateParentRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return htcondor_cluster_manager.create_parent_node(
+            bind_ip=payload.bind_ip,
+            low_port=payload.low_port,
+            high_port=payload.high_port,
+        )
+    except HTCondorClusterError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/htcondor/join-parent")
+def api_htcondor_join_parent(
+    payload: HTCondorJoinParentRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return htcondor_cluster_manager.join_parent_node(
+            parent_ip=payload.parent_ip,
+            child_ip=payload.child_ip,
+            low_port=payload.low_port,
+            high_port=payload.high_port,
+        )
+    except HTCondorClusterError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/htcondor/leave-pool")
+def api_htcondor_leave_pool(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    try:
+        return htcondor_cluster_manager.leave_pool()
+    except HTCondorClusterError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # 通用辅助函数

@@ -607,3 +607,49 @@ export async function getDaskLogs() {
   return request('/api/distributed/logs');
 }
 
+export async function getHTCondorStatus() {
+  return request('/api/htcondor/status');
+}
+
+export async function setHTCondorExecutionMode(mode) {
+  return request('/api/htcondor/execution-mode', {
+    method: 'POST',
+    body: JSON.stringify({ mode }),
+  });
+}
+
+export async function runHTCondorSmokeTest() {
+  return request('/api/htcondor/smoke-test', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function getHTCondorLogs() {
+  return request('/api/htcondor/logs');
+}
+
+export async function getHTCondorNodes() {
+  return request('/api/htcondor/nodes');
+}
+
+export async function createHTCondorParent(payload = {}) {
+  return request('/api/htcondor/create-parent', {
+    method: 'POST',
+    body: JSON.stringify(payload || {}),
+  });
+}
+
+export async function joinHTCondorParent(payload = {}) {
+  return request('/api/htcondor/join-parent', {
+    method: 'POST',
+    body: JSON.stringify(payload || {}),
+  });
+}
+
+export async function leaveHTCondorPool() {
+  return request('/api/htcondor/leave-pool', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}

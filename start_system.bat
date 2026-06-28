@@ -2,8 +2,9 @@
 setlocal EnableExtensions
 
 REM ============================================================
-REM Frontend development/build launcher.
-REM It does not prepare Python or install HTCondor.
+REM Production one-click launcher for local_web_module_system.
+REM All environment preparation is centralized in:
+REM   backend\bootstrap_env.ps1
 REM ============================================================
 
 set "PROJECT_ROOT=%~dp0"
@@ -21,16 +22,14 @@ powershell.exe ^
     -NoProfile ^
     -ExecutionPolicy Bypass ^
     -File "%BOOTSTRAP_PS1%" ^
-    -Mode Frontend
+    -Mode System
 
 set "EXIT_CODE=%ERRORLEVEL%"
 
-echo.
-if "%EXIT_CODE%"=="0" (
-    echo [OK] Frontend build completed.
-) else (
-    echo [ERROR] Frontend build failed. Exit code: %EXIT_CODE%
+if not "%EXIT_CODE%"=="0" (
+    echo.
+    echo [ERROR] System startup failed. Exit code: %EXIT_CODE%
+    pause
 )
 
-pause
 exit /b %EXIT_CODE%

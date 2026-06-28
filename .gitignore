@@ -1,53 +1,44 @@
-﻿# Python cache
-__pycache__/
-*.pyc
-*.pyo
-
-# IDE
-.idea/
-.vscode/
-
-# Frontend dependencies/build
-node_modules/
+﻿# frontend
 frontend/node_modules/
 frontend/dist/
-dist/
-build/
 
-# Backend runtime/cache
+# backend runtime
+backend/.venv/
+backend/__pycache__/
 backend/runtime/
-backend/uploads/
 backend/logs/
-*.log
-*.tmp
-
-# Runtime data
 backend/data/tasks.json
 backend/data/data_files.json
 
-# Generated structure file
-project_structure.txt
-
-# Installed/runtime module packages
+# installed modules and generated envs
 backend/installed_modules/
+backend/module_envs/
 module_drop/
-/backend/python_wheels/GDAL-3.8.4-cp310-cp310-win_amd64.whl
-/backend/python_wheels/GDAL-3.8.4-cp311-cp311-win_amd64.whl
-/backend/python_wheels/GDAL-3.8.4-cp311-cp311-win_arm64.whl
-/backend/python_wheels/gdal-3.12.2-cp312-cp312-win_amd64.whl
-/backend/python_wheels/gdal-3.12.2-cp312-cp312-win_arm64.whl
-/backend/python_wheels/gdal-3.12.2-cp313-cp313-win_amd64.whl
-/backend/python_wheels/gdal-3.12.2-cp313-cp313-win_arm64.whl
-/backend/python_wheels/gdal-3.12.2-cp314-cp314-win_amd64.whl
-/backend/python_wheels/gdal-3.12.2-cp314-cp314-win_arm64.whl
-/backend/python_wheels/h5py-3.8.0-cp311-cp311-win_amd64.whl
-/backend/python_wheels/h5py-3.10.0-cp310-cp310-win_amd64.whl
-/backend/python_wheels/h5py-3.10.0-cp312-cp312-win_amd64.whl
-/backend/python_wheels/numpy-1.26.3-cp39-cp39-win_amd64.whl
-/backend/python_wheels/numpy-1.26.3-cp310-cp310-win_amd64.whl
-/backend/python_wheels/numpy-1.26.3-cp311-cp311-win_amd64.whl
-/backend/python_wheels/numpy-1.26.3-cp312-cp312-win_amd64.whl
-/backend/python_wheels/numpy-2.2.1-cp312-cp312-win_amd64.whl
-/backend/python_wheels/numpy-2.4.4-cp313-cp313t-win_arm64.whl
-/backend/python_wheels/GDAL-3.4.2-cp38-cp38-win_amd64.whl
-/backend/python_wheels/h5py-2.10.0-cp38-cp38-win_amd64.whl
+
+# secrets
+backend/runtime/htcondor/submit_account_secret.bin
+*.secret
+*.key
+*.pem
+
+# big remote sensing data
+*.nc
+*.hdf
+*.h5
+*.tif
+*.tiff
+*.zip
+
+# python
+__pycache__/
+*.pyc
+
+# backup files
+*_before_v*.py
+*_before_v*.jsx
+*_before_v*.js
+*_before_htcondor_v*.ps1
+
+# system
+.DS_Store
+Thumbs.db

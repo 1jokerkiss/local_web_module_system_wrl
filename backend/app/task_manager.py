@@ -96,6 +96,13 @@ class TaskManager:
             float(os.environ.get("LOCAL_WEB_DASK_RESULT_TIMEOUT_SECONDS", "45")),
         )
 
+        # 可选 HTCondor 执行后端。现在先和 Dask 并存，测试稳定后再删除旧分布式按钮。
+        self.htcondor_manager = None
+        self.htcondor_job_timeout_seconds = max(
+            60,
+            int(os.environ.get("LOCAL_WEB_HTCONDOR_JOB_TIMEOUT_SECONDS", "604800")),
+        )
+
         # 性能优化：日志高频输出时，不再每一行都把完整 tasks.json 写回磁盘。
         # 前端读取任务时仍然直接读内存中的 logs；这里只是把持久化写盘做成短时间合并。
         self.task_save_debounce_seconds = float(os.environ.get("LOCAL_WEB_TASK_SAVE_DEBOUNCE_SECONDS", "0.8"))
@@ -113,6 +120,47 @@ class TaskManager:
     def set_cluster_manager(self, cluster_manager):
         """注入 DaskClusterManager，避免 TaskManager 直接依赖 FastAPI 层。"""
         self.cluster_manager = cluster_manager
+
+    def set_htcondor_manager(self, htcondor_manager):
+        """注入 HTCondor 管理器。"""
+        self.htcondor_manager = htcondor_manager
+
+    def _htcondor_execution_requested(self) -> bool:
+        manager = self.htcondor_manager
+        if manager is None:
+            return False
+        try:
+            requested = getattr(manager, "distributed_execution_requested", None)
+            if callable(requested):
+                return bool(requested())
+            state = getattr(manager, "state", {}) or {}
+            return str(state.get("execution_mode") or "") == "htcondor"
+        except Exception:
+            return False
+
+    def _htcondor_execution_enabled(self) -> bool:
+        manager = self.htcondor_manager
+        if manager is None:
+            return False
+        try:
+            return bool(manager.distributed_execution_enabled())
+        except Exception:
+            return False
+
+    def _fail_when_htcondor_unavailable(self, task_id: str, task_kind: str = "任务"):
+        message = (
+            "已选择 HTCondor 执行，但当前 HTCondor 没有通过安装、自检或安全检查。"
+            "系统不会自动退回本机运行，请先到 HTCondor 页面查看状态。"
+        )
+        self.append_log(task_id, f"[HTCONDOR-ERROR] {message}")
+        self.update_task(
+            task_id,
+            status="failed",
+            return_code=-1,
+            ended_at=now_iso(),
+            execution_backend="htcondor",
+            queue_reason=message,
+        )
 
     def _distributed_execution_requested(self) -> bool:
         manager = self.cluster_manager
@@ -142,7 +190,7 @@ class TaskManager:
     def _distributed_parent_slots(self, local_slots: int) -> int:
         # 用户已选择分布式时，父任务只占一个本机协调槽。
         # 即使 Scheduler 暂时不可用，也不应退回并占用多个本机执行槽。
-        return 1 if self._distributed_execution_requested() else max(1, int(local_slots or 1))
+        return 1 if (self._distributed_execution_requested() or self._htcondor_execution_requested()) else max(1, int(local_slots or 1))
 
     def _fail_when_dask_unavailable(self, task_id: str, task_kind: str = "任务"):
         """用户选择分布式但集群不可用时直接失败，禁止静默退回本机执行。"""
@@ -569,6 +617,306 @@ class TaskManager:
 
         finally:
             self.cancel_flags.discard(parent_id)
+
+    def _append_htcondor_output(self, task_id: str, prefix: str, text: str, max_lines: int = 500):
+        if not text:
+            return
+        lines = str(text).splitlines()
+        if len(lines) > max_lines:
+            lines = lines[-max_lines:]
+            self.append_log(task_id, f"[{prefix}] 输出过长，仅保留最后 {max_lines} 行")
+        for line in lines:
+            self.append_log(task_id, f"[{prefix}] {line}")
+
+    def _apply_htcondor_result(self, task_id: str, result: Dict[str, Any]) -> str:
+        result = result or {}
+
+        # 如果 run_job 已经边运行边把 stdout/stderr 写入任务日志，
+        # 这里就不再重复追加完整日志。
+        if not result.get("live_output_sent"):
+            self._append_htcondor_output(task_id, "STDOUT", str(result.get("stdout") or ""))
+            self._append_htcondor_output(task_id, "STDERR", str(result.get("stderr") or ""))
+        self._append_htcondor_output(task_id, "CONDOR", str(result.get("wait_output") or ""), max_lines=80)
+
+        return_code = int(result.get("return_code", -1))
+        if bool(result.get("cancelled")) or return_code == -2:
+            status = "cancelled"
+        else:
+            status = "success" if return_code == 0 else "failed"
+
+        remote_name = str(result.get("hostname") or "unknown")
+        cluster_id = str(result.get("cluster_id") or "")
+        self.append_log(
+            task_id,
+            f"[HTCONDOR] 执行节点={remote_name}，ClusterId={cluster_id}，return_code={return_code}",
+        )
+        self.update_task(
+            task_id,
+            status=status,
+            return_code=return_code,
+            started_at=result.get("started_at") or now_iso(),
+            ended_at=result.get("ended_at") or now_iso(),
+            remote_node=remote_name,
+            htcondor_cluster_id=cluster_id,
+            htcondor_job_dir=result.get("job_dir") or "",
+            execution_backend="htcondor",
+        )
+        return status
+
+    def _run_htcondor_single_task(
+        self,
+        task_id: str,
+        command: List[str],
+        working_dir: str | None,
+        env: Dict[str, str] | None,
+    ):
+        manager = self.htcondor_manager
+        if manager is None:
+            self._run_process_task(task_id, command, working_dir, env)
+            return
+
+        self.update_task(
+            task_id,
+            status="running",
+            started_at=now_iso(),
+            execution_backend="htcondor",
+        )
+        self.append_log(task_id, "[HTCONDOR] 单任务已提交给 HTCondor")
+        self.append_log(task_id, "[HTCONDOR] 当前版本要求执行节点具备相同的软件安装路径；大型输入输出仍按 config.json 中的路径读取和写入。")
+
+        def should_cancel():
+            task = self.get_task(task_id) or {}
+            return task_id in self.cancel_flags or task.get("status") == "cancelled"
+
+        def on_update(info):
+            info = info or {}
+            kind = str(info.get("type") or "")
+
+            if kind == "submitted":
+                cluster_id = str(info.get("cluster_id") or "")
+                job_dir = str(info.get("job_dir") or "")
+                self.update_task(
+                    task_id,
+                    htcondor_cluster_id=cluster_id,
+                    htcondor_job_dir=job_dir,
+                    execution_backend="htcondor",
+                )
+                self.append_log(task_id, f"[HTCONDOR] ClusterId={cluster_id}，已进入 HTCondor 队列")
+                return
+
+            text = str(info.get("text") or "")
+            if not text:
+                return
+
+            if kind == "stdout":
+                self._append_htcondor_output(task_id, "STDOUT", text)
+            elif kind == "stderr":
+                self._append_htcondor_output(task_id, "STDERR", text)
+            elif kind == "event":
+                # event.log 很长，只记录关键事件，避免日志刷太多。
+                useful = []
+                for line in text.splitlines():
+                    raw = str(line or "").strip()
+                    if not raw:
+                        continue
+                    low = raw.lower()
+                    if (
+                        "submitted" in low
+                        or "executing" in low
+                        or "terminated" in low
+                        or "aborted" in low
+                        or "held" in low
+                        or "removed" in low
+                        or "任务已请求取消" in raw
+                    ):
+                        useful.append(raw)
+                if useful:
+                    self._append_htcondor_output(task_id, "CONDOR", "\n".join(useful), max_lines=80)
+
+        try:
+            result = manager.run_job(
+                job_id=task_id,
+                command=command,
+                working_dir=working_dir,
+                env=env or {},
+                timeout_seconds=self.htcondor_job_timeout_seconds,
+                on_update=on_update,
+                should_cancel=should_cancel,
+            )
+            self._apply_htcondor_result(task_id, result)
+        except Exception as exc:
+            self.append_log(task_id, f"[HTCONDOR-ERROR] {type(exc).__name__}: {exc}")
+            self.append_log(task_id, traceback.format_exc())
+            self.update_task(
+                task_id,
+                status="failed",
+                return_code=-1,
+                ended_at=now_iso(),
+                execution_backend="htcondor",
+            )
+        finally:
+            self.cancel_flags.discard(task_id)
+
+    def _run_htcondor_job_group(
+        self,
+        parent_id: str,
+        entries: List[Dict[str, Any]],
+        max_workers: int,
+        group_name: str,
+    ):
+        total = len(entries)
+        max_workers = max(1, min(int(max_workers or 1), max(1, total)))
+        manager = self.htcondor_manager
+        if manager is None:
+            raise RuntimeError("HTCondorClusterManager 未初始化")
+
+        self.update_task(
+            parent_id,
+            status="running",
+            started_at=now_iso(),
+            parallel_total=total,
+            parallel_done=0,
+            parallel_failed=0,
+            max_workers=max_workers,
+            execution_backend="htcondor",
+        )
+        self.append_log(parent_id, f"[HTCONDOR] {group_name}启动：总任务数={total}，最多同时提交={max_workers}")
+        self.append_log(parent_id, "[HTCONDOR] 这是第一版接入，要求各执行节点安装相同模块，输入输出路径按 config.json 保持不变。")
+
+        done_count = 0
+        failures = 0
+        future_map: Dict[Any, Dict[str, Any]] = {}
+
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for index, entry in enumerate(entries):
+                    if parent_id in self.cancel_flags:
+                        break
+                    spec = entry["spec"]
+                    child_id = entry.get("child_id")
+                    label = str(spec.get("label") or f"子任务 {index + 1}")
+
+                    if not child_id:
+                        parent_task = self.get_task(parent_id) or {}
+                        child = self.create_task(
+                            module_id=spec.get("module_id", ""),
+                            module_name=spec.get("module_name", label),
+                            command=spec.get("command") or [],
+                            inputs=spec.get("inputs") or {},
+                            kind="module",
+                            extra={
+                                "parent_id": parent_id,
+                                "job_index": index + 1,
+                                "owner_username": str(parent_task.get("owner_username") or ""),
+                                "execution_backend": "htcondor",
+                            },
+                        )
+                        child_id = child["id"]
+                        with self.lock:
+                            parent = self.tasks.get(parent_id)
+                            if parent:
+                                parent.setdefault("children", []).append(child_id)
+                    else:
+                        self.update_task(
+                            child_id,
+                            status="running",
+                            started_at=now_iso(),
+                            execution_backend="htcondor",
+                        )
+
+                    future = pool.submit(
+                        manager.run_job,
+                        child_id,
+                        spec.get("command") or [],
+                        spec.get("working_dir"),
+                        spec.get("env") or {},
+                        self.htcondor_job_timeout_seconds,
+                    )
+                    future_map[future] = {
+                        "child_id": child_id,
+                        "label": label,
+                    }
+                    self.append_log(parent_id, f"[HTCONDOR] 已提交 {index + 1}/{total}: {label}")
+
+                while future_map:
+                    if parent_id in self.cancel_flags:
+                        self.append_log(parent_id, "[HTCONDOR] 收到取消请求，等待已提交的任务结束。")
+                        break
+
+                    done, _ = wait(list(future_map.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
+                    if not done:
+                        continue
+
+                    for future in done:
+                        meta = future_map.pop(future)
+                        child_id = meta["child_id"]
+                        label = meta["label"]
+                        try:
+                            result = future.result()
+                            status = self._apply_htcondor_result(child_id, result)
+                        except Exception as exc:
+                            status = "failed"
+                            self.append_log(child_id, f"[HTCONDOR-ERROR] {type(exc).__name__}: {exc}")
+                            self.append_log(child_id, traceback.format_exc())
+                            self.update_task(
+                                child_id,
+                                status="failed",
+                                return_code=-1,
+                                ended_at=now_iso(),
+                                execution_backend="htcondor",
+                            )
+
+                        done_count += 1
+                        if status != "success":
+                            failures += 1
+                            self._append_child_failure_to_parent(parent_id, child_id, label)
+
+                        self.update_task(
+                            parent_id,
+                            parallel_done=done_count,
+                            parallel_failed=failures,
+                        )
+                        self.append_log(parent_id, f"[HTCONDOR] 完成 {done_count}/{total}: {label}，状态={status}")
+
+            if parent_id in self.cancel_flags:
+                final_status = "cancelled"
+            else:
+                final_status = "success" if failures == 0 and done_count == total else "failed"
+
+            self.update_task(
+                parent_id,
+                status=final_status,
+                ended_at=now_iso(),
+                parallel_done=done_count,
+                parallel_failed=failures,
+                execution_backend="htcondor",
+            )
+            self.append_log(parent_id, f"[HTCONDOR] {group_name}结束，状态={final_status}")
+            self._cleanup_runtime_roots_for_task(parent_id, reason=f"HTCondor {group_name}结束，状态={final_status}")
+        except Exception as exc:
+            self.append_log(parent_id, f"[HTCONDOR-ERROR] {type(exc).__name__}: {exc}")
+            self.append_log(parent_id, traceback.format_exc())
+            self.update_task(
+                parent_id,
+                status="failed",
+                return_code=-1,
+                ended_at=now_iso(),
+                execution_backend="htcondor",
+            )
+            self._cleanup_runtime_roots_for_task(parent_id, reason=f"HTCondor {group_name}异常结束")
+        finally:
+            self.cancel_flags.discard(parent_id)
+
+    def _run_parallel_task_htcondor(self, parent_id: str, jobs: List[Dict[str, Any]], max_workers: int):
+        entries = [{"spec": job} for job in jobs]
+        return self._run_htcondor_job_group(parent_id, entries, max_workers, "并行任务")
+
+    def _run_batch_group_htcondor(self, parent_id: str, child_job_map: Dict[str, Dict[str, Any]], max_parallel: int):
+        entries = [
+            {"child_id": child_id, "spec": job}
+            for child_id, job in child_job_map.items()
+        ]
+        return self._run_htcondor_job_group(parent_id, entries, max_parallel, "批处理")
 
     def _mark_dask_parent_failed(self, parent_id: str, exc: Exception, group_name: str):
         self.append_log(parent_id, f"[DASK-ERROR] {type(exc).__name__}: {exc}")
@@ -1179,7 +1527,7 @@ class TaskManager:
             "disk_percent": disk_snapshot.get("percent"),
             "disk_free_gb": disk_snapshot.get("free_gb"),
             "active_tasks": active_tasks,
-            "execution_backend": "dask" if self._distributed_execution_enabled() else "local",
+            "execution_backend": "htcondor" if self._htcondor_execution_enabled() else ("dask" if self._distributed_execution_enabled() else "local"),
         }
 
     def _can_start_queued_item_locked(self, item: Dict[str, Any]) -> tuple[bool, str]:
@@ -1511,7 +1859,14 @@ class TaskManager:
 
         self._append_parallel_adjustment_log(task["id"], inputs)
         # 单个模块进程只占 1 个真实启动槽；parallel_workers 只写入配置，不作为父任务排队条件。
-        if self._distributed_execution_requested():
+        if self._htcondor_execution_requested():
+            if self._htcondor_execution_enabled():
+                runner = self._run_htcondor_single_task
+                runner_args = (task["id"], command, working_dir, env)
+            else:
+                runner = self._fail_when_htcondor_unavailable
+                runner_args = (task["id"], "单模块任务")
+        elif self._distributed_execution_requested():
             if self._distributed_execution_enabled():
                 runner = self._run_dask_single_task
                 runner_args = (task["id"], command, working_dir, env)
@@ -1689,6 +2044,11 @@ class TaskManager:
         child_job_map: Dict[str, Dict[str, Any]],
         max_parallel: int,
     ):
+        if self._htcondor_execution_requested():
+            if self._htcondor_execution_enabled():
+                return self._run_batch_group_htcondor(parent_id, child_job_map, max_parallel)
+            return self._fail_when_htcondor_unavailable(parent_id, "批处理任务")
+
         if self._distributed_execution_requested():
             if self._distributed_execution_enabled():
                 return self._run_batch_group_dask(parent_id, child_job_map, max_parallel)
@@ -1856,13 +2216,40 @@ class TaskManager:
             if pipe is None:
                 return
 
-            for raw in iter(pipe.readline, b""):
-                if not raw:
+            # tqdm 这类进度条经常用 \r 刷新同一行，不一定输出 \n。
+            # 这里按字节块读取，同时识别 \r 和 \n，这样前端能更快看到进度。
+            buffer = b""
+            last_line = ""
+
+            while True:
+                chunk = pipe.read(256)
+                if not chunk:
                     break
 
-                line = self.decode_process_output(raw).rstrip("\r\n")
+                buffer += chunk
 
-                if line:
+                while True:
+                    positions = [p for p in [buffer.find(b"\n"), buffer.find(b"\r")] if p >= 0]
+                    if not positions:
+                        break
+
+                    pos = min(positions)
+                    raw_line = buffer[:pos]
+                    buffer = buffer[pos + 1:]
+
+                    line = self.decode_process_output(raw_line).strip()
+                    if not line:
+                        continue
+
+                    # 进度条会不断刷新同一行，完全相同的就不重复写。
+                    if line == last_line:
+                        continue
+                    last_line = line
+                    self.append_log(task_id, f"[{prefix}] {line}")
+
+            if buffer:
+                line = self.decode_process_output(buffer).strip()
+                if line and line != last_line:
                     self.append_log(task_id, f"[{prefix}] {line}")
 
         except Exception as e:
@@ -2071,6 +2458,11 @@ class TaskManager:
             self._save_tasks()
 
     def _run_parallel_task(self, parent_id: str, jobs: List[Dict[str, Any]], max_workers: int):
+        if self._htcondor_execution_requested():
+            if self._htcondor_execution_enabled():
+                return self._run_parallel_task_htcondor(parent_id, jobs, max_workers)
+            return self._fail_when_htcondor_unavailable(parent_id, "并行任务")
+
         if self._distributed_execution_requested():
             if self._distributed_execution_enabled():
                 return self._run_parallel_task_dask(parent_id, jobs, max_workers)
@@ -2358,6 +2750,37 @@ class TaskManager:
                     task["return_code"] = -1
                     task.setdefault("logs", []).append("[SYSTEM] Dask 任务已请求取消")
                 self.dask_futures.pop(task_id, None)
+            self._save_tasks()
+            return True
+
+        # HTCondor 任务不能按本机 PID 杀掉，必须用 condor_rm 取消。
+        if str(task.get("execution_backend") or "") == "htcondor" and task.get("status") not in TERMINAL_STATUSES:
+            self.cancel_flags.add(task_id)
+            cluster_id = str(task.get("htcondor_cluster_id") or "")
+            result = None
+            if self.htcondor_manager is not None:
+                try:
+                    result = self.htcondor_manager.cancel_job(
+                        job_id=task_id,
+                        cluster_id=cluster_id,
+                    )
+                except Exception as exc:
+                    result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+            with self.lock:
+                task = self.tasks.get(task_id)
+                if task:
+                    task["status"] = "cancelled"
+                    task["ended_at"] = now_iso()
+                    task["return_code"] = -2
+                    task.setdefault("logs", []).append("[SYSTEM] 已请求取消 HTCondor 任务")
+                    if result:
+                        if result.get("cluster_id"):
+                            task["htcondor_cluster_id"] = str(result.get("cluster_id") or "")
+                        msg = result.get("message") or result.get("stdout") or result.get("stderr") or result.get("error") or ""
+                        if msg:
+                            task.setdefault("logs", []).append(f"[HTCONDOR] 停止结果：{msg}")
+
             self._save_tasks()
             return True
 

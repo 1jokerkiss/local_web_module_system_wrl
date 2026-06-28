@@ -55,6 +55,12 @@ import {
   stopDaskCluster,
   setDistributedExecutionMode,
   testDaskSharedPath,
+  getHTCondorStatus,
+  setHTCondorExecutionMode,
+  runHTCondorSmokeTest,
+  createHTCondorParent,
+  joinHTCondorParent,
+  leaveHTCondorPool,
 } from './api';
 
 import clusterEarthImage from './assets/earth.jpg';
@@ -781,6 +787,42 @@ function countLogMatches(logs, pattern) {
   return logs.reduce((n, line) => n + (pattern.test(String(line || '')) ? 1 : 0), 0);
 }
 
+function getLastTqdmProgress(logs) {
+  const items = Array.isArray(logs) ? logs : [];
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const raw = String(items[i] || '');
+    const parts = raw.split(/\r|\n/).reverse();
+    for (const part of parts) {
+      const line = String(part || '').trim();
+      if (!line) continue;
+
+      const percentMatch = line.match(/(\d{1,3})\s*%\s*\|/);
+      const countMatch = line.match(/(\d+)\s*\/\s*(\d+)/);
+
+      if (percentMatch) {
+        const percent = Math.max(0, Math.min(100, Number.parseInt(percentMatch[1], 10) || 0));
+        let current = null;
+        let total = null;
+        if (countMatch) {
+          current = Number.parseInt(countMatch[1], 10) || null;
+          total = Number.parseInt(countMatch[2], 10) || null;
+        }
+        return { percent, current, total };
+      }
+
+      if (countMatch && /it\/s|s\/it|elapsed|remaining|\[.*\]/i.test(line)) {
+        const current = Number.parseInt(countMatch[1], 10) || 0;
+        const total = Number.parseInt(countMatch[2], 10) || 0;
+        if (total > 0) {
+          const percent = Math.max(0, Math.min(100, Math.round((current / total) * 100)));
+          return { percent, current, total };
+        }
+      }
+    }
+  }
+  return null;
+}
+
 function findLastNumberInLogs(logs, patterns) {
   for (let i = logs.length - 1; i >= 0; i -= 1) {
     const line = String(logs[i] || '');
@@ -865,6 +907,25 @@ function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
       label: `子任务进度：${finished}/${parallelTotal}`,
       detail: `成功 ${succeeded} 个，失败 ${failed} 个${elapsedText ? `，已运行 ${elapsedText}` : ''}`,
       mode: 'parallel',
+      color: '#2d7cf6',
+    };
+  }
+
+  const tqdmProgress = getLastTqdmProgress(logs);
+  if (tqdmProgress) {
+    const percent = status === 'running'
+      ? Math.max(1, Math.min(99, tqdmProgress.percent))
+      : tqdmProgress.percent;
+
+    const label = tqdmProgress.total
+      ? `算法进度：${tqdmProgress.current || 0}/${tqdmProgress.total}`
+      : `算法进度：${percent}%`;
+
+    return {
+      percent,
+      label,
+      detail: `${elapsedText ? `已运行 ${elapsedText}；` : ''}进度来自程序输出的 tqdm 进度条`,
+      mode: 'tqdm',
       color: '#2d7cf6',
     };
   }
@@ -1929,6 +1990,193 @@ const TASK_TRAY_RESERVED_RIGHT = TASK_TRAY_WIDTH + TASK_TRAY_RIGHT + 24;
 const TASK_TRAY_RESERVED_BOTTOM = 150;
 
 
+
+function HTCondorPage({ status, busy, message, clusterForm, setClusterForm, onRefresh, onSetMode, onSmokeTest, onCreateParent, onJoinParent, onLeavePool }) {
+  const info = status || {};
+  const install = info.install_result || {};
+  const runtime = info.runtime || {};
+  const installedRuntime = runtime.installed_runtime || {};
+  const service = installedRuntime.service || {};
+  const ping = info.ping || {};
+  const slot = info.slot_status || {};
+  const queue = info.queue || {};
+  const nodes = info.nodes || {};
+  const localIps = Array.isArray(info.local_ips) ? info.local_ips : [];
+  const mode = info.execution_mode || 'local';
+  const roleText = info.pool_role === 'parent' ? '父节点' : (info.pool_role === 'child' ? '子节点' : '单机');
+
+  const okBadge = (ok, yesText, noText) => (
+    <span style={{
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: 6,
+      padding: '6px 10px',
+      borderRadius: 999,
+      fontSize: 12,
+      fontWeight: 800,
+      background: ok ? '#dcfce7' : '#fee2e2',
+      color: ok ? '#166534' : '#991b1b',
+    }}>
+      <span style={{
+        width: 8,
+        height: 8,
+        borderRadius: '50%',
+        background: ok ? '#22c55e' : '#ef4444',
+      }} />
+      {ok ? yesText : noText}
+    </span>
+  );
+
+  const row = (label, value) => (
+    <div style={{ padding: 12, border: '1px solid #dce8f3', borderRadius: 10, background: '#fff' }}>
+      <div style={{ fontSize: 12, color: '#6a7f96', fontWeight: 800 }}>{label}</div>
+      <div style={{ marginTop: 5, fontWeight: 800, color: '#173b61', overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>
+        {value || '-'}
+      </div>
+    </div>
+  );
+
+  return (
+    <section style={{ display: 'grid', gap: 16, minHeight: 'calc(100vh - 98px)' }}>
+      <div style={{ ...styles.card, padding: 24 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+          <div>
+            <div style={{ fontSize: 28, fontWeight: 900, color: '#12385f' }}>HTCondor 分布式</div>
+            <div style={{ marginTop: 8, color: '#5c7189', lineHeight: 1.7 }}>
+              当前先接入 HTCondor 提交和执行模式。旧的“分布式”Dask 页面暂时保留，测试稳定后再删除。
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            {okBadge(info.install_validated, '一键安装已验证', '安装未完全验证')}
+            {okBadge(info.service_running, 'Condor 服务运行中', 'Condor 服务未运行')}
+            {okBadge(ping.ok, 'NTSSPI 检查通过', 'NTSSPI 检查失败')}
+            {okBadge(info.enabled, 'HTCondor 执行已启用', '当前未启用 HTCondor')}
+          </div>
+        </div>
+      </div>
+
+      {message && (
+        <div style={{
+          ...styles.card,
+          padding: '12px 16px',
+          whiteSpace: 'pre-wrap',
+          color: message.type === 'error' ? '#991b1b' : '#166534',
+          background: message.type === 'error' ? '#fff1f2' : '#f0fdf4',
+        }}>
+          {message.text}
+        </div>
+      )}
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 430px), 1fr))', gap: 16 }}>
+        <div style={{ ...styles.card, padding: 18 }}>
+          <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>运行状态</div>
+          <div style={{ display: 'grid', gap: 10 }}>
+            {row('当前执行模式', mode === 'htcondor' ? 'HTCondor' : '本机 local')}
+            {row('机器名', info.machine)}
+            {row('HTCondor 版本', installedRuntime.version_output)}
+            {row('服务状态', service.state)}
+            {row('安装结果', install.message || install.status)}
+            {row('集群角色', roleText)}
+            {row('父节点地址', info.parent_ip || '-')}
+            {row('本机绑定 IP', info.bind_ip || '-')}
+            {row('本机可用 IP', localIps.join('\n') || '-')}
+            {row('runtime 目录', info.runtime_dir)}
+          </div>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 14 }}>
+            <button style={styles.blueBtn} disabled={!!busy} onClick={onRefresh}>刷新状态</button>
+            <button style={styles.whiteBtn} disabled={!!busy} onClick={() => onSetMode('htcondor')}>启用 HTCondor 执行</button>
+            <button style={styles.whiteBtn} disabled={!!busy} onClick={() => onSetMode('local')}>切回本机执行</button>
+            <button style={styles.whiteBtn} disabled={!!busy} onClick={onSmokeTest}>提交自检任务</button>
+          </div>
+        </div>
+
+        <div style={{ ...styles.card, padding: 18 }}>
+          <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>父节点 / 子节点配置</div>
+          <div style={{ color: '#5c7189', lineHeight: 1.7, marginBottom: 12 }}>
+            父节点负责调度，子节点只负责执行。这里会自动写入 HTCondor 配置、开放端口并重启 Condor 服务；如果弹出管理员授权窗口，点“是”。
+          </div>
+          <div style={{ display: 'grid', gap: 10 }}>
+            <label>
+              <div style={labelStyle}>父节点 IP</div>
+              <input
+                style={styles.input}
+                value={clusterForm.parent_ip}
+                placeholder="例如 192.168.2.150"
+                onChange={(e) => setClusterForm({ ...clusterForm, parent_ip: e.target.value })}
+              />
+            </label>
+            <label>
+              <div style={labelStyle}>本机绑定 IP，可空</div>
+              <input
+                style={styles.input}
+                value={clusterForm.bind_ip}
+                placeholder={localIps[0] || '可留空，系统自动选择'}
+                onChange={(e) => setClusterForm({ ...clusterForm, bind_ip: e.target.value, child_ip: e.target.value })}
+              />
+            </label>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+              <label>
+                <div style={labelStyle}>动态端口起始</div>
+                <input
+                  style={styles.input}
+                  value={clusterForm.low_port}
+                  onChange={(e) => setClusterForm({ ...clusterForm, low_port: e.target.value })}
+                />
+              </label>
+              <label>
+                <div style={labelStyle}>动态端口结束</div>
+                <input
+                  style={styles.input}
+                  value={clusterForm.high_port}
+                  onChange={(e) => setClusterForm({ ...clusterForm, high_port: e.target.value })}
+                />
+              </label>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 14 }}>
+            <button style={styles.blueBtn} disabled={!!busy} onClick={onCreateParent}>创建为父节点</button>
+            <button style={styles.whiteBtn} disabled={!!busy} onClick={onJoinParent}>加入父节点</button>
+            <button style={styles.redBtn} disabled={!!busy} onClick={onLeavePool}>退出 HTCondor 集群</button>
+          </div>
+          <div style={{ marginTop: 12, fontSize: 13, color: '#64748b', lineHeight: 1.7 }}>
+            子节点加入后，在父节点页面点击“刷新状态”，condor_status 里应能看到子节点机器名。
+          </div>
+        </div>
+
+        <div style={{ ...styles.card, padding: 18 }}>
+          <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>队列和 Slot</div>
+          <div style={{ display: 'grid', gap: 12 }}>
+            <div>
+              <div style={{ fontWeight: 900, color: '#17406b', marginBottom: 6 }}>执行节点列表</div>
+              <pre style={{ maxHeight: 180, overflow: 'auto', whiteSpace: 'pre-wrap', background: '#0f172a', color: '#dbeafe', padding: 12, borderRadius: 10 }}>
+                {nodes.text || '-'}
+              </pre>
+            </div>
+            <div>
+              <div style={{ fontWeight: 900, color: '#17406b', marginBottom: 6 }}>condor_status</div>
+              <pre style={{ maxHeight: 220, overflow: 'auto', whiteSpace: 'pre-wrap', background: '#0f172a', color: '#dbeafe', padding: 12, borderRadius: 10 }}>
+                {slot.text || '-'}
+              </pre>
+            </div>
+            <div>
+              <div style={{ fontWeight: 900, color: '#17406b', marginBottom: 6 }}>condor_q</div>
+              <pre style={{ maxHeight: 220, overflow: 'auto', whiteSpace: 'pre-wrap', background: '#0f172a', color: '#dbeafe', padding: 12, borderRadius: 10 }}>
+                {queue.text || '-'}
+              </pre>
+            </div>
+            <div>
+              <div style={{ fontWeight: 900, color: '#17406b', marginBottom: 6 }}>condor_ping WRITE</div>
+              <pre style={{ maxHeight: 160, overflow: 'auto', whiteSpace: 'pre-wrap', background: '#0f172a', color: '#dbeafe', padding: 12, borderRadius: 10 }}>
+                {ping.text || '-'}
+              </pre>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function DistributedPage({
   status,
   form,
@@ -2504,6 +2752,16 @@ export default function App() {
   const [distributedStatus, setDistributedStatus] = useState(null);
   const [distributedBusy, setDistributedBusy] = useState('');
   const [distributedMessage, setDistributedMessage] = useState(null);
+  const [htcondorStatus, setHTCondorStatus] = useState(null);
+  const [htcondorBusy, setHTCondorBusy] = useState('');
+  const [htcondorMessage, setHTCondorMessage] = useState(null);
+  const [htcondorClusterForm, setHTCondorClusterForm] = useState({
+    parent_ip: '',
+    bind_ip: '',
+    child_ip: '',
+    low_port: '9700',
+    high_port: '9800',
+  });
   const [distributedSharedPathTest, setDistributedSharedPathTest] = useState(null);
   const [distributedForm, setDistributedForm] = useState({
     bind_ip: '',
@@ -2618,6 +2876,7 @@ export default function App() {
     arr.push({ key: 'data_mgmt', label: '数据管理' });
 
     if (isAdmin) {
+      arr.push({ key: 'htcondor', label: 'HTCondor' });
       arr.push({ key: 'user_mgmt', label: '用户管理' });
     }
     arr.push({ key: 'distributed', label: '分布式' });
@@ -2689,6 +2948,29 @@ export default function App() {
 
     refresh();
     const timer = window.setInterval(refresh, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [currentUser, activeTab]);
+
+  useEffect(() => {
+    if (!currentUser || activeTab !== 'htcondor') return undefined;
+
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const data = await getHTCondorStatus();
+        if (!cancelled) setHTCondorStatus(data);
+      } catch (e) {
+        if (!cancelled) {
+          setHTCondorMessage({ type: 'error', text: e?.message || '读取 HTCondor 状态失败' });
+        }
+      }
+    };
+
+    refresh();
+    const timer = window.setInterval(refresh, 4000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -3457,6 +3739,81 @@ async function installModuleFolder() {
     if (data) setDistributedSharedPathTest(data);
   }
 
+  async function refreshHTCondorStatus(silent = false) {
+    try {
+      const data = await getHTCondorStatus();
+      setHTCondorStatus(data);
+      if (data) {
+        setHTCondorClusterForm((old) => ({
+          ...old,
+          parent_ip: old.parent_ip || data.parent_ip || '',
+          bind_ip: old.bind_ip || data.bind_ip || (Array.isArray(data.local_ips) ? (data.local_ips[0] || '') : ''),
+          child_ip: old.child_ip || data.bind_ip || (Array.isArray(data.local_ips) ? (data.local_ips[0] || '') : ''),
+          low_port: String(data.low_port || old.low_port || '9700'),
+          high_port: String(data.high_port || old.high_port || '9800'),
+        }));
+      }
+      return data;
+    } catch (e) {
+      if (!silent) {
+        setHTCondorMessage({ type: 'error', text: e?.message || '读取 HTCondor 状态失败' });
+      }
+      throw e;
+    }
+  }
+
+  async function runHTCondorAction(actionName, callback) {
+    if (htcondorBusy) return null;
+    setHTCondorBusy(actionName);
+    setHTCondorMessage(null);
+    try {
+      const data = await callback();
+      await refreshHTCondorStatus(true);
+      setHTCondorMessage({ type: 'success', text: data?.message || `${actionName}完成` });
+      return data;
+    } catch (e) {
+      setHTCondorMessage({ type: 'error', text: e?.message || `${actionName}失败` });
+      return null;
+    } finally {
+      setHTCondorBusy('');
+    }
+  }
+
+  async function handleHTCondorSetMode(mode) {
+    return runHTCondorAction(
+      mode === 'htcondor' ? '启用 HTCondor 执行' : '切回本机执行',
+      () => setHTCondorExecutionMode(mode),
+    );
+  }
+
+  async function handleHTCondorSmokeTest() {
+    return runHTCondorAction('提交 HTCondor 自检任务', () => runHTCondorSmokeTest());
+  }
+
+  async function handleHTCondorCreateParent() {
+    const payload = {
+      bind_ip: htcondorClusterForm.bind_ip || '',
+      low_port: Number(htcondorClusterForm.low_port || 9700),
+      high_port: Number(htcondorClusterForm.high_port || 9800),
+    };
+    return runHTCondorAction('创建 HTCondor 父节点', () => createHTCondorParent(payload));
+  }
+
+  async function handleHTCondorJoinParent() {
+    const payload = {
+      parent_ip: htcondorClusterForm.parent_ip || '',
+      child_ip: htcondorClusterForm.child_ip || htcondorClusterForm.bind_ip || '',
+      low_port: Number(htcondorClusterForm.low_port || 9700),
+      high_port: Number(htcondorClusterForm.high_port || 9800),
+    };
+    return runHTCondorAction('加入 HTCondor 父节点', () => joinHTCondorParent(payload));
+  }
+
+  async function handleHTCondorLeavePool() {
+    if (!window.confirm('确定退出 HTCondor 集群吗？系统会重启 Condor 服务。')) return null;
+    return runHTCondorAction('退出 HTCondor 集群', () => leaveHTCondorPool());
+  }
+
 function getCenteredTaskWindowPosition(offset = 0) {
   const popupWidth = 420;
   const popupHeight = 520;
@@ -3505,8 +3862,29 @@ function addTaskWindow(task, title) {
   async function stopTaskWindow(id) {
     const target = windows.find((x) => x.id === id);
     if (!target) return;
+
     try {
       await cancelTask(target.taskId);
+
+      setWindows((prev) =>
+        prev.map((x) =>
+          x.id === id
+            ? {
+                ...x,
+                task: mergeTaskForWindow(x.task, {
+                  ...(x.task || {}),
+                  status: 'cancelled',
+                  ended_at: new Date().toISOString().slice(0, 19),
+                  logs: [
+                    ...((x.task && Array.isArray(x.task.logs)) ? x.task.logs : []),
+                    '[SYSTEM] 已发送停止任务请求',
+                  ],
+                }),
+                zIndex: ++zRef.current,
+              }
+            : x
+        )
+      );
 
       try {
         const detail = await getTask(target.taskId);
@@ -3522,6 +3900,7 @@ function addTaskWindow(task, title) {
       await refreshTasks();
     } catch (e) {
       alert(e?.message || '停止任务失败');
+      await refreshTasks();
     }
   }
 
@@ -5784,6 +6163,21 @@ function renderTaskManagementPage() {
         {activeTab.startsWith('tool:') && renderToolPage(activeTab.slice('tool:'.length))}
         {activeTab === 'data_mgmt' && renderDataManagementPage()}
         {activeTab === 'tasks' && renderTaskManagementPage()}
+        {activeTab === 'htcondor' && isAdmin && (
+          <HTCondorPage
+            status={htcondorStatus}
+            busy={htcondorBusy}
+            message={htcondorMessage}
+            clusterForm={htcondorClusterForm}
+            setClusterForm={setHTCondorClusterForm}
+            onRefresh={() => refreshHTCondorStatus(false)}
+            onSetMode={handleHTCondorSetMode}
+            onSmokeTest={handleHTCondorSmokeTest}
+            onCreateParent={handleHTCondorCreateParent}
+            onJoinParent={handleHTCondorJoinParent}
+            onLeavePool={handleHTCondorLeavePool}
+          />
+        )}
         {activeTab === 'distributed' && (
           <DistributedPage
             status={distributedStatus}
