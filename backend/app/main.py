@@ -26,11 +26,8 @@ from .task_manager import TaskManager
 from .dask_cluster_manager import DaskClusterError, DaskClusterManager
 from .htcondor_cluster_manager import HTCondorClusterError, HTCondorClusterManager
 
-
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
-
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = BASE_DIR.parent
 DATA_DIR = BASE_DIR / "data"
@@ -39,70 +36,44 @@ MODULES_FILE = DATA_DIR / "modules.json"
 TASKS_FILE = DATA_DIR / "tasks.json"
 TOOLBARS_FILE = DATA_DIR / "toolbars.json"
 DATA_FILES_FILE = DATA_DIR / "data_files.json"
-
 INSTALLED_MODULES_DIR = BASE_DIR / "installed_modules"
 INSTALLED_MODULES_DIR.mkdir(parents=True, exist_ok=True)
 PYTHON_WHEELS_DIR = BASE_DIR / "python_wheels"
 PYTHON_WHEELS_DIR.mkdir(parents=True, exist_ok=True)
-
 STRICT_LOCAL_BINARY_PACKAGES = {"gdal","rasterio","pyproj","cartopy",}
-
 PREFER_LOCAL_BINARY_PACKAGES = {"numpy","h5py","netcdf4",}
-# Python 源码模块的独立运行环境目录。
-# 方案二：不再把 Python 源码打包成 exe，而是为每个 Python 模块创建独立 venv，
-# 运行时使用该 venv 的 python.exe 执行入口脚本，并传入平台生成的 config.json。
 PYTHON_MODULE_ENVS_DIR = BASE_DIR / "module_envs"
 PYTHON_MODULE_ENVS_DIR.mkdir(parents=True, exist_ok=True)
-
-# 单机本地投放目录：管理员可以把模块 zip 直接放到这里，前端点“扫描本地目录安装”即可。
 MODULE_DROP_DIR = PROJECT_ROOT / "module_drop"
 MODULE_DROP_DIR.mkdir(parents=True, exist_ok=True)
-
 RUNTIME_DIR = BASE_DIR / "runtime"
 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-
 FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
 
-app = FastAPI(title="云和气溶胶反演系统 API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+app = FastAPI(title="云和气溶胶反演系统API")
+app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"],)
 dask_cluster_manager = DaskClusterManager(BASE_DIR, project_root=PROJECT_ROOT)
 htcondor_cluster_manager = HTCondorClusterManager(BASE_DIR, project_root=PROJECT_ROOT)
 task_manager = TaskManager(TASKS_FILE)
 task_manager.set_cluster_manager(dask_cluster_manager)
 task_manager.set_htcondor_manager(htcondor_cluster_manager)
 
-
 @app.get("/api/system/resources")
 def api_system_resources(authorization: str | None = Header(default=None)):
-    """返回本机 CPU 核数、建议进程数、上限进程数和当前任务资源占用。"""
+    #读取当前电脑的CPU核数，根据CPU核数建议进程数和上限进程数并展示当前任务资源占用。
     get_current_user(authorization)
     task_manager.kick_scheduler()
     return task_manager.get_system_resource_info()
-
-
-# =========================
-# 数据模型
-# =========================
 class LoginRequest(BaseModel):
     username: str
     password: str
     role: Optional[str] = None
-
 
 class RegisterRequest(BaseModel):
     username: str
     password: str
     security_question: str = ""
     security_answer: str = ""
-
 
 class ForgotPasswordResetRequest(BaseModel):
     username: str
@@ -1819,22 +1790,27 @@ def _remove_path_safely(path: Path, allowed_roots: list[Path]) -> dict:
             detail=f"删除模块本地文件失败: {path}，原因: {exc}",
         )
 
-
 def remove_module(module_id: str) -> dict:
     """
     删除模块：
-    1. 从 modules.json 移除模块记录；
-    2. 删除 backend/installed_modules/{module_id}；
-    3. 删除 backend/module_envs/{module_id}；
-    4. 不删除任务记录、不删除数据管理中的输出结果文件。
+    1. 优先从 modules.json 中删除模块注册信息；
+    2. 再尝试删除模块本地文件夹；
+    3. 再尝试删除 Python 独立环境；
+    4. 对于旧版本模块，还会根据 working_dir/source_dir/entry_script/param_template 反推可删除目录；
+    5. 不删除任务记录、不删除用户输出结果。
     """
+    module_id = str(module_id or "").strip()
+    if not module_id:
+        raise HTTPException(status_code=400, detail="模块 ID 不能为空")
+
     modules = load_modules()
 
     target_module = None
     new_modules = []
 
+    # 关键：只要 id 匹配，就从 modules.json 里移除
     for module in modules:
-        if module.get("id") == module_id:
+        if str(module.get("id") or "") == module_id:
             target_module = module
         else:
             new_modules.append(module)
@@ -1842,40 +1818,131 @@ def remove_module(module_id: str) -> dict:
     if not target_module:
         return {
             "removed": False,
+            "module_id": module_id,
             "deleted_paths": [],
+            "message": "modules.json 中没有找到该模块注册信息",
         }
 
     safe_module_id = sanitize_filename(module_id).strip()
     if not safe_module_id:
-        raise HTTPException(status_code=400, detail="模块 ID 不能为空")
+        raise HTTPException(status_code=400, detail="模块 ID 非法")
 
-    installed_dir = INSTALLED_MODULES_DIR / safe_module_id
-    env_dir = PYTHON_MODULE_ENVS_DIR / safe_module_id
+    deleted_paths = []
 
     allowed_roots = [
         INSTALLED_MODULES_DIR,
         PYTHON_MODULE_ENVS_DIR,
     ]
 
-    deleted_paths = []
+    def add_candidate_path(raw_value):
+        """把模块配置里的路径转成可删除候选路径。"""
+        text = str(raw_value or "").strip()
+        if not text:
+            return None
 
-    # 删除模块安装目录：backend/installed_modules/{module_id}
-    deleted_paths.append(
-        _remove_path_safely(installed_dir, allowed_roots)
-    )
+        path = Path(text)
 
-    # 删除 Python 独立环境目录：backend/module_envs/{module_id}
-    deleted_paths.append(
-        _remove_path_safely(env_dir, allowed_roots)
-    )
+        # 相对路径按项目根目录解析
+        if not path.is_absolute():
+            path = (PROJECT_ROOT / path).resolve()
+        else:
+            path = path.resolve()
 
-    # 本地文件删除成功后，再删除 modules.json 中的记录
+        return path
+
+    candidate_paths = []
+
+    # 标准模块目录
+    candidate_paths.append(INSTALLED_MODULES_DIR / safe_module_id)
+
+    # Python 独立环境目录
+    candidate_paths.append(PYTHON_MODULE_ENVS_DIR / safe_module_id)
+
+    # 旧 Python 源码模块可能注册了 working_dir/source_dir
+    for key in [
+        "working_dir",
+        "source_dir",
+    ]:
+        path = add_candidate_path(target_module.get(key))
+        if path:
+            candidate_paths.append(path)
+
+    # entry_script / param_template 是文件路径，删除时提升到它们所在目录，
+    # 避免只删一个 py/json 文件后留下空 release 目录。
+    for key in [
+        "entry_script",
+        "param_template",
+    ]:
+        path = add_candidate_path(target_module.get(key))
+        if path:
+            candidate_paths.append(path.parent)
+
+    # 去重，并且只允许删除 installed_modules 和 module_envs 内部内容
+    seen = set()
+    safe_candidates = []
+
+    for path in candidate_paths:
+        try:
+            resolved = Path(path).resolve()
+        except Exception:
+            continue
+
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # 只允许删除系统模块目录和环境目录下的内容，防止误删用户数据
+        allowed = False
+        for root in allowed_roots:
+            try:
+                resolved.relative_to(root.resolve())
+                allowed = True
+                break
+            except ValueError:
+                continue
+
+        if allowed:
+            safe_candidates.append(resolved)
+
+    # 关键修复：先写 modules.json，避免文件删除失败后注册信息残留
     save_modules(new_modules)
+
+    # 再删除本地文件。失败也不回滚 modules.json，避免前端继续显示坏模块。
+    for path in safe_candidates:
+        try:
+            if not path.exists():
+                deleted_paths.append({
+                    "path": str(path),
+                    "status": "missing",
+                })
+                continue
+
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=False)
+                deleted_paths.append({
+                    "path": str(path),
+                    "status": "deleted",
+                })
+            else:
+                path.unlink()
+                deleted_paths.append({
+                    "path": str(path),
+                    "status": "deleted",
+                })
+
+        except Exception as exc:
+            deleted_paths.append({
+                "path": str(path),
+                "status": "delete_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
 
     return {
         "removed": True,
         "module_id": module_id,
         "deleted_paths": deleted_paths,
+        "message": "模块注册信息已从 modules.json 删除，本地文件已尽量清理",
     }
 
 
